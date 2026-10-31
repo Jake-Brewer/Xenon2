@@ -27,6 +27,10 @@ npm install        # first time only
 npm run tauri dev
 ```
 
+`npm run tauri` runs `scripts/run_desktop.sh`, which drops the GTK paths a VS Code
+snap terminal exports. Without that, WebKit aborts on a schema mismatch before
+the window opens. A normal desktop launch does not have those variables.
+
 The first build compiles the Rust/Tauri dependency tree from scratch and can take several
 minutes; subsequent builds are incremental and fast. This launches a real desktop window (not a
 browser tab) — Vite serves the Vue frontend on `http://localhost:1420` internally, but you
