@@ -195,6 +195,8 @@ that directory contains `libxenon_inference.so` or `xenon_inference.dll`, and as
 layer. If CUDA init fails it loads the same model on CPU instead of refusing to start.
 A machine with no NVIDIA GPU cannot compile that script. Run `./build_cpu.sh`
 there; the app links `build-cpu-app` when the CUDA library is absent.
+`quantize.py` finds `librwkv.so` when run from `rwkv.cpp/build-cpu`. Hugging Face
+GGUF files are llama.cpp format and will not load in `xenon_load_model`.
 
 ### 2. Build the xenon_inference wrapper + test_inference CLI
 
