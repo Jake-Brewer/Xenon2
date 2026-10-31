@@ -75,8 +75,9 @@ const groups = computed(() => {
 .sidebar {
   display: flex;
   flex-direction: column;
-  width: 240px;
-  min-width: 240px;
+  width: clamp(168px, 22vw, 240px);
+  min-width: 0;
+  flex: 0 1 240px;
   background: var(--sidebar-bg, #191919);
   color: #e6e6e6;
   height: 100%;
@@ -84,6 +85,19 @@ const groups = computed(() => {
   padding: 0.6rem;
   gap: 0.6rem;
   border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+@media (max-width: 859px) {
+  .sidebar {
+    position: absolute;
+    z-index: 30;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(260px, calc(100vw - 3rem));
+    flex: none;
+    box-shadow: 8px 0 24px rgba(0, 0, 0, 0.45);
+  }
 }
 
 .new-chat-btn {

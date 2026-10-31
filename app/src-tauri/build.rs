@@ -1,23 +1,58 @@
 // build.rs
 //
-// Links this crate against Phase 1's pre-built `xenon_inference` shared library
-// (inference-engine/build-cpu-app) and copies its runtime DLLs (xenon_inference.dll, rwkv.dll,
-// plus the MSVC/UCRT redistributable DLLs that build already collected next to
-// test_inference.exe) next to this crate's own build output, so the Tauri app can load them at
-// runtime without editing PATH.
+// Links this crate against the pre-built `xenon_inference` shared library and copies that
+// library (and librwkv / rwkv.dll beside it) next to the Tauri executable.
 //
-// This intentionally links the CPU-only build (build-cpu-app), not build-cuda-app -- see
-// src/inference.rs for why (matches Phase 1's documented steady-state throughput finding: for
-// this model size, CPU-only is the safer/faster default, and it avoids depending on a CUDA
-// toolkit being present on whatever machine runs this app).
+// Prefer inference-engine/build-cuda-app so an RTX 2060 (or any CUDA GPU) actually runs the
+// model. Fall back to build-cpu-app when the CUDA library has not been built yet. At runtime
+// inference.rs offloads every RWKV layer when the linked library was compiled with CUDA, and
+// retries on CPU if the GPU init fails, so a CUDA build still launches on a machine with no GPU.
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+fn is_native_lib(path: &Path) -> bool {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("dll") | Some("so") | Some("dylib") => true,
+        _ => false,
+    }
+}
+
+fn is_link_lib(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if cfg!(windows) {
+        name == "xenon_inference.lib"
+    } else if cfg!(target_os = "macos") {
+        name == "libxenon_inference.dylib" || name == "libxenon_inference.a"
+    } else {
+        name == "libxenon_inference.so"
+    }
+}
+
+fn find_link_lib(build_dir: &Path) -> Option<PathBuf> {
+    let mut dirs = vec![
+        build_dir.join("bin").join("Release"),
+        build_dir.join("bin"),
+        build_dir.join("Release"),
+        build_dir.to_path_buf(),
+    ];
+    // Single-config Linux builds drop the .so in bin/ via LIBRARY_OUTPUT_DIRECTORY.
+    dirs.retain(|d| d.is_dir());
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if is_link_lib(&path) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    // manifest_dir = <repo>/app/src-tauri -> repo root is two levels up.
     let repo_root = manifest_dir
         .parent()
         .expect("app/ dir")
@@ -25,38 +60,47 @@ fn main() {
         .expect("repo root")
         .to_path_buf();
 
-    let build_dir = repo_root.join("inference-engine").join("build-cpu-app");
-    let lib_dir = build_dir.join("Release"); // xenon_inference.lib (import lib)
-    let dll_dir = build_dir.join("bin").join("Release"); // xenon_inference.dll, rwkv.dll, redist DLLs
+    let engine_dir = repo_root.join("inference-engine");
+    let cuda_dir = engine_dir.join("build-cuda-app");
+    let cpu_dir = engine_dir.join("build-cpu-app");
 
-    if !lib_dir.join("xenon_inference.lib").exists() {
+    let (build_dir, link_lib) = if let Some(lib) = find_link_lib(&cuda_dir) {
+        (cuda_dir, lib)
+    } else if let Some(lib) = find_link_lib(&cpu_dir) {
+        (cpu_dir, lib)
+    } else {
         panic!(
-            "xenon_inference.lib not found at {} -- build inference-engine/build-cpu-app first \
-             (see inference-engine/README.md, section '2. Build the xenon_inference wrapper').",
-            lib_dir.display()
+            "xenon_inference library not found under {} or {}. \
+             On a machine with an RTX 2060, build the CUDA library first: \
+             inference-engine/build_cuda.sh (CMAKE_CUDA_ARCHITECTURES=75). \
+             Otherwise build inference-engine/build-cpu-app. See inference-engine/README.md.",
+            cuda_dir.display(),
+            cpu_dir.display()
         );
-    }
+    };
 
+    let lib_dir = link_lib.parent().expect("library parent dir");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=xenon_inference");
-    println!("cargo:rerun-if-changed={}", lib_dir.display());
+    println!("cargo:rerun-if-changed={}", link_lib.display());
+    println!("cargo:rerun-if-changed={}", build_dir.display());
 
-    // Copy every DLL next to the eventual .exe so the app can find them without PATH edits.
-    // OUT_DIR looks like <target-dir>/<profile>/build/app-<hash>/out -- the target/profile dir
-    // that holds the actual executable is three levels up from OUT_DIR.
+    if cfg!(unix) {
+        // Look beside the executable for libxenon_inference.so and librwkv.so.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
+
     if let Ok(out_dir) = env::var("OUT_DIR") {
         let mut target_dir = PathBuf::from(out_dir);
         for _ in 0..3 {
             target_dir.pop();
         }
 
-        if let Ok(entries) = fs::read_dir(&dll_dir) {
+        if let Ok(entries) = fs::read_dir(lib_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("dll") {
+                if is_native_lib(&path) {
                     let dest = target_dir.join(path.file_name().unwrap());
-                    // Best-effort: don't fail the build if a DLL happens to be locked by a
-                    // running instance of the app.
                     let _ = fs::copy(&path, &dest);
                 }
             }

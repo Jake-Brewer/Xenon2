@@ -69,11 +69,9 @@ class VoiceServer:
         log("loading VAD...")
         self.vad = VoiceActivityDetector()
         log("loading STT (faster-whisper, small, cuda)...")
-        # device="cuda" is safe here even though Phase 1's CLI harness benchmark preferred
-        # CPU for RWKV inference at this model size -- that finding was about RWKV
-        # specifically (see inference-engine/README.md); the Tauri app links the CPU-only
-        # RWKV build (see app/src-tauri/build.rs), so the GPU is otherwise idle and free for
-        # STT exactly as Phase 2's original device split intended.
+        # device="cuda" shares the GPU with RWKV. The desktop app offloads every RWKV layer
+        # when build-cuda-app is what it linked (see inference.rs). Whisper small fp16 is
+        # about 1GB; together with the 2.75GB Q5_1 model that fits a 6GB RTX 2060.
         self.stt = SpeechToText(model_size="small", device="cuda", compute_type="float16")
         log("loading TTS (piper)...")
         self.tts = TextToSpeech()

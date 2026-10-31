@@ -234,11 +234,9 @@ issues, addressed in the same phase rather than opening a new one:
    prompts and got basic arithmetic wrong. Upgraded to **RWKV-7 World v3
    2.9B** (`rwkv-7-world-2.9B-Q5_1.bin`) -- same World tokenizer, same
    rwkv.cpp conversion pipeline (rwkv.cpp already supports the v7
-   architecture). Still CPU-only (re-benchmarked: GPU offload is now
-   actually faster for this size -- 11.18 vs 8.95 tok/s -- but CPU-only was
-   kept to avoid a hard CUDA-GPU dependency, matching the portable/
-   USB-first goal). See `app/README.md`'s Phase 7 section for full
-   before/after evidence.
+   architecture). GPU offload is faster at this size (11.18 vs 8.95 tok/s).
+   The app now uses it when `build-cuda-app` is present (RTX 2060 / sm_75)
+   and falls back to CPU if CUDA init fails. See `app/README.md`.
 2. **Persistent memory**: added a mid-conversation toggle between two
    agents -- **Dementia** (the pre-existing behavior: memory only within
    the current chat, nothing survives outside it) and **Sloth** (reads and
@@ -311,7 +309,8 @@ output at turn 1/5/edit/regenerate), and measured before/after numbers.
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
-- GPU acceleration (optional CUDA path).
+- GPU acceleration is wired: `inference-engine/build_cuda.sh` targets sm_75 (RTX 2060) and the
+  app offloads every layer when that build is present, with a CPU retry if CUDA init fails.
 - Wake-word detection for always-listening mode.
 - Conversation branching (currently editing discards the old branch instead
   of preserving it).

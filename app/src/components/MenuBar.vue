@@ -22,6 +22,9 @@ import { ref, onMounted, onUnmounted } from "vue";
 const props = defineProps<{
   /** Disables Save / Save As when there's no active conversation. */
   hasActiveConversation?: boolean;
+  /** Shown on the right of the menu bar, e.g. "CUDA — all layers on GPU". */
+  deviceLabel?: string;
+  sidebarOpen?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -33,6 +36,7 @@ const emit = defineEmits<{
   (e: "import-memory"): void;
   (e: "settings"): void;
   (e: "sloth-memory"): void;
+  (e: "toggle-sidebar"): void;
 }>();
 
 const fileMenuOpen = ref(false);
@@ -101,6 +105,13 @@ function onSlothMemory() {
 
 <template>
   <div class="menu-bar" @keydown.escape="closeFileMenu">
+    <button
+      class="menu-item-btn"
+      :title="sidebarOpen ? 'Hide conversation list' : 'Show conversation list'"
+      @click="emit('toggle-sidebar')"
+    >
+      {{ sidebarOpen ? "Hide chats" : "Chats" }}
+    </button>
     <div class="menu-item" ref="menuItemEl">
       <button class="menu-item-btn" @click="toggleFileMenu">File</button>
       <div v-if="fileMenuOpen" class="dropdown">
@@ -128,6 +139,7 @@ function onSlothMemory() {
         <button class="dropdown-item" @click="onSlothMemory">Sloth Memory...</button>
       </div>
     </div>
+    <span v-if="deviceLabel" class="device-label" :title="deviceLabel">{{ deviceLabel }}</span>
   </div>
 </template>
 
@@ -140,6 +152,20 @@ function onSlothMemory() {
   font-size: 0.85rem;
   user-select: none;
   -webkit-app-region: drag;
+  min-width: 0;
+}
+
+.device-label {
+  margin-left: auto;
+  align-self: center;
+  padding: 0 0.75rem;
+  color: #9ab;
+  font-size: 0.75rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46vw;
+  -webkit-app-region: no-drag;
 }
 
 .menu-item {

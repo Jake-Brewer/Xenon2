@@ -15,8 +15,9 @@
         "title": "Xenon2",
         "width": 1200,
         "height": 800,
-        "minWidth": 700,
-        "minHeight": 480
+        "minWidth": 480,
+        "minHeight": 420,
+        "center": true
       }
     ],
     "security": {
