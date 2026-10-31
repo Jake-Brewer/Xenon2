@@ -193,6 +193,8 @@ older CUDA Toolkit this flag is likely unnecessary (harmless either way).
 architecture will not load kernels on a 2060. The desktop app links `build-cuda-app` when
 that directory contains `libxenon_inference.so` or `xenon_inference.dll`, and asks for every
 layer. If CUDA init fails it loads the same model on CPU instead of refusing to start.
+A machine with no NVIDIA GPU cannot compile that script. Run `./build_cpu.sh`
+there; the app links `build-cpu-app` when the CUDA library is absent.
 
 ### 2. Build the xenon_inference wrapper + test_inference CLI
 

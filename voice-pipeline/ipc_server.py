@@ -68,11 +68,15 @@ class VoiceServer:
     def __init__(self):
         log("loading VAD...")
         self.vad = VoiceActivityDetector()
-        log("loading STT (faster-whisper, small, cuda)...")
-        # device="cuda" shares the GPU with RWKV. The desktop app offloads every RWKV layer
-        # when build-cuda-app is what it linked (see inference.rs). Whisper small fp16 is
-        # about 1GB; together with the 2.75GB Q5_1 model that fits a 6GB RTX 2060.
-        self.stt = SpeechToText(model_size="small", device="cuda", compute_type="float16")
+        log("loading STT (faster-whisper, small)...")
+        # Prefer the GPU (RTX 2060). This Iris Xe machine has no CUDA device, so fall
+        # back to CPU int8 instead of leaving the mic dead.
+        try:
+            self.stt = SpeechToText(model_size="small", device="cuda", compute_type="float16")
+            log("STT on CUDA")
+        except Exception as exc:
+            log(f"CUDA STT unavailable ({exc}); loading CPU int8")
+            self.stt = SpeechToText(model_size="small", device="cpu", compute_type="int8")
         log("loading TTS (piper)...")
         self.tts = TextToSpeech()
         log("ready")

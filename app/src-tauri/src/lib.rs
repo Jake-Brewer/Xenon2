@@ -8,99 +8,49 @@ mod voice;
 use std::path::PathBuf;
 use tauri::{Manager, PhysicalPosition, PhysicalSize};
 
-/// If the window is hanging off every monitor (a saved position from another display layout)
-/// or is larger than the current work area, move and shrink it so the title bar and the
-/// composer stay on a visible screen.
-fn keep_window_on_screen(app: &tauri::App) {
+/// Open maximized on the monitor the window is actually on, so a 1920x1080 laptop
+/// panel and a larger external display both get a window that fills the work area
+/// (the space below the menu bar, not under it). If the saved position is off every
+/// display, move onto the primary monitor first. Wayland often rejects set_position;
+/// maximize() is what makes the window fit.
+fn fit_window_to_screen(app: &tauri::App) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
     let Ok(monitors) = window.available_monitors() else {
+        let _ = window.maximize();
         return;
     };
-    if monitors.is_empty() {
-        return;
-    }
-    let Ok(pos) = window.outer_position() else {
-        return;
-    };
-    let Ok(size) = window.outer_size() else {
-        return;
-    };
-
-    let overlaps = |area: &tauri::PhysicalRect<i32, u32>| -> bool {
-        let x1 = pos.x.max(area.position.x);
-        let y1 = pos.y.max(area.position.y);
-        let x2 = (pos.x + size.width as i32).min(area.position.x + area.size.width as i32);
-        let y2 = (pos.y + size.height as i32).min(area.position.y + area.size.height as i32);
-        x2 - x1 > 48 && y2 - y1 > 48
-    };
-
-    let anchor = if monitors.iter().any(|m| overlaps(m.work_area())) {
-        window.current_monitor().ok().flatten()
-    } else {
-        None
-    };
-    let monitor = anchor
-        .or_else(|| window.primary_monitor().ok().flatten())
-        .or_else(|| monitors.into_iter().next());
-    let Some(monitor) = monitor else {
-        return;
-    };
-    let area = monitor.work_area();
-    let width = size.width.min(area.size.width).max(1);
-    let height = size.height.min(area.size.height).max(1);
-    if width != size.width || height != size.height {
-        let _ = window.set_size(PhysicalSize::new(width, height));
-    }
-
-    let Ok(pos) = window.outer_position() else {
-        return;
-    };
-    let Ok(size) = window.outer_size() else {
-        return;
-    };
-    let left = area.position.x;
-    let top = area.position.y;
-    let right = left + area.size.width as i32;
-    let bottom = top + area.size.height as i32;
-    let mut x = pos.x;
-    let mut y = pos.y;
-    let fully_off = !monitors_still_overlap(&window, x, y, size.width, size.height);
-    if fully_off {
-        x = left + (area.size.width as i32 - size.width as i32) / 2;
-        y = top + (area.size.height as i32 - size.height as i32) / 2;
-    } else {
-        if x < left {
-            x = left;
-        }
-        if y < top {
-            y = top;
-        }
-        if x + size.width as i32 > right {
-            x = (right - size.width as i32).max(left);
-        }
-        if y + size.height as i32 > bottom {
-            y = (bottom - size.height as i32).max(top);
+    let on_a_screen = window.outer_position().ok().zip(window.outer_size().ok()).is_some_and(|(pos, size)| {
+        monitors.iter().any(|m| {
+            let area = m.work_area();
+            let x1 = pos.x.max(area.position.x);
+            let y1 = pos.y.max(area.position.y);
+            let x2 = (pos.x + size.width as i32).min(area.position.x + area.size.width as i32);
+            let y2 = (pos.y + size.height as i32).min(area.position.y + area.size.height as i32);
+            x2 - x1 > 48 && y2 - y1 > 48
+        })
+    });
+    if !on_a_screen {
+        if let Some(monitor) = window.primary_monitor().ok().flatten().or_else(|| monitors.into_iter().next()) {
+            let area = monitor.work_area();
+            let _ = window.set_position(PhysicalPosition::new(area.position.x, area.position.y));
+            let _ = window.set_size(PhysicalSize::new(area.size.width, area.size.height));
         }
     }
-    if x != pos.x || y != pos.y {
-        let _ = window.set_position(PhysicalPosition::new(x, y));
+    if let Err(err) = window.maximize() {
+        eprintln!("xenon2: maximize failed ({err}); sizing to the work area");
+        let monitor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| window.primary_monitor().ok().flatten());
+        if let Some(monitor) = monitor {
+            let area = monitor.work_area();
+            let _ = window.set_position(PhysicalPosition::new(area.position.x, area.position.y));
+            let _ = window.set_size(PhysicalSize::new(area.size.width, area.size.height));
+        }
     }
-}
-
-fn monitors_still_overlap(window: &tauri::WebviewWindow, x: i32, y: i32, width: u32, height: u32) -> bool {
-    let Ok(monitors) = window.available_monitors() else {
-        return true;
-    };
-    monitors.iter().any(|m| {
-        let area = m.work_area();
-        let x1 = x.max(area.position.x);
-        let y1 = y.max(area.position.y);
-        let x2 = (x + width as i32).min(area.position.x + area.size.width as i32);
-        let y2 = (y + height as i32).min(area.position.y + area.size.height as i32);
-        x2 - x1 > 48 && y2 - y1 > 48
-    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -120,7 +70,7 @@ pub fn run() {
                 .expect("repo root")
                 .to_path_buf();
 
-            keep_window_on_screen(app);
+            fit_window_to_screen(app);
 
             let (engine_state, model_info, device_info) = inference::load_engine(&repo_root);
             app.manage(engine_state);
