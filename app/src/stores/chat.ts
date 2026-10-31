@@ -60,6 +60,8 @@ interface ChatState {
    * `get_model_name` Tauri command) -- recorded into every conversation's `model` field so a
    * saved file always says which model generated it. */
   modelName: string;
+  /** "CUDA — all layers on GPU", "CPU", or a fallback note. Empty until startup fetch. */
+  deviceLabel: string;
   /** Message from the most recent failed Save/Save As/Open, or null. Separate from
    * `backendError` (inference errors) since these are a different failure domain (file I/O /
    * validation), surfaced in their own banner. */
@@ -130,6 +132,7 @@ export const useChatStore = defineStore("chat", {
     backendError: null,
     filePaths: {},
     modelName: "unknown-model",
+    deviceLabel: "",
     fileError: null,
     sessionRestored: false,
     modelMismatchDismissed: false,
@@ -206,6 +209,11 @@ export const useChatStore = defineStore("chat", {
         this.modelName = await invoke<string>("get_model_name");
       } catch (err) {
         console.warn("[chat store] could not fetch model name:", err);
+      }
+      try {
+        this.deviceLabel = await invoke<string>("get_inference_device");
+      } catch (err) {
+        console.warn("[chat store] could not fetch inference device:", err);
       }
     },
 

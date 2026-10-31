@@ -234,11 +234,9 @@ issues, addressed in the same phase rather than opening a new one:
    prompts and got basic arithmetic wrong. Upgraded to **RWKV-7 World v3
    2.9B** (`rwkv-7-world-2.9B-Q5_1.bin`) -- same World tokenizer, same
    rwkv.cpp conversion pipeline (rwkv.cpp already supports the v7
-   architecture). Still CPU-only (re-benchmarked: GPU offload is now
-   actually faster for this size -- 11.18 vs 8.95 tok/s -- but CPU-only was
-   kept to avoid a hard CUDA-GPU dependency, matching the portable/
-   USB-first goal). See `app/README.md`'s Phase 7 section for full
-   before/after evidence.
+   architecture). GPU offload is faster at this size (11.18 vs 8.95 tok/s).
+   The app now uses it when `build-cuda-app` is present (RTX 2060 / sm_75)
+   and falls back to CPU if CUDA init fails. See `app/README.md`.
 2. **Persistent memory**: added a mid-conversation toggle between two
    agents -- **Dementia** (the pre-existing behavior: memory only within
    the current chat, nothing survives outside it) and **Sloth** (reads and
@@ -308,10 +306,56 @@ output at turn 1/5/edit/regenerate), and measured before/after numbers.
 
 ---
 
+## This computer vs the 2060 laptop (2026-10-31)
+
+Two machines. The RTX 2060 is not attached here. This box is an Intel i5-1235U with Iris Xe
+only (no `nvidia-smi`, no `nvcc`). Do not install a CUDA toolkit on it.
+
+What is already true on this checkout, and is gitignored so it will not be on a fresh clone:
+
+- `inference-engine/build-cpu-app` was built with `./build_cpu.sh` (AVX2, `XENON_HAS_CUDA=OFF`).
+  The desktop app links that when `build-cuda-app` is absent.
+- `models/rwkv-7-world-2.9B-Q5_1.bin` (2.6 GB) is the file `load_engine` opens. The 5.5 GB
+  source `models/RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth` is still on disk; the FP16
+  intermediate was deleted after quantize. Hugging Face GGUF files are llama.cpp format and
+  will not load. Rebuild with `rwkv.cpp/python/convert_pytorch_to_ggml.py` then `quantize.py`
+  Q5_1, run from `rwkv.cpp/build-cpu` so `quantize.py` finds `librwkv.so`. Source URL:
+  `https://huggingface.co/BlinkDL/rwkv-7-world/resolve/main/RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth`.
+- CLI check: `test_inference "Say hello in one short sentence."` on CPU, 6 threads, answered
+  `Hello!` in 3.6 s (1.38 tok/s, time to first token 3.2 s). `n_layer=32`, state 20.6 MB.
+  The desktop app then printed `xenon2: inference device: CPU` and stayed up.
+- Host packages the window needed: `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`,
+  `libayatana-appindicator3-dev`, `librsvg2-dev`, `patchelf`.
+
+Window: `tauri.conf.json` has `"maximized": true`, and `fit_window_to_screen` asks again
+after the window is mapped (model load blocks setup, so an earlier geometry read is 0×0).
+Wayland reports position `0,0` and ignores `set_position`, so the app cannot choose the
+monitor. Verified both placements: built-in panel (LGD `0x0709`) maximized to 1920×1080,
+which is that work area; primary HP `w2338h` on HDMI at x=1920 maximized to 1854×1048,
+the same size as a maximized window there (top bar and dock). Launch with
+`npm run tauri dev` from `app/`. A VS Code snap terminal exports `GSETTINGS_SCHEMA_DIR`
+and `GTK_PATH`; system WebKit then aborts
+(`org.gnome.settings-daemon.plugins.xsettings` has no key `antialiasing`).
+`app/scripts/run_desktop.sh` unsets those. A normal desktop launch does not have them.
+
+Git push: `Jake-Brewer` accepted the write invite to `mrmccrea-coder/Xenon2` on this date
+and is the account that can push. `jakez-gh` is pull-only. Do not change the remote.
+
+Open, in priority order:
+
+1. Voice is not installed. Startup logs that `voice-pipeline/.venv/bin/python3` is missing,
+   and typed chat keeps working. Next step is `python -m venv .venv` and
+   `pip install -r requirements.txt` in `voice-pipeline/`, plus the Piper voice. `ipc_server.py`
+   tries CUDA STT first, then CPU int8, so the mic can work here without a GPU.
+   `voice-pipeline/README.md` still names the old 0.4B model and `build-cuda-app`.
+2. The 5.5 GB `.pth` can be deleted once nobody needs to re-quantize without re-downloading.
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
-- GPU acceleration (optional CUDA path).
+- GPU acceleration is wired: `inference-engine/build_cuda.sh` targets sm_75 (RTX 2060) and the
+  app offloads every layer when that build is present, with a CPU retry if CUDA init fails.
+  This Iris Xe machine uses `./build_cpu.sh` instead.
 - Wake-word detection for always-listening mode.
 - Conversation branching (currently editing discards the old branch instead
   of preserving it).

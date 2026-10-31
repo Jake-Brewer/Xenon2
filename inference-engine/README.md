@@ -188,6 +188,16 @@ files. `-DCMAKE_CUDA_FLAGS="-Xcompiler=/Zc:preprocessor"` forwards the conformin
 flag to the host compiler for every CUDA translation unit and resolves it. If you're on an
 older CUDA Toolkit this flag is likely unnecessary (harmless either way).
 
+**Linux, including an RTX 2060:** `./build_cuda.sh` from this directory. It passes
+`CMAKE_CUDA_ARCHITECTURES=75` (compute capability 7.5). A binary built only for a newer
+architecture will not load kernels on a 2060. The desktop app links `build-cuda-app` when
+that directory contains `libxenon_inference.so` or `xenon_inference.dll`, and asks for every
+layer. If CUDA init fails it loads the same model on CPU instead of refusing to start.
+A machine with no NVIDIA GPU cannot compile that script. Run `./build_cpu.sh`
+there; the app links `build-cpu-app` when the CUDA library is absent.
+`quantize.py` finds `librwkv.so` when run from `rwkv.cpp/build-cpu`. Hugging Face
+GGUF files are llama.cpp format and will not load in `xenon_load_model`.
+
 ### 2. Build the xenon_inference wrapper + test_inference CLI
 
 Point `XENON_RWKV_BUILD_DIR` at whichever rwkv.cpp build you want to link against:

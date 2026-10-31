@@ -21,6 +21,16 @@ import { useChatStore } from "./stores/chat";
 const store = useChatStore();
 
 const messagesContainer = ref<HTMLElement | null>(null);
+const sidebarOpen = ref(true);
+const narrow = ref(false);
+let wasNarrow = false;
+
+function applyViewport() {
+  const isNarrow = window.innerWidth < 860;
+  if (isNarrow && !wasNarrow) sidebarOpen.value = false;
+  wasNarrow = isNarrow;
+  narrow.value = isNarrow;
+}
 
 function scrollToBottom() {
   requestAnimationFrame(() => {
@@ -182,6 +192,9 @@ type MemoryDonePayload = { filesCopied: number; totalBytes: number };
 type MemoryErrorPayload = { message: string };
 
 onMounted(async () => {
+  applyViewport();
+  window.addEventListener("resize", applyViewport);
+
   // Phase 5: fetch the backend's actually-loaded model name first (so any conversation created
   // or loaded afterwards has a real fallback value -- see store.newChat/autoSave), then restore
   // the last session (sidebar + last-active conversation) before wiring up generation events.
@@ -255,6 +268,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener("resize", applyViewport);
   unlistenToken?.();
   unlistenDone?.();
   unlistenError?.();
@@ -272,6 +286,9 @@ onUnmounted(() => {
   <div class="app-shell">
     <MenuBar
       :has-active-conversation="!!store.activeConversation"
+      :device-label="store.deviceLabel"
+      :sidebar-open="sidebarOpen"
+      @toggle-sidebar="sidebarOpen = !sidebarOpen"
       @new="newChat"
       @open="openConversation"
       @save="saveConversation"
@@ -282,7 +299,8 @@ onUnmounted(() => {
       @sloth-memory="openSlothMemory"
     />
 
-    <div class="body">
+    <div class="body" :class="{ 'sidebar-closed': !sidebarOpen, narrow }">
+      <div v-if="sidebarOpen && narrow" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
       <Sidebar
         :conversations="store.conversations"
         :active-id="store.activeId"
@@ -423,13 +441,30 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   width: 100vw;
+  max-width: 100vw;
+  overflow: hidden;
 }
 
 .body {
   display: flex;
   flex: 1;
   min-height: 0;
+  min-width: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.body.sidebar-closed :deep(.sidebar) {
+  display: none;
+}
+
+.sidebar-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 25;
 }
 
 .chat-panel {
@@ -437,12 +472,16 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   background: #131314;
 }
 
 .messages {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 1.5rem 1.5rem 0.5rem;
   display: flex;
   flex-direction: column;
@@ -465,6 +504,7 @@ onUnmounted(() => {
 }
 
 .error-banner {
+  flex-shrink: 0;
   margin: 0 1rem;
   padding: 0.4rem 0.7rem;
   background: #5a2323;
@@ -511,8 +551,10 @@ onUnmounted(() => {
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
   padding: 1.25rem 1.5rem;
-  min-width: 320px;
-  max-width: 460px;
+  width: min(460px, calc(100vw - 1.5rem));
+  max-height: calc(100vh - 1.5rem);
+  max-height: calc(100dvh - 1.5rem);
+  overflow: auto;
   color: #eee;
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
 }
@@ -628,8 +670,10 @@ onUnmounted(() => {
 
 .toast {
   position: fixed;
-  bottom: 1.25rem;
-  right: 1.25rem;
+  top: 2.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100vw - 1.5rem);
   background: #234a2e;
   color: #d6ffe0;
   padding: 0.6rem 0.9rem;

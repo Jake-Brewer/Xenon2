@@ -148,14 +148,18 @@ async function toggleMic() {
 .input-bar {
   display: flex;
   align-items: flex-end;
+  flex-wrap: wrap;
+  flex-shrink: 0;
   gap: 0.5rem;
   padding: 0.6rem 0.8rem;
   border-top: 1px solid rgba(255, 255, 255, 0.08);
   background: var(--input-bg, #191919);
+  max-width: 100%;
 }
 
 .text-box {
-  flex: 1;
+  flex: 1 1 140px;
+  min-width: 0;
   resize: none;
   max-height: 8rem;
   padding: 0.55rem 0.7rem;

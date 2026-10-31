@@ -116,24 +116,34 @@ pub struct EngineState(pub Arc<Mutex<EngineInner>>);
 /// actual path `load_engine` loads, so it can never drift from what's really running.
 pub struct ModelInfo(pub String);
 
+/// Short label for the menu bar. "CUDA — all layers on GPU" when offload succeeded.
+pub struct DeviceInfo(pub String);
+
 #[tauri::command]
 pub fn get_model_name(model_info: tauri::State<'_, ModelInfo>) -> String {
     model_info.0.clone()
+}
+
+#[tauri::command]
+pub fn get_inference_device(device_info: tauri::State<'_, DeviceInfo>) -> String {
+    device_info.0.clone()
 }
 
 /// Loads the Phase 1 model once at app startup. Panics (fails app startup) rather than silently
 /// falling back to a stub -- per the phase spec, this app must call the real inference engine,
 /// not reimplement or fake it. Also returns a `ModelInfo` derived from the same path, so the name
 /// recorded in saved conversation files (Phase 5) can never drift from what's actually loaded.
-pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
+pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) {
     // Phase 7 follow-up (model upgrade): swapped from RWKV-5 World 0.4B to RWKV-7 World 2.9B v3
     // -- the 0.4B base model was found to collapse onto generic canned replies for short/
     // greeting-style prompts and got basic arithmetic wrong (see conversation history around
     // 2026-08-01). RWKV-7 ("Goose") is a materially more capable architecture per-parameter --
     // the paper reports RWKV7-World3-2.9B nearly matching Qwen2.5-3B on English benchmarks
-    // despite far less training data. Same World tokenizer, same rwkv.cpp conversion pipeline.
-    // Inference is GPU-offloaded (see N_GPU_LAYERS below). This machine is an RTX 2060 with
-    // 6 GB VRAM; the Q5_1 weights are about 2.1 GB with every layer resident on the GPU.
+    // despite far less training data. Same World tokenizer, same rwkv.cpp conversion pipeline,
+    // GPU offload is preferred when this binary was built with CUDA (see build.rs, which links
+    // build-cuda-app ahead of build-cpu-app). An RTX 2060 has 6GB; this Q5_1 file is ~2.75GB
+    // and the RWKV state is ~21MB, so every layer fits. If CUDA init fails, load retries on CPU
+    // so a CUDA build still starts on a machine with no NVIDIA GPU.
     let model_path = repo_root.join("models").join("rwkv-7-world-2.9B-Q5_1.bin");
     let vocab_path = repo_root
         .join("inference-engine")
@@ -150,18 +160,32 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
     let vocab_path_c = CString::new(vocab_path.to_string_lossy().as_bytes())
         .expect("vocab path contains NUL byte");
 
-    // 6 threads for the ops rwkv.cpp still runs on the CPU. N_GPU_LAYERS is clamped by
-    // rwkv.cpp to n_layer+1, and that clamped value offloads every layer plus the output
-    // head (see rwkv_set_params in rwkv_model_loading.inc). 1024 is "everything on GPU".
-    const N_GPU_LAYERS: u32 = 1024;
-    let engine = unsafe {
+    // 6 threads matches the CLI harness default. rwkv.cpp clamps n_gpu_layers to n_layer+1,
+    // so 999 means "every block plus the output head", which is what a 6GB 2060 should do
+    // with this model. A CPU-only library ignores the count (no CUDA backend is compiled in).
+    let gpu_compiled = unsafe { ffi::xenon_has_gpu_support() } != 0;
+    let gpu_layers: u32 = if gpu_compiled { 999 } else { 0 };
+    let mut on_gpu = false;
+    let mut engine = unsafe {
         ffi::xenon_load_model(
             model_path_c.as_ptr(),
             vocab_path_c.as_ptr(),
             6,
-            N_GPU_LAYERS,
+            gpu_layers,
         )
     };
+
+    if engine.is_null() && gpu_layers > 0 {
+        let err = last_error();
+        eprintln!(
+            "xenon2: CUDA offload failed ({err}). Loading the model on CPU instead."
+        );
+        engine = unsafe {
+            ffi::xenon_load_model(model_path_c.as_ptr(), vocab_path_c.as_ptr(), 6, 0)
+        };
+    } else if gpu_layers > 0 {
+        on_gpu = true;
+    }
 
     if engine.is_null() {
         let err = last_error();
@@ -172,6 +196,15 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
             err
         );
     }
+
+    let device_label = if on_gpu {
+        "CUDA — all layers on GPU".to_string()
+    } else if gpu_compiled {
+        "CPU (GPU offload failed)".to_string()
+    } else {
+        "CPU".to_string()
+    };
+    eprintln!("xenon2: inference device: {device_label}");
 
     // Phase 8: prefill the two engine-level static preambles once, up front, instead of
     // re-evaluating them on every single generate/extraction call -- see `EngineInner`'s doc
@@ -210,6 +243,7 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
             conversation_cache: Vec::new(),
         }))),
         ModelInfo(model_name),
+        DeviceInfo(device_label),
     )
 }
 

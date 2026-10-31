@@ -16,11 +16,46 @@ if (NOT XENON_RWKV_BUILD_DIR)
     message(FATAL_ERROR "Set -DXENON_RWKV_BUILD_DIR=<path to rwkv.cpp/build-cpu or rwkv.cpp/build-cuda>")
 endif()
 
-add_library(rwkv_imported SHARED IMPORTED)
-set_target_properties(rwkv_imported PROPERTIES
-    IMPORTED_LOCATION "${XENON_RWKV_BUILD_DIR}/bin/Release/rwkv.dll"
-    IMPORTED_IMPLIB   "${XENON_RWKV_BUILD_DIR}/Release/rwkv.lib"
+# Windows multi-config (Visual Studio) puts rwkv.dll under bin/Release and the import lib
+# under Release/. Ninja/Makefiles on Linux put librwkv.so in the build directory itself.
+set(_rwkv_shared_candidates
+    "${XENON_RWKV_BUILD_DIR}/bin/Release/rwkv.dll"
+    "${XENON_RWKV_BUILD_DIR}/bin/rwkv.dll"
+    "${XENON_RWKV_BUILD_DIR}/librwkv.so"
+    "${XENON_RWKV_BUILD_DIR}/lib/librwkv.so"
+    "${XENON_RWKV_BUILD_DIR}/Release/librwkv.so"
 )
+set(_rwkv_shared "")
+foreach(_candidate ${_rwkv_shared_candidates})
+    if (EXISTS "${_candidate}")
+        set(_rwkv_shared "${_candidate}")
+        break()
+    endif()
+endforeach()
+if (NOT _rwkv_shared)
+    message(FATAL_ERROR
+        "No rwkv shared library under ${XENON_RWKV_BUILD_DIR}. Looked for rwkv.dll and librwkv.so.")
+endif()
+
+add_library(rwkv_imported SHARED IMPORTED)
+set_target_properties(rwkv_imported PROPERTIES IMPORTED_LOCATION "${_rwkv_shared}")
+if (WIN32)
+    set(_rwkv_implib_candidates
+        "${XENON_RWKV_BUILD_DIR}/Release/rwkv.lib"
+        "${XENON_RWKV_BUILD_DIR}/rwkv.lib"
+    )
+    set(_rwkv_implib "")
+    foreach(_candidate ${_rwkv_implib_candidates})
+        if (EXISTS "${_candidate}")
+            set(_rwkv_implib "${_candidate}")
+            break()
+        endif()
+    endforeach()
+    if (NOT _rwkv_implib)
+        message(FATAL_ERROR "rwkv.lib not found under ${XENON_RWKV_BUILD_DIR}")
+    endif()
+    set_target_properties(rwkv_imported PROPERTIES IMPORTED_IMPLIB "${_rwkv_implib}")
+endif()
 target_include_directories(rwkv_imported INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/rwkv.cpp")
 
 add_library(xenon_inference SHARED
@@ -50,16 +85,25 @@ endif()
 
 set_target_properties(xenon_inference test_inference test_state_cache PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+if (UNIX AND NOT APPLE)
+    # The Tauri app and the CLI both load this .so by directory. $ORIGIN lets librwkv.so
+    # resolve from beside libxenon_inference.so without a global ldconfig entry.
+    set_target_properties(xenon_inference PROPERTIES
+        BUILD_RPATH "\$ORIGIN"
+        INSTALL_RPATH "\$ORIGIN"
+    )
+endif()
 
-# rwkv.dll needs to be next to test_inference.exe / test_state_cache.exe to run without manually
-# editing PATH.
+# The rwkv shared library has to sit next to the test binary (and, on Linux, next to
+# libxenon_inference.so) or the dynamic loader will not find it.
 foreach(_xenon_test_target test_inference test_state_cache)
     add_custom_command(TARGET ${_xenon_test_target} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${XENON_RWKV_BUILD_DIR}/bin/Release/rwkv.dll"
-            "$<TARGET_FILE_DIR:${_xenon_test_target}>/rwkv.dll"
-        COMMENT "Copying rwkv.dll next to ${_xenon_test_target}.exe"
+            "${_rwkv_shared}"
+            "$<TARGET_FILE_DIR:${_xenon_test_target}>/"
+        COMMENT "Copying rwkv shared library next to ${_xenon_test_target}"
     )
 
     # Follow-up fix: world_vocab.bin (the World tokenizer's vocab file) must ship next to the
@@ -73,9 +117,18 @@ foreach(_xenon_test_target test_inference test_state_cache)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/data/world_vocab.bin"
             "$<TARGET_FILE_DIR:${_xenon_test_target}>/world_vocab.bin"
-        COMMENT "Copying world_vocab.bin next to ${_xenon_test_target}.exe"
+        COMMENT "Copying world_vocab.bin next to ${_xenon_test_target}"
     )
 endforeach()
+
+if (UNIX AND NOT APPLE)
+    add_custom_command(TARGET xenon_inference POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_rwkv_shared}"
+            "$<TARGET_FILE_DIR:xenon_inference>/"
+        COMMENT "Copying librwkv.so next to libxenon_inference.so"
+    )
+endif()
 
 # Extra runtime DLLs discovered as real, hard requirements while getting this to actually run
 # (not just build) on this machine -- best-effort app-local deployment so test_inference.exe

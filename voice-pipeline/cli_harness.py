@@ -50,7 +50,12 @@ def main():
                           "peak VRAM alongside RWKV) and 'small' (~945 MiB peak) were measured to "
                           "fit comfortably in the ~4GB budget; 'small' is chosen for better "
                           "transcription accuracy since there's ample headroom. See README.)")
-    ap.add_argument("--gpu-layers", type=int, default=24, help="RWKV layers to offload to GPU.")
+    ap.add_argument(
+        "--gpu-layers",
+        type=int,
+        default=999,
+        help="RWKV layers to offload to GPU. 999 means every layer (clamped to the model).",
+    )
     ap.add_argument("--max-response-tokens", type=int, default=60)
     ap.add_argument("--no-speak", action="store_true", help="Skip audio playback (still synthesizes).")
     ap.add_argument("--max-listen-sec", type=float, default=6.0)

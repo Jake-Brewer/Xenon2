@@ -22,9 +22,22 @@ from typing import Callable, Optional
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_THIS_DIR)
 
-DEFAULT_DLL_PATH = os.path.join(
-    REPO_ROOT, "inference-engine", "build-cuda-app", "bin", "Release", "xenon_inference.dll"
-)
+def _default_lib_path() -> str:
+    """CUDA build, Windows DLL layout or Linux libxenon_inference.so layout."""
+    base = os.path.join(REPO_ROOT, "inference-engine", "build-cuda-app")
+    candidates = [
+        os.path.join(base, "bin", "Release", "xenon_inference.dll"),
+        os.path.join(base, "bin", "libxenon_inference.so"),
+        os.path.join(base, "libxenon_inference.so"),
+        os.path.join(base, "bin", "Release", "libxenon_inference.so"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+DEFAULT_DLL_PATH = _default_lib_path()
 DEFAULT_MODEL_PATH = os.path.join(REPO_ROOT, "models", "rwkv-5-world-0.4B-Q4_0.bin")
 DEFAULT_VOCAB_PATH = os.path.join(REPO_ROOT, "inference-engine", "data", "world_vocab.bin")
 
@@ -56,6 +69,10 @@ def _load_lib(dll_path: str) -> ctypes.CDLL:
         os.add_dll_directory(dll_dir)  # py3.8+
     except (AttributeError, FileNotFoundError, OSError):
         pass
+    # Linux: load librwkv.so from the same directory before libxenon_inference.so needs it.
+    rwkv_so = os.path.join(dll_dir, "librwkv.so")
+    if os.path.exists(rwkv_so):
+        ctypes.CDLL(rwkv_so, mode=ctypes.RTLD_GLOBAL)
     return ctypes.CDLL(dll_path)
 
 
@@ -127,18 +144,20 @@ class XenonEngine:
         model_path: str = DEFAULT_MODEL_PATH,
         vocab_path: str = DEFAULT_VOCAB_PATH,
         n_threads: int = 6,
-        n_gpu_layers: int = 24,
+        # rwkv.cpp clamps this to n_layer+1. 999 offloads every layer onto the GPU.
+        # An RTX 2060 (6GB) holds the Q5_1 2.9B weights (~2.75GB) plus the ~21MB state.
+        n_gpu_layers: int = 999,
     ):
         self.lib = _load_lib(dll_path)
         _configure_signatures(self.lib)
 
         self.has_gpu_support = bool(self.lib.xenon_has_gpu_support())
         if n_gpu_layers > 0 and not self.has_gpu_support:
-            raise RuntimeError(
-                "Requested GPU offload (n_gpu_layers > 0) but this xenon_inference.dll build "
-                "was not compiled with CUDA support -- point dll_path at build-cuda-app, not "
-                "build-cpu-app."
+            print(
+                "This xenon_inference build has no CUDA support. Loading on CPU.",
+                file=__import__("sys").stderr,
             )
+            n_gpu_layers = 0
 
         self.n_gpu_layers = n_gpu_layers
 
@@ -146,6 +165,17 @@ class XenonEngine:
         self._engine = self.lib.xenon_load_model(
             model_path.encode("utf-8"), vocab_path.encode("utf-8"), n_threads, n_gpu_layers
         )
+        if not self._engine and n_gpu_layers > 0:
+            err = self.lib.xenon_get_last_error()
+            err_text = err.decode("utf-8", errors="replace") if err else ""
+            print(
+                f"CUDA offload failed ({err_text}). Loading on CPU instead.",
+                file=__import__("sys").stderr,
+            )
+            self.n_gpu_layers = 0
+            self._engine = self.lib.xenon_load_model(
+                model_path.encode("utf-8"), vocab_path.encode("utf-8"), n_threads, 0
+            )
         self.load_sec = time.perf_counter() - t0
 
         if not self._engine:

@@ -6,7 +6,52 @@ mod sloth_memory;
 mod voice;
 
 use std::path::PathBuf;
-use tauri::Manager;
+use tauri::{Manager, PhysicalPosition, PhysicalSize};
+
+/// Open maximized on the monitor the window is actually on, so a 1920x1080 laptop
+/// panel and a larger external display both get a window that fills the work area
+/// (the space below the menu bar, not under it). If the saved position is off every
+/// display, move onto the primary monitor first. Wayland often rejects set_position;
+/// maximize() is what makes the window fit.
+fn fit_window_to_screen(app: &tauri::App) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let Ok(monitors) = window.available_monitors() else {
+        let _ = window.maximize();
+        return;
+    };
+    let on_a_screen = window.outer_position().ok().zip(window.outer_size().ok()).is_some_and(|(pos, size)| {
+        monitors.iter().any(|m| {
+            let area = m.work_area();
+            let x1 = pos.x.max(area.position.x);
+            let y1 = pos.y.max(area.position.y);
+            let x2 = (pos.x + size.width as i32).min(area.position.x + area.size.width as i32);
+            let y2 = (pos.y + size.height as i32).min(area.position.y + area.size.height as i32);
+            x2 - x1 > 48 && y2 - y1 > 48
+        })
+    });
+    if !on_a_screen {
+        if let Some(monitor) = window.primary_monitor().ok().flatten().or_else(|| monitors.into_iter().next()) {
+            let area = monitor.work_area();
+            let _ = window.set_position(PhysicalPosition::new(area.position.x, area.position.y));
+            let _ = window.set_size(PhysicalSize::new(area.size.width, area.size.height));
+        }
+    }
+    if let Err(err) = window.maximize() {
+        eprintln!("xenon2: maximize failed ({err}); sizing to the work area");
+        let monitor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| window.primary_monitor().ok().flatten());
+        if let Some(monitor) = monitor {
+            let area = monitor.work_area();
+            let _ = window.set_position(PhysicalPosition::new(area.position.x, area.position.y));
+            let _ = window.set_size(PhysicalSize::new(area.size.width, area.size.height));
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -25,9 +70,12 @@ pub fn run() {
                 .expect("repo root")
                 .to_path_buf();
 
-            let (engine_state, model_info) = inference::load_engine(&repo_root);
+            fit_window_to_screen(app);
+
+            let (engine_state, model_info, device_info) = inference::load_engine(&repo_root);
             app.manage(engine_state);
             app.manage(model_info);
+            app.manage(device_info);
             // Phase 6: export/import need to find models/, inference-engine/data/, and
             // voice-pipeline/models/ relative to the repo root too, so it's kept as managed state
             // instead of being recomputed from CARGO_MANIFEST_DIR a second time.
@@ -42,11 +90,82 @@ pub fn run() {
             let voice_process = voice::spawn_voice_process(&repo_root, app.handle().clone());
             app.manage(voice::VoiceState(voice_process));
 
+            // Model load blocks this closure, and the window is mapped only after it
+            // returns. Measure (and re-maximize) once the compositor has the window.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                let handle_for_fit = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    if let Some(window) = handle_for_fit.get_webview_window("main") {
+                        // Wayland ignores most moves. Still ask for the primary monitor
+                        // (the one with the panel) before maximizing, so a second display
+                        // does not keep the window on the other panel.
+                        if let Some(primary) = window.primary_monitor().ok().flatten() {
+                            let area = primary.work_area();
+                            let _ = window.set_position(PhysicalPosition::new(
+                                area.position.x,
+                                area.position.y,
+                            ));
+                        }
+                        let _ = window.maximize();
+                    }
+                });
+                std::thread::sleep(std::time::Duration::from_millis(600));
+                let handle_for_log = handle.clone();
+                let _ = handle.run_on_main_thread(move || {
+                    let Some(window) = handle_for_log.get_webview_window("main") else {
+                        return;
+                    };
+                    let maxed = window.is_maximized().unwrap_or(false);
+                    let size = window.outer_size().ok();
+                    let pos = window.outer_position().ok();
+                    let monitor = window
+                        .current_monitor()
+                        .ok()
+                        .flatten()
+                        .or_else(|| window.primary_monitor().ok().flatten());
+                    let work = monitor.as_ref().map(|monitor| {
+                        let area = monitor.work_area();
+                        format!(
+                            "{}x{} at {},{} ({})",
+                            area.size.width,
+                            area.size.height,
+                            area.position.x,
+                            area.position.y,
+                            monitor.name().map(|name| name.as_str()).unwrap_or("")
+                        )
+                    });
+                    if let (Some(size), Some(monitor)) = (size, monitor.as_ref()) {
+                        let area = monitor.work_area();
+                        // A dock or top bar already makes a maximized window a little
+                        // smaller than the monitor's full mode. Only step in when the
+                        // window is still the un-maximized startup size.
+                        let too_small = size.width > 0
+                            && size.height > 0
+                            && (size.width + 160 < area.size.width
+                                || size.height + 160 < area.size.height);
+                        if !maxed && too_small {
+                            let _ = window.set_position(PhysicalPosition::new(
+                                area.position.x,
+                                area.position.y,
+                            ));
+                            let _ = window
+                                .set_size(PhysicalSize::new(area.size.width, area.size.height));
+                        }
+                    }
+                    eprintln!(
+                        "xenon2: window maximized={maxed} outer={size:?} pos={pos:?} work={work:?}"
+                    );
+                });
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             inference::generate_response,
             inference::get_model_name,
+            inference::get_inference_device,
             persistence::save_conversation_file,
             persistence::open_conversation_file,
             persistence::pick_save_dialog,
