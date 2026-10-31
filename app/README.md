@@ -27,9 +27,9 @@ npm install        # first time only
 npm run tauri dev
 ```
 
-`npm run tauri` runs `scripts/run_desktop.sh`, which drops the GTK paths a VS Code
-snap terminal exports. Without that, WebKit aborts on a schema mismatch before
-the window opens. A normal desktop launch does not have those variables.
+`npm run tauri` runs `scripts/run_desktop.mjs`. On Linux that drops the GTK paths
+a VS Code snap terminal exports, which otherwise make WebKit abort on a schema
+mismatch before the window opens. On Windows it starts the Tauri CLI directly.
 
 The first build compiles the Rust/Tauri dependency tree from scratch and can take several
 minutes; subsequent builds are incremental and fast. This launches a real desktop window (not a
