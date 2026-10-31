@@ -1,15 +1,13 @@
 // build.rs
 //
 // Links this crate against Phase 1's pre-built `xenon_inference` shared library
-// (inference-engine/build-cpu-app) and copies its runtime DLLs (xenon_inference.dll, rwkv.dll,
-// plus the MSVC/UCRT redistributable DLLs that build already collected next to
+// (inference-engine/build-cuda-app) and copies its runtime DLLs (xenon_inference.dll, rwkv.dll,
+// cuBLAS, plus the MSVC/UCRT redistributable DLLs that build already collected next to
 // test_inference.exe) next to this crate's own build output, so the Tauri app can load them at
 // runtime without editing PATH.
 //
-// This intentionally links the CPU-only build (build-cpu-app), not build-cuda-app -- see
-// src/inference.rs for why (matches Phase 1's documented steady-state throughput finding: for
-// this model size, CPU-only is the safer/faster default, and it avoids depending on a CUDA
-// toolkit being present on whatever machine runs this app).
+// This links the CUDA build so RWKV inference runs on the NVIDIA GPU. On this machine that is
+// an RTX 2060 (6 GB). build-cpu-app remains a valid alternate configure of the C++ library.
 
 use std::env;
 use std::fs;
@@ -25,13 +23,13 @@ fn main() {
         .expect("repo root")
         .to_path_buf();
 
-    let build_dir = repo_root.join("inference-engine").join("build-cpu-app");
+    let build_dir = repo_root.join("inference-engine").join("build-cuda-app");
     let lib_dir = build_dir.join("Release"); // xenon_inference.lib (import lib)
-    let dll_dir = build_dir.join("bin").join("Release"); // xenon_inference.dll, rwkv.dll, redist DLLs
+    let dll_dir = build_dir.join("bin").join("Release"); // xenon_inference.dll, rwkv.dll, cublas, redist DLLs
 
     if !lib_dir.join("xenon_inference.lib").exists() {
         panic!(
-            "xenon_inference.lib not found at {} -- build inference-engine/build-cpu-app first \
+            "xenon_inference.lib not found at {} -- build inference-engine/build-cuda-app first \
              (see inference-engine/README.md, section '2. Build the xenon_inference wrapper').",
             lib_dir.display()
         );

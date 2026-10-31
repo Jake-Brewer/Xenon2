@@ -131,11 +131,9 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
     // greeting-style prompts and got basic arithmetic wrong (see conversation history around
     // 2026-08-01). RWKV-7 ("Goose") is a materially more capable architecture per-parameter --
     // the paper reports RWKV7-World3-2.9B nearly matching Qwen2.5-3B on English benchmarks
-    // despite far less training data. Same World tokenizer, same rwkv.cpp conversion pipeline,
-    // still CPU-only (measured: CPU 8.95 tok/s vs GPU-offloaded 11.18 tok/s for this model on
-    // this machine -- GPU is faster now, unlike the 0.4B result, but CPU-only was kept to avoid
-    // making the app hard-depend on a CUDA-capable GPU, matching the project's portable/
-    // USB-first goal; revisit if that tradeoff should flip).
+    // despite far less training data. Same World tokenizer, same rwkv.cpp conversion pipeline.
+    // Inference is GPU-offloaded (see N_GPU_LAYERS below). This machine is an RTX 2060 with
+    // 6 GB VRAM; the Q5_1 weights are about 2.1 GB with every layer resident on the GPU.
     let model_path = repo_root.join("models").join("rwkv-7-world-2.9B-Q5_1.bin");
     let vocab_path = repo_root
         .join("inference-engine")
@@ -152,10 +150,18 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo) {
     let vocab_path_c = CString::new(vocab_path.to_string_lossy().as_bytes())
         .expect("vocab path contains NUL byte");
 
-    // 6 threads to match Phase 1's CLI harness default (a reasonable middle ground on this
-    // 16c/24t dev machine); 0 GPU layers -- see build.rs for why this app links the CPU-only
-    // build of the inference engine.
-    let engine = unsafe { ffi::xenon_load_model(model_path_c.as_ptr(), vocab_path_c.as_ptr(), 6, 0) };
+    // 6 threads for the ops rwkv.cpp still runs on the CPU. N_GPU_LAYERS is clamped by
+    // rwkv.cpp to n_layer+1, and that clamped value offloads every layer plus the output
+    // head (see rwkv_set_params in rwkv_model_loading.inc). 1024 is "everything on GPU".
+    const N_GPU_LAYERS: u32 = 1024;
+    let engine = unsafe {
+        ffi::xenon_load_model(
+            model_path_c.as_ptr(),
+            vocab_path_c.as_ptr(),
+            6,
+            N_GPU_LAYERS,
+        )
+    };
 
     if engine.is_null() {
         let err = last_error();
