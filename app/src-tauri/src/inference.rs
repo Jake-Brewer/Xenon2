@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::ffi::{c_void, CStr, CString};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -129,6 +130,105 @@ pub fn get_inference_device(device_info: tauri::State<'_, DeviceInfo>) -> String
     device_info.0.clone()
 }
 
+/// One ggml worker per physical core. Hyperthreads share a core's execution units, and this
+/// model gets slower when two workers are pinned to the same core. Dementia and Sloth both use
+/// the single engine loaded below, so they both get this count.
+fn inference_threads() -> u32 {
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .max(1);
+    let physical = physical_cpus().unwrap_or(logical);
+    physical.clamp(1, logical)
+}
+
+fn logical_cpus() -> u32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(windows)]
+fn physical_cpus() -> Option<u32> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLogicalProcessorInformation(buffer: *mut u8, returned_length: *mut u32) -> i32;
+    }
+    let mut bytes = 0u32;
+    unsafe {
+        GetLogicalProcessorInformation(std::ptr::null_mut(), &mut bytes);
+    }
+    if bytes == 0 {
+        return None;
+    }
+    // The struct is 8-byte aligned. A byte Vec is not, and a misaligned buffer
+    // makes the call fail, which would fall back to one worker per hyperthread.
+    let words = (bytes as usize).div_ceil(8);
+    let mut buf = vec![0u64; words];
+    let ok = unsafe {
+        GetLogicalProcessorInformation(buf.as_mut_ptr() as *mut u8, &mut bytes)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let reported = bytes as usize;
+    let raw = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, reported.min(buf.len() * 8)) };
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION on x64 is 32 bytes. Relationship is at offset 8.
+    // RelationProcessorCore == 0.
+    const STRIDE: usize = 32;
+    let mut cores = 0u32;
+    let mut off = 0;
+    while off + STRIDE <= raw.len() {
+        let relationship = u32::from_ne_bytes(raw[off + 8..off + 12].try_into().ok()?);
+        if relationship == 0 {
+            cores += 1;
+        }
+        off += STRIDE;
+    }
+    if cores == 0 {
+        None
+    } else {
+        Some(cores)
+    }
+}
+
+#[cfg(not(windows))]
+fn physical_cpus() -> Option<u32> {
+    std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
+        .ok()
+        .map(|_| logical_cpus() / 2)
+        .filter(|n| *n >= 1)
+}
+
+/// Free VRAM in MiB, when `nvidia-smi` can answer. Used to decide how many RWKV layers fit
+/// on the GPU without pushing Whisper off the card.
+fn gpu_memory_free_mib() -> Option<u32> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().next()?.trim().parse().ok()
+}
+
+/// Q5_1 weights are about 2.6 GB. Full offload needs that plus activations, with room left
+/// for Whisper on the same GPU. A tighter card keeps some blocks on the CPU instead of
+/// dropping all the way to a CPU-only load.
+fn preferred_gpu_layers(free_mib: Option<u32>) -> u32 {
+    match free_mib {
+        Some(free) if free < 1200 => 0,
+        Some(free) if free < 3400 => 16,
+        _ => 999,
+    }
+}
+
 /// Loads the Phase 1 model once at app startup. Panics (fails app startup) rather than silently
 /// falling back to a stub -- per the phase spec, this app must call the real inference engine,
 /// not reimplement or fake it. Also returns a `ModelInfo` derived from the same path, so the name
@@ -160,31 +260,47 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     let vocab_path_c = CString::new(vocab_path.to_string_lossy().as_bytes())
         .expect("vocab path contains NUL byte");
 
-    // 6 threads matches the CLI harness default. rwkv.cpp clamps n_gpu_layers to n_layer+1,
-    // so 999 means "every block plus the output head", which is what a 6GB 2060 should do
-    // with this model. A CPU-only library ignores the count (no CUDA backend is compiled in).
+    // Dementia and Sloth share this one engine. Thread count follows the physical cores.
+    // rwkv.cpp clamps n_gpu_layers to n_layer+1, and that clamped value offloads every block
+    // plus the output head. A CPU-only library ignores the layer count.
+    let threads = inference_threads();
     let gpu_compiled = unsafe { ffi::xenon_has_gpu_support() } != 0;
-    let gpu_layers: u32 = if gpu_compiled { 999 } else { 0 };
-    let mut on_gpu = false;
-    let mut engine = unsafe {
-        ffi::xenon_load_model(
-            model_path_c.as_ptr(),
-            vocab_path_c.as_ptr(),
-            6,
-            gpu_layers,
-        )
-    };
+    let free_mib = gpu_memory_free_mib();
+    let mut layer_plan = Vec::new();
+    if gpu_compiled {
+        let preferred = preferred_gpu_layers(free_mib);
+        layer_plan.push(preferred);
+        if preferred > 16 {
+            layer_plan.push(16);
+        }
+        if preferred != 0 {
+            layer_plan.push(0);
+        }
+    } else {
+        layer_plan.push(0);
+    }
 
-    if engine.is_null() && gpu_layers > 0 {
-        let err = last_error();
-        eprintln!(
-            "xenon2: CUDA offload failed ({err}). Loading the model on CPU instead."
-        );
+    let mut engine = std::ptr::null_mut();
+    let mut used_layers = 0u32;
+    for (attempt, &layers) in layer_plan.iter().enumerate() {
+        if attempt > 0 {
+            eprintln!(
+                "xenon2: model load with the previous GPU plan failed ({}). Retrying with {layers} GPU layers.",
+                last_error()
+            );
+        }
         engine = unsafe {
-            ffi::xenon_load_model(model_path_c.as_ptr(), vocab_path_c.as_ptr(), 6, 0)
+            ffi::xenon_load_model(
+                model_path_c.as_ptr(),
+                vocab_path_c.as_ptr(),
+                threads,
+                layers,
+            )
         };
-    } else if gpu_layers > 0 {
-        on_gpu = true;
+        if !engine.is_null() {
+            used_layers = layers;
+            break;
+        }
     }
 
     if engine.is_null() {
@@ -197,14 +313,21 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
         );
     }
 
-    let device_label = if on_gpu {
-        "CUDA — all layers on GPU".to_string()
-    } else if gpu_compiled {
-        "CPU (GPU offload failed)".to_string()
+    let n_layer = unsafe { ffi::xenon_get_n_layer(engine) } as u32;
+    let device_label = if used_layers == 0 {
+        format!("CPU · {threads} threads")
+    } else if used_layers >= n_layer.saturating_add(1) {
+        format!("CUDA — all layers on GPU · {threads} threads")
     } else {
-        "CPU".to_string()
+        format!("CUDA — {used_layers} layers on GPU, rest on CPU · {threads} threads")
     };
-    eprintln!("xenon2: inference device: {device_label}");
+    eprintln!(
+        "xenon2: inference device: {device_label} (logical cpus {}, free vram {})",
+        logical_cpus(),
+        free_mib
+            .map(|m| format!("{m} MiB"))
+            .unwrap_or_else(|| "unknown".to_string())
+    );
 
     // Phase 8: prefill the two engine-level static preambles once, up front, instead of
     // re-evaluating them on every single generate/extraction call -- see `EngineInner`'s doc
@@ -353,8 +476,74 @@ fn volatile_header_text(facts: &[sloth_memory::SlothFact]) -> String {
     out
 }
 
-fn ends_with_stop(tail: &str) -> bool {
-    tail.ends_with("\n\nUser:") || tail.ends_with("\n\nuser:")
+const STOP_SEQUENCES: &[&str] = &["\n\nUser:", "\n\nuser:"];
+
+/// How many trailing bytes of `text` are a proper prefix of a stop sequence. Those bytes stay
+/// buffered so the chat never shows the next "User:" prompt, or a cursor sitting on it.
+fn stop_hold_len(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut best = 0;
+    for stop in STOP_SEQUENCES {
+        let stop_b = stop.as_bytes();
+        let max = bytes.len().min(stop_b.len().saturating_sub(1));
+        for n in (1..=max).rev() {
+            if &bytes[bytes.len() - n..] == &stop_b[..n] {
+                best = best.max(n);
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn emit_visible(ctx: &CallbackCtx, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    ctx.full_text.borrow_mut().push_str(text);
+    let _ = ctx.app.emit(
+        "token-stream",
+        TokenEvent {
+            conversation_id: ctx.conversation_id.clone(),
+            text: text.to_string(),
+        },
+    );
+}
+
+/// Appends one generated fragment. Returns false when the model has started the next user turn
+/// and generation should stop. The "User:" text itself is not emitted.
+fn absorb_token(ctx: &CallbackCtx, text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    let mut pending = ctx.pending.borrow_mut();
+    pending.push_str(text);
+    for stop in STOP_SEQUENCES {
+        if pending.ends_with(stop) {
+            let keep = pending.len() - stop.len();
+            let emit = pending[..keep].to_string();
+            pending.clear();
+            drop(pending);
+            emit_visible(ctx, &emit);
+            return false;
+        }
+    }
+    let hold = stop_hold_len(&pending);
+    let emit_end = pending.len() - hold;
+    let emit = pending[..emit_end].to_string();
+    pending.drain(..emit_end);
+    drop(pending);
+    emit_visible(ctx, &emit);
+    true
+}
+
+fn flush_pending(ctx: &CallbackCtx) {
+    let rest = std::mem::take(&mut *ctx.pending.borrow_mut());
+    if rest.is_empty() {
+        return;
+    }
+    let hold = stop_hold_len(&rest);
+    emit_visible(ctx, &rest[..rest.len() - hold]);
 }
 
 /// Context handed to the C callback via the `user_data` void*. The callback runs synchronously
@@ -362,11 +551,9 @@ fn ends_with_stop(tail: &str) -> bool {
 struct CallbackCtx {
     app: AppHandle,
     conversation_id: String,
-    tail: RefCell<String>,
-    /// Full generated text, untruncated (unlike `tail`, which is capped for stop-sequence
-    /// checking) -- used by the Sloth fact-extraction step after generation completes. `None`
-    /// for the extraction call itself (see `run_fact_extraction`), which uses a separate,
-    /// simpler callback that doesn't emit `token-stream` events.
+    /// Tail that might still turn into "\n\nUser:". Not shown until it can't be that prompt.
+    pending: RefCell<String>,
+    /// Reply text actually shown (stop sequence excluded). Used by Sloth fact extraction.
     full_text: RefCell<String>,
 }
 
@@ -379,37 +566,12 @@ extern "C" fn on_token(
         return true;
     }
     let ctx = unsafe { &*(user_data as *const CallbackCtx) };
-
     let text_str = if text.is_null() {
         ""
     } else {
         unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("")
     };
-
-    if !text_str.is_empty() {
-        let _ = ctx.app.emit(
-            "token-stream",
-            TokenEvent {
-                conversation_id: ctx.conversation_id.clone(),
-                text: text_str.to_string(),
-            },
-        );
-
-        ctx.full_text.borrow_mut().push_str(text_str);
-
-        let mut tail = ctx.tail.borrow_mut();
-        tail.push_str(text_str);
-        let len = tail.len();
-        if len > 64 {
-            tail.drain(0..len - 64);
-        }
-
-        if ends_with_stop(&tail) {
-            return false; // natural end of this turn, matches the CLI harness's stop heuristic
-        }
-    }
-
-    true
+    absorb_token(ctx, text_str)
 }
 
 /// Minimal callback for the Sloth fact-extraction call -- just accumulates text into `user_data`
@@ -760,7 +922,7 @@ fn generate_blocking(
     let ctx = CallbackCtx {
         app: app.clone(),
         conversation_id: conversation_id.clone(),
-        tail: RefCell::new(String::new()),
+        pending: RefCell::new(String::new()),
         full_text: RefCell::new(String::new()),
     };
     let ctx_ptr = &ctx as *const CallbackCtx as *mut c_void;
@@ -790,12 +952,18 @@ fn generate_blocking(
 
     unsafe { ffi::xenon_state_free(turn_state) };
 
+    // Drop a held "\n\nUser:" prefix. Anything else still buffered is real reply text.
+    flush_pending(&ctx);
+
     if status == ffi::XenonStatus::OK {
+        let reply_text = ctx.full_text.borrow().clone();
+        // Done before Sloth's extraction pass. A mic reply speaks its last
+        // sentence from this event, and extraction is a second generate on the
+        // same engine. Waiting would hold that audio until the extra pass ends.
+        let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id: conversation_id.clone() });
         if is_sloth {
-            let reply_text = ctx.full_text.borrow();
             run_fact_extraction(engine, &inner.extraction_prefix, &app, &new_user_turn.content, &reply_text);
         }
-        let _ = app.emit("generation-done", GenerationDoneEvent { conversation_id });
     } else {
         let _ = app.emit(
             "generation-error",

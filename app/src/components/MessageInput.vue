@@ -2,11 +2,9 @@
 // MessageInput.vue -- text box + send button + mic button, all fully functional (Phase 7).
 //
 // Clicking the mic starts real VAD-gated mic capture via the voice-pipeline sidecar
-// (`voice_listen`, see app/src-tauri/src/voice.rs): it blocks (from this component's
-// perspective, as an awaited invoke() call) until speech is detected and transcribed, or a
-// listen/utterance timeout is hit. A successful transcript is emitted as `voice-send`, which
-// App.vue feeds into the exact same store.sendMessage path typed text uses -- not a separate
-// voice-only code path (per phase7_prompt.md task 1).
+// (`voice_listen`, see app/src-tauri/src/voice.rs). The button stays usable while a reply
+// is generating. A transcript is emitted as `voice-send`. App.vue sends it through the same
+// store.sendMessage path as typed text, or holds it until the engine and playback are free.
 
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -25,6 +23,9 @@ const props = defineProps<{
    * the sidecar's own startup instead of failing), but is visually dimmed with an explanatory
    * title so it doesn't look broken during the few seconds of startup. */
   voiceReady?: boolean;
+  /** True while a reply is generating or its speech is still playing. A transcript captured
+   * then is kept and sent later instead of being dropped. */
+  voiceBusy?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -50,8 +51,16 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
+function listenFailure(reason?: string): string {
+  if (reason === "no_speech_timeout") return "No speech detected";
+  if (reason === "too_quiet") return "Mic was too quiet";
+  if (reason === "busy") return "Still listening";
+  if (reason === "error") return "Voice input unavailable";
+  return "Didn't catch that";
+}
+
 async function toggleMic() {
-  if (props.disabled || listening.value) return;
+  if (listening.value) return;
   listening.value = true;
   micStatus.value = "Listening...";
   try {
@@ -61,9 +70,14 @@ async function toggleMic() {
     });
     if (result.ok && result.text) {
       emit("voice-send", result.text);
-      micStatus.value = "";
+      micStatus.value = props.voiceBusy ? "Queued until Xenon is free" : "";
+      if (props.voiceBusy) {
+        window.setTimeout(() => {
+          if (micStatus.value === "Queued until Xenon is free") micStatus.value = "";
+        }, 2500);
+      }
     } else {
-      micStatus.value = result.reason === "no_speech_timeout" ? "No speech detected" : "Didn't catch that";
+      micStatus.value = listenFailure(result.reason);
       window.setTimeout(() => {
         if (!listening.value) micStatus.value = "";
       }, 2000);

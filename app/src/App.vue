@@ -133,20 +133,84 @@ async function sendMessage(text: string) {
   scrollToBottom();
 }
 
-// Phase 7: mic button transcript feeds the exact same sendMessage/store path typed text uses --
-// no parallel voice-only code path, per phase7_prompt.md task 1. `viaVoice=true` marks the reply
-// for spoken playback (see store.currentTurnIsVoice and the token-stream/generation-done/
-// generation-error handlers below, which forward text to the voice sidecar's TTS while it's set).
-async function onVoiceSend(text: string) {
+// Voice transcripts share sendMessage with typed text. Ones that arrive while RWKV is
+// generating, or while the reply is still being spoken, stay in this queue and go out
+// when both are free. Playback of one turn is not cut off to start the next.
+const pendingVoice: string[] = [];
+let pumpingVoice = false;
+const speechOutActive = ref(false);
+let speakStartOk = false;
+let awaitingSpeakDone = false;
+
+function finishVoicePlayback() {
+  if (!store.currentTurnIsVoice) return;
+  store.currentTurnIsVoice = false;
+  requestSpeakFinish();
+}
+
+function requestSpeakFinish() {
+  if (!speakStartOk) {
+    speechOutActive.value = false;
+    return;
+  }
+  awaitingSpeakDone = true;
+  invoke("voice_speak_finish").catch((err) => {
+    console.warn("[App] voice_speak_finish failed:", err);
+    awaitingSpeakDone = false;
+    speechOutActive.value = false;
+    void pumpVoice();
+  });
+}
+
+function enqueueVoice(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  pendingVoice.push(trimmed);
+  void pumpVoice();
+}
+
+async function pumpVoice() {
+  if (pumpingVoice) return;
+  pumpingVoice = true;
+  try {
+    while (pendingVoice.length && !store.generating && !speechOutActive.value) {
+      const next = pendingVoice.shift();
+      if (next) await startVoiceTurn(next);
+    }
+  } finally {
+    pumpingVoice = false;
+    if (pendingVoice.length && !store.generating && !speechOutActive.value) void pumpVoice();
+  }
+}
+
+async function startVoiceTurn(text: string) {
+  speechOutActive.value = true;
+  speakStartOk = false;
   scrollToBottom();
   try {
     await invoke("voice_speak_start");
+    speakStartOk = true;
   } catch (err) {
+    speakStartOk = false;
+    speechOutActive.value = false;
     console.warn("[App] voice_speak_start failed (continuing without spoken reply):", err);
   }
-  await store.sendMessage(text, true);
-  store.currentTurnIsVoice = false;
+  const started = await store.sendMessage(text, true);
+  if (!started) {
+    pendingVoice.unshift(text);
+    if (speakStartOk) requestSpeakFinish();
+    else speechOutActive.value = false;
+    return;
+  }
+  // generation-done usually lands while sendMessage is still awaiting the backend,
+  // and that handler flushes speech. If the backend returned without the event,
+  // the flag is still set and the last sentence would never be spoken.
+  if (!store.generating) finishVoicePlayback();
   scrollToBottom();
+}
+
+function onVoiceSend(text: string) {
+  enqueueVoice(text);
 }
 
 async function editMessage(messageId: string, newText: string) {
@@ -180,6 +244,7 @@ let unlistenImportProgress: UnlistenFn | null = null;
 let unlistenImportDone: UnlistenFn | null = null;
 let unlistenImportError: UnlistenFn | null = null;
 let unlistenSlothFactsUpdated: UnlistenFn | null = null;
+let unlistenSpeakDone: UnlistenFn | null = null;
 
 type MemoryProgressPayload = {
   file: string;
@@ -242,21 +307,33 @@ onMounted(async () => {
   });
 
   unlistenDone = await listen<{ conversationId: string }>("generation-done", (event) => {
+    // Clear the flag before completeGeneration so a late token cannot start a second speak.
+    const speakThisTurn = store.currentTurnIsVoice;
+    store.currentTurnIsVoice = false;
     store.completeGeneration(event.payload.conversationId);
-    if (store.currentTurnIsVoice) {
-      invoke("voice_speak_finish").catch((err) => console.warn("[App] voice_speak_finish failed:", err));
-    }
+    if (speakThisTurn) requestSpeakFinish();
+    void pumpVoice();
   });
 
   unlistenError = await listen<{ conversationId: string; message: string }>(
     "generation-error",
     (event) => {
+      const speakThisTurn = store.currentTurnIsVoice;
+      store.currentTurnIsVoice = false;
       store.failGeneration(event.payload.conversationId, event.payload.message);
-      // Deliberately not calling voice_speak_finish here -- there's nothing meaningful buffered
-      // to speak for a failed generation. The sidecar tears down any left-open speaker itself on
-      // the next speak_start (see ipc_server.py's handle_speak_start), so nothing leaks.
+      // Flush whatever was already fed. finish() speaks a short reply that never
+      // hit sentence punctuation, and the next speak_start also drops a leftover speaker.
+      if (speakThisTurn) requestSpeakFinish();
+      void pumpVoice();
     }
   );
+
+  unlistenSpeakDone = await listen("voice-speak-done", () => {
+    if (!awaitingSpeakDone) return;
+    awaitingSpeakDone = false;
+    speechOutActive.value = false;
+    void pumpVoice();
+  });
 
   // Phase 7: poll the voice sidecar's readiness (model loading takes a few seconds -- see
   // voice-pipeline/README.md's load times) until it reports ready, then stop polling.
@@ -279,6 +356,7 @@ onUnmounted(() => {
   unlistenImportDone?.();
   unlistenImportError?.();
   unlistenSlothFactsUpdated?.();
+  unlistenSpeakDone?.();
 });
 </script>
 
@@ -341,6 +419,7 @@ onUnmounted(() => {
         <MessageInput
           :disabled="store.generating"
           :voice-ready="store.voiceReady"
+          :voice-busy="store.generating || speechOutActive"
           @send="sendMessage"
           @voice-send="onVoiceSend"
         />
@@ -438,12 +517,12 @@ onUnmounted(() => {
 
 <style scoped>
 .app-shell {
+  position: fixed;
+  inset: 0;
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  height: 100dvh;
-  width: 100vw;
-  max-width: 100vw;
+  width: 100%;
+  height: 100%;
   overflow: hidden;
 }
 
@@ -478,7 +557,7 @@ onUnmounted(() => {
 }
 
 .messages {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;

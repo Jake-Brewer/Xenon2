@@ -31,6 +31,8 @@ from typing import List, Optional
 
 import numpy as np
 
+from hardware import physical_cpus
+
 SAMPLE_RATE = 16000
 
 _cuda12_dlls_added = False
@@ -112,9 +114,18 @@ class SpeechToText:
         self.requested_device = device
         self.model_size = model_size
         self.compute_type = compute_type
+        # The GPU path still runs the feature extractor on the CPU. One worker
+        # per physical core; hyperthreads make that extractor and RWKV slower.
+        self.cpu_threads = physical_cpus()
 
         t0 = time.perf_counter()
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        self.model = WhisperModel(
+            model_size,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=self.cpu_threads,
+            num_workers=1,
+        )
         self.load_sec = time.perf_counter() - t0
 
         # Confirm the actual execution device CTranslate2 is using -- do not just trust
@@ -158,7 +169,16 @@ class SpeechToText:
             raise ValueError(f"faster-whisper expects {SAMPLE_RATE} Hz audio, got {sample_rate}")
 
         t0 = time.perf_counter()
-        segments, info = self.model.transcribe(audio, language="en", beam_size=1, vad_filter=False)
+        segments, info = self.model.transcribe(
+            audio,
+            language="en",
+            beam_size=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            # Silero already decided this clip contains speech. Whisper's own
+            # no-speech filter was discarding quiet headset audio.
+            no_speech_threshold=None,
+        )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         transcribe_sec = time.perf_counter() - t0
 

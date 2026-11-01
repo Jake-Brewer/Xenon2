@@ -7,7 +7,13 @@ source (mic vs. a pre-recorded fixture WAV) without touching the VAD/STT/TTS mod
 """
 from __future__ import annotations
 
+import ctypes
+import math
+import queue
+import sys
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,9 +45,136 @@ def play_audio(audio: np.ndarray, sample_rate: int, block: bool = True) -> None:
     """Plays float32 mono audio through the default speaker output device."""
     if audio.size == 0:
         return
+    _ensure_com()
     sd.play(audio, sample_rate)
     if block:
         sd.wait()
+
+
+def _log_audio(msg: str) -> None:
+    print(f"[audio] {msg}", file=sys.stderr, flush=True)
+
+
+_com_state = threading.local()
+
+
+def _ensure_com() -> None:
+    """WASAPI capture uses COM. PortAudio is initialized on the sidecar's main
+    thread, but listen/playback run on workers. Opening the headset mic from a
+    worker that has not called CoInitializeEx fails with WDM-KS 0x490 and the
+    mic button reports that voice input is unavailable.
+    """
+    if getattr(_com_state, "ready", False) or sys.platform != "win32":
+        _com_state.ready = True
+        return
+    # COINIT_MULTITHREADED. 0 is S_OK, 1 is S_FALSE (already initialized).
+    hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+    if hr not in (0, 1) and (hr & 0xFFFFFFFF) != 0x80010106:
+        _log_audio(f"CoInitializeEx returned {hr:#010x}")
+    _com_state.ready = True
+
+
+def _wasapi_index() -> Optional[int]:
+    for index, host in enumerate(sd.query_hostapis()):
+        if "WASAPI" in host["name"].upper():
+            return index
+    return None
+
+
+def _skip_input_name(name: str) -> bool:
+    lowered = name.lower()
+    return any(bad in lowered for bad in ("hands-free", "voicemeeter", "steam", "mapper"))
+
+
+def input_candidates() -> list[tuple[int, int, str]]:
+    """Mics to try, best first.
+
+    The default output is the OpenRun headset, so its WASAPI input comes first.
+    A forced 512-frame period on that Bluetooth mic fails to start (or starts
+    silent), so callers open these with blocksize 0. WDM-KS entries are skipped;
+    several of them are not real capture pins. MME and DirectSound copies of the
+    same headset are later fallbacks.
+    """
+    devices = list(sd.query_devices())
+    hostapis = list(sd.query_hostapis())
+    wasapi = _wasapi_index()
+
+    def usable(index: int) -> bool:
+        if index is None or not isinstance(index, int) or index < 0 or index >= len(devices):
+            return False
+        info = devices[index]
+        if info["max_input_channels"] < 1:
+            return False
+        if "WDM-KS" in hostapis[info["hostapi"]]["name"].upper():
+            return False
+        return not _skip_input_name(info["name"])
+
+    out_index = hostapis[wasapi]["default_output_device"] if wasapi is not None else int(sd.default.device[1])
+    out_name = devices[out_index]["name"].lower() if usable_output(out_index, devices) else ""
+    token = "openrun" if "openrun" in out_name else ("headset" if "headset" in out_name else None)
+    wasapi_default = hostapis[wasapi]["default_input_device"] if wasapi is not None else -1
+    mme_default = int(sd.default.device[0])
+
+    ranked: list[tuple[int, int, int, str]] = []
+    for index, info in enumerate(devices):
+        if not usable(index):
+            continue
+        host = hostapis[info["hostapi"]]["name"].upper()
+        is_wasapi = "WASAPI" in host
+        matches = bool(token and token in info["name"].lower())
+        if not matches and index not in (wasapi_default, mme_default):
+            continue
+        score = 20
+        if matches and is_wasapi:
+            score = 100
+        elif matches:
+            score = 80
+        elif is_wasapi:
+            score = 40
+        if abs(float(info["default_samplerate"]) - SAMPLE_RATE) < 1:
+            score += 5
+        ranked.append((score, index, int(info["default_samplerate"]), info["name"]))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    seen: set[int] = set()
+    chosen: list[tuple[int, int, str]] = []
+    for _score, index, rate, name in ranked:
+        if index in seen:
+            continue
+        seen.add(index)
+        chosen.append((index, rate, name))
+    if not chosen and devices:
+        info = devices[mme_default]
+        chosen.append((mme_default, int(info["default_samplerate"]), info["name"]))
+    return chosen
+
+
+def select_input_device() -> tuple[int, int, str]:
+    """The preferred mic. `record_from_mic` tries the rest of `input_candidates` if it will not start."""
+    found = input_candidates()
+    if not found:
+        raise RuntimeError("no microphone input device")
+    return found[0]
+
+
+def usable_output(index: int, devices) -> bool:
+    return index is not None and 0 <= index < len(devices) and devices[index]["max_output_channels"] > 0
+
+
+def _to_mono(indata: np.ndarray) -> np.ndarray:
+    samples = np.asarray(indata, dtype=np.float32)
+    if samples.ndim == 1 or samples.shape[1] == 1:
+        return samples.reshape(-1)
+    rms = np.sqrt(np.mean(samples * samples, axis=0))
+    return samples[:, int(np.argmax(rms))]
+
+
+def _to_16k(samples: np.ndarray, native_sr: int) -> np.ndarray:
+    if native_sr == SAMPLE_RATE or samples.size == 0:
+        return samples.astype(np.float32, copy=False)
+    divisor = math.gcd(native_sr, SAMPLE_RATE)
+    converted = sps.resample_poly(samples, SAMPLE_RATE // divisor, native_sr // divisor)
+    return np.ascontiguousarray(converted, dtype=np.float32)
 
 
 @dataclass
@@ -49,7 +182,10 @@ class MicCaptureResult:
     audio: Optional[np.ndarray]  # None if no speech was ever detected
     speech_detected: bool
     listen_sec: float
-    reason: str  # "speech_end" | "max_utterance" | "no_speech_timeout"
+    reason: str  # "speech_end" | "max_utterance" | "no_speech_timeout" | "too_quiet"
+    device_name: str = ""
+    peak: float = 0.0
+    rms: float = 0.0
 
 
 def record_from_mic(
@@ -57,74 +193,156 @@ def record_from_mic(
     max_listen_sec: float = 6.0,
     max_utterance_sec: float = 10.0,
     silence_end_ms: int = 700,
-    speech_threshold: float = 0.5,
+    speech_threshold: float = 0.35,
     device: Optional[int] = None,
 ) -> MicCaptureResult:
-    """Streams audio from the default microphone, frame-by-frame, through silero-vad's
-    streaming VADIterator (CPU) to detect speech start/end in real time.
+    """Stream the selected mic until an utterance ends.
 
-    - Waits up to `max_listen_sec` for speech to *start* at all. If nothing is detected
-      in that window, returns immediately with speech_detected=False (reason=
-      "no_speech_timeout") rather than blocking forever -- this is the mechanism that
-      satisfies the "recovers gracefully if no speech is detected, does not hang"
-      acceptance criterion for the live-mic path.
-    - Once speech starts, keeps recording until `silence_end_ms` of continuous silence is
-      observed (utterance end) or `max_utterance_sec` total speech duration is hit
-      (safety cap against a stuck-open mic / non-stopping speaker).
+    The device is opened at its native rate and converted to 16 kHz for Silero.
+    A half-second of audio from before the voice-activity trigger is kept, so the
+    start of the word is not cut off. A quiet headset mic is boosted later, at
+    transcription time.
     """
+    _ensure_com()
+    if device is None:
+        candidates = input_candidates()
+        # Bluetooth headsets sometimes refuse the first open. Try the preferred mic twice.
+        if candidates:
+            candidates = [candidates[0], *candidates]
+    else:
+        info = sd.query_devices(device)
+        candidates = [(device, int(info["default_samplerate"]), info["name"])]
+
     vad_iterator = VADIterator(
         vad.model, threshold=speech_threshold, sampling_rate=SAMPLE_RATE,
         min_silence_duration_ms=silence_end_ms,
     )
 
     frames: list[np.ndarray] = []
+    # 16 frames * 512 samples is about half a second of pre-roll.
+    pre_roll: deque[np.ndarray] = deque(maxlen=16)
     speech_started = False
     t_listen_start = time.perf_counter()
+    t_speech_start = t_listen_start
+    raw_queue: queue.Queue[np.ndarray] = queue.Queue()
+    heard = threading.Event()
+    pending = np.zeros(0, dtype=np.float32)
 
-    frame_queue: list[np.ndarray] = []
+    def _callback(indata, _frame_count, _time_info, status):
+        if status:
+            _log_audio(f"input status: {status}")
+        raw_queue.put(_to_mono(indata))
+        heard.set()
 
-    def _callback(indata, frame_count, time_info, status):
-        frame_queue.append(indata[:, 0].copy())
+    def _finished(reason: str, detected: bool) -> MicCaptureResult:
+        audio = np.concatenate(frames) if frames else None
+        peak = float(np.max(np.abs(audio))) if audio is not None and audio.size else 0.0
+        rms = float(np.sqrt(np.mean(audio * audio))) if audio is not None and audio.size else 0.0
+        if detected and peak < 0.003:
+            return MicCaptureResult(
+                audio=None, speech_detected=False,
+                listen_sec=time.perf_counter() - t_listen_start,
+                reason="too_quiet", device_name=device_name, peak=peak, rms=rms,
+            )
+        return MicCaptureResult(
+            audio=audio, speech_detected=detected,
+            listen_sec=time.perf_counter() - t_listen_start,
+            reason=reason, device_name=device_name, peak=peak, rms=rms,
+        )
 
+    def _start_input(device_index: int, native_sr: int, channels: int) -> sd.InputStream:
+        # A fixed 512-frame block makes this OpenRun WASAPI mic fail to start
+        # (WDM-KS 0x490) or come up silent. PortAudio's own period delivers audio.
+        # WasapiSettings(auto_convert=True) starts the same mic and then never
+        # calls back, so leave the host defaults alone.
+        stream = sd.InputStream(
+            samplerate=native_sr, channels=channels, dtype="float32",
+            blocksize=0, device=device_index, callback=_callback,
+        )
+        try:
+            stream.start()
+        except Exception:
+            stream.close()
+            raise
+        return stream
+
+    stream: Optional[sd.InputStream] = None
+    last_error: Optional[BaseException] = None
+    native_sr = SAMPLE_RATE
+    device_name = ""
     try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            blocksize=FRAME_SAMPLES, device=device, callback=_callback,
-        ):
-            while True:
-                now = time.perf_counter()
-                elapsed = now - t_listen_start
+        for device_index, rate, name in candidates:
+            info = sd.query_devices(device_index)
+            channels = max(1, min(int(info["max_input_channels"]), 2))
+            _log_audio(f"mic {name!r} #{device_index} {rate} Hz {channels} ch")
+            try:
+                heard.clear()
+                while True:
+                    try:
+                        raw_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                stream = _start_input(device_index, rate, channels)
+                # A Bluetooth mic can report "started" and then never deliver a
+                # buffer. Treat that as a failed open and try the next device.
+                # The OpenRun mic can take over a second to deliver the first
+                # buffer after the capture profile switches. Waiting this long
+                # only applies when nothing arrives; the first buffer ends it.
+                if not heard.wait(timeout=2.5):
+                    stream.stop()
+                    stream.close()
+                    stream = None
+                    raise RuntimeError("microphone produced no audio")
+                native_sr = rate
+                device_name = name
+                break
+            except Exception as exc:  # noqa: BLE001 -- try the next host API for this headset
+                last_error = exc
+                _log_audio(f"mic open failed {name!r} #{device_index}: {exc}")
+                if stream is not None:
+                    try:
+                        stream.stop()
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    stream = None
+        if stream is None:
+            raise last_error or RuntimeError("no microphone could be opened")
+        while True:
+            now = time.perf_counter()
+            elapsed = now - t_listen_start
+            if not speech_started and elapsed > max_listen_sec:
+                return _finished("no_speech_timeout", False)
+            if speech_started and (now - t_speech_start) > max_utterance_sec:
+                return _finished("max_utterance", True)
 
-                if not speech_started and elapsed > max_listen_sec:
-                    return MicCaptureResult(
-                        audio=None, speech_detected=False, listen_sec=elapsed,
-                        reason="no_speech_timeout",
-                    )
-                if speech_started and (now - t_speech_start) > max_utterance_sec:
-                    return MicCaptureResult(
-                        audio=np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32),
-                        speech_detected=True, listen_sec=elapsed, reason="max_utterance",
-                    )
-
-                if not frame_queue:
-                    time.sleep(0.01)
-                    continue
-
-                chunk = frame_queue.pop(0)
+            try:
+                raw = raw_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            pending = np.concatenate((pending, _to_16k(raw, native_sr)))
+            while pending.size >= FRAME_SAMPLES:
+                chunk = pending[:FRAME_SAMPLES]
+                pending = pending[FRAME_SAMPLES:]
                 if speech_started:
                     frames.append(chunk)
-
-                event = vad_iterator(chunk, return_seconds=True)
-                if event is not None:
-                    if "start" in event and not speech_started:
-                        speech_started = True
-                        t_speech_start = now
-                        frames.append(chunk)  # include the frame that triggered onset
-                    elif "end" in event and speech_started:
-                        elapsed = time.perf_counter() - t_listen_start
-                        return MicCaptureResult(
-                            audio=np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32),
-                            speech_detected=True, listen_sec=elapsed, reason="speech_end",
-                        )
+                else:
+                    pre_roll.append(chunk)
+                event = vad_iterator(np.ascontiguousarray(chunk), return_seconds=True)
+                if event is None:
+                    continue
+                if "start" in event and not speech_started:
+                    speech_started = True
+                    t_speech_start = time.perf_counter()
+                    frames.extend(pre_roll)
+                    pre_roll.clear()
+                elif "end" in event and speech_started:
+                    return _finished("speech_end", True)
     finally:
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:  # noqa: BLE001 -- closing a failed stream must not hide the capture result
+                pass
         vad_iterator.reset_states()

@@ -93,7 +93,7 @@ function onDelete() {
 
       <template v-else>
         <div class="content">
-          {{ message.content }}<span v-if="message.streaming" class="cursor">▍</span>
+          {{ message.content }}<span v-if="message.streaming && message.content" class="cursor">▍</span>
         </div>
         <div v-if="message.edited" class="edited-tag">(edited)</div>
         <div v-if="message.agent === 'sloth'" class="agent-badge sloth">Sloth</div>

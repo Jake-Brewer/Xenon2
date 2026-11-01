@@ -24,13 +24,18 @@ they never corrupt the stdout protocol stream.
 Commands:
   {"cmd": "ping"}
     -> {"type": "pong"}
-  {"cmd": "listen", "maxListenSec": 6.0, "maxUtteranceSec": 10.0}
-    -> {"type": "listen_result", "ok": true, "text": "..."}
-       {"type": "listen_result", "ok": false, "reason": "no_speech_timeout" | "no_speech"}
+  {"cmd": "listen", "id": 1, "maxListenSec": 6.0, "maxUtteranceSec": 10.0}
+    -> {"type": "ack", "cmd": "listen"} immediately
+       {"type": "listen_result", "id": 1, "ok": true, "text": "..."} later
+       {"type": "listen_result", "id": 1, "ok": false, "reason": "..."} later
+    Capture and transcription run on a worker so speak_* can proceed while the
+    mic is open. A second listen while one is running acks, then returns
+    reason "busy".
   {"cmd": "speak_start"}
     -> {"type": "ack", "cmd": "speak_start"}
   {"cmd": "speak_feed", "text": "..."}
     -> {"type": "ack", "cmd": "speak_feed"}
+    The text is queued; synthesis does not run on this thread.
   {"cmd": "speak_finish"}
     -> {"type": "ack", "cmd": "speak_finish"} (immediately)
        {"type": "speak_done"} (later, once playback actually finishes)
@@ -40,14 +45,24 @@ Commands:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import traceback
 
+import numpy as np
+
+from hardware import logical_cpus, physical_cpus
+
+# Numeric libraries read these at import. Set them before VAD/STT/TTS load.
+_CPU_THREADS = physical_cpus()
+os.environ.setdefault("OMP_NUM_THREADS", str(_CPU_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_CPU_THREADS))
+
 from vad import VoiceActivityDetector
 from stt import SpeechToText
 from tts import TextToSpeech
-from audio_io import record_from_mic, SAMPLE_RATE
+from audio_io import SAMPLE_RATE, record_from_mic, select_input_device
 from speech_streamer import IncrementalSpeaker
 
 _stdout_lock = threading.Lock()
@@ -66,6 +81,7 @@ def log(msg: str) -> None:
 
 class VoiceServer:
     def __init__(self):
+        log(f"voice threads: {_CPU_THREADS} physical / {logical_cpus()} logical")
         log("loading VAD...")
         self.vad = VoiceActivityDetector()
         log("loading STT (faster-whisper, small)...")
@@ -79,41 +95,86 @@ class VoiceServer:
             self.stt = SpeechToText(model_size="small", device="cpu", compute_type="int8")
         log("loading TTS (piper)...")
         self.tts = TextToSpeech()
+        try:
+            index, rate, name = select_input_device()
+            log(f"input device: {name} #{index} {rate} Hz")
+        except Exception as exc:  # noqa: BLE001 -- device choice is diagnostic, not fatal
+            log(f"input device selection failed: {exc}")
         log("ready")
 
         self._speaker: IncrementalSpeaker | None = None
         self._speaker_lock = threading.Lock()
+        self._listen_lock = threading.Lock()
+        self._listen_thread: threading.Thread | None = None
 
     def handle_listen(self, cmd: dict) -> None:
+        """Ack immediately and capture on a worker so TTS commands stay responsive."""
+        listen_id = cmd.get("id")
+        with self._listen_lock:
+            busy = self._listen_thread is not None and self._listen_thread.is_alive()
+            if not busy:
+                self._listen_thread = threading.Thread(
+                    target=self._listen_worker,
+                    args=(cmd,),
+                    daemon=True,
+                    name="voice-listen",
+                )
+                self._listen_thread.start()
+        send({"type": "ack", "cmd": "listen"})
+        if busy:
+            send({"type": "listen_result", "id": listen_id, "ok": False, "reason": "busy"})
+
+    def _listen_worker(self, cmd: dict) -> None:
+        listen_id = cmd.get("id")
+        try:
+            payload = self._capture_and_transcribe(cmd)
+        except Exception as exc:  # noqa: BLE001 -- the sidecar command loop must stay up
+            log(traceback.format_exc())
+            payload = {"ok": False, "reason": "error", "message": str(exc)}
+        payload["type"] = "listen_result"
+        payload["id"] = listen_id
+        send(payload)
+
+    def _capture_and_transcribe(self, cmd: dict) -> dict:
         max_listen_sec = float(cmd.get("maxListenSec", 6.0))
         max_utterance_sec = float(cmd.get("maxUtteranceSec", 10.0))
-
         mic_result = record_from_mic(
             self.vad, max_listen_sec=max_listen_sec, max_utterance_sec=max_utterance_sec
         )
+        detail = (
+            f"device={mic_result.device_name!r} reason={mic_result.reason} "
+            f"sec={mic_result.listen_sec:.2f} peak={mic_result.peak:.4f} rms={mic_result.rms:.4f}"
+        )
         if not mic_result.speech_detected or mic_result.audio is None or mic_result.audio.size == 0:
-            send({"type": "listen_result", "ok": False, "reason": mic_result.reason})
-            return
+            log(f"listen {detail} text=''")
+            return {"ok": False, "reason": mic_result.reason or "no_speech"}
 
-        # Trim to the detected speech span before STT, same as pipeline.py's batch path.
-        vad_result = self.vad.detect(mic_result.audio, sample_rate=SAMPLE_RATE)
-        if not vad_result.speech_detected:
-            send({"type": "listen_result", "ok": False, "reason": "no_speech"})
-            return
+        audio = np.asarray(mic_result.audio, dtype=np.float32)
+        peak = mic_result.peak if mic_result.peak > 0 else float(np.max(np.abs(audio)))
+        # A quiet headset still trips VAD, then Whisper drops it as silence.
+        if 0.001 < peak < 0.25:
+            audio = np.clip(audio * (0.25 / peak), -1.0, 1.0).astype(np.float32)
 
-        first_start = vad_result.segments[0]["start"]
-        last_end = vad_result.segments[-1]["end"]
-        pad = 0.2
-        start_sample = max(0, int((first_start - pad) * SAMPLE_RATE))
-        end_sample = min(len(mic_result.audio), int((last_end + pad) * SAMPLE_RATE))
-        speech_audio = mic_result.audio[start_sample:end_sample]
+        # Streaming VAD already accepted this clip. The batch pass only trims it.
+        # An empty batch result must not throw the utterance away.
+        vad_result = self.vad.detect(audio, sample_rate=SAMPLE_RATE)
+        speech_audio = audio
+        if vad_result.speech_detected and vad_result.segments:
+            first_start = vad_result.segments[0]["start"]
+            last_end = vad_result.segments[-1]["end"]
+            pad = 0.2
+            start_sample = max(0, int((first_start - pad) * SAMPLE_RATE))
+            end_sample = min(len(audio), int((last_end + pad) * SAMPLE_RATE))
+            trimmed = audio[start_sample:end_sample]
+            if trimmed.size > 0:
+                speech_audio = trimmed
 
         stt_result = self.stt.transcribe(speech_audio, sample_rate=SAMPLE_RATE)
-        if not stt_result.text.strip():
-            send({"type": "listen_result", "ok": False, "reason": "no_speech"})
-            return
-
-        send({"type": "listen_result", "ok": True, "text": stt_result.text})
+        text = stt_result.text.strip()
+        log(f"listen {detail} text={text!r}")
+        if not text:
+            return {"ok": False, "reason": "no_speech"}
+        return {"ok": True, "text": text}
 
     def handle_speak_start(self) -> None:
         with self._speaker_lock:

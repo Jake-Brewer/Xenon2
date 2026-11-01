@@ -413,8 +413,8 @@ export const useChatStore = defineStore("chat", {
      * generate a reply from the full history. `viaVoice` marks this turn's reply for spoken
      * playback (see `currentTurnIsVoice`) -- set when the text came from the mic button's
      * transcript rather than typed input. */
-    async sendMessage(text: string, viaVoice = false): Promise<void> {
-      if (this.generating) return;
+    async sendMessage(text: string, viaVoice = false): Promise<boolean> {
+      if (this.generating) return false;
       this.currentTurnIsVoice = viaVoice;
       if (!this.activeConversation) {
         this.newChat();
@@ -446,6 +446,7 @@ export const useChatStore = defineStore("chat", {
         .map((m) => ({ role: m.role, content: m.content }));
 
       await this.runGeneration(convo.id, assistantMsg, history);
+      return true;
     },
 
     /** Edit an earlier user message: truncate everything after it, update its content, and
@@ -548,9 +549,8 @@ export const useChatStore = defineStore("chat", {
       const msg = this.findConversation(conversationId)?.messages.find((m) => m.id === messageId);
       if (msg) {
         msg.streaming = false;
-        // The Rust backend's stop-sequence check stops generation as soon as the model starts a
-        // new "User:" turn, but that stop-sequence text has already been streamed and appended --
-        // strip it here so the bubble shows only Xenon's actual reply.
+        // The backend holds "\n\nUser:" out of the token stream. This still strips a
+        // trailing prompt if one arrives, so a saved bubble never keeps it.
         msg.content = msg.content.replace(/\n+\s*[Uu]ser:\s*$/, "").trimEnd();
         // Phase 7 follow-up (2026-08-02): a small base model leans heavily on whatever style its
         // prompt demonstrates -- the seed example used to end with "How can I help you today?"

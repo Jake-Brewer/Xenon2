@@ -21,10 +21,10 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -34,14 +34,16 @@ use tauri::{AppHandle, Emitter};
 /// speak_start/speak_feed/speak_finish acks.
 const QUICK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Guards the sidecar's stdin/response channel so only one command is in flight at a time --
-/// mirrors `inference::EngineState`'s mutex-around-the-whole-call approach, for the same reason
-/// (the sidecar's command loop is single-threaded and processes one line at a time).
+/// Guards stdin so each command's ack is matched to that command. `listen` acks immediately
+/// and delivers `listen_result` later on `listen_results`, so a capture can overlap TTS.
 pub struct VoiceProcess {
     /// `None` if the sidecar failed to spawn at all (e.g. the venv/ipc_server.py aren't present
     /// in this checkout) -- commands then fail fast with `spawn_error` instead of hanging.
     stdin: Mutex<Option<std::process::ChildStdin>>,
     responses: Mutex<Option<Receiver<serde_json::Value>>>,
+    /// Async `listen_result` events, demuxed off the ack channel so `speak_feed` cannot consume them.
+    listen_results: Mutex<Option<Receiver<serde_json::Value>>>,
+    listen_seq: AtomicU64,
     ready: Arc<AtomicBool>,
     spawn_error: Option<String>,
     request_lock: Mutex<()>,
@@ -67,12 +69,9 @@ fn venv_python(voice_pipeline_dir: &PathBuf) -> PathBuf {
 }
 
 /// Spawns `ipc_server.py` and starts a background reader thread that demultiplexes its stdout:
-/// `speak_done` events are emitted directly as a `voice-speak-done` Tauri event (no command is
-/// waiting on them specifically -- `voice_speak_finish` returns as soon as its `ack` arrives, not
-/// when playback finishes), everything else is forwarded to `responses` for whichever command is
-/// currently waiting. Never panics -- a spawn failure is recorded in `spawn_error` so the app
-/// still starts without voice support (per phase7_prompt.md, voice is new functionality being
-/// added, not something the rest of the app should become unusable without).
+/// `speak_done` becomes a `voice-speak-done` Tauri event, `listen_result` goes to its own
+/// channel, and acks go to `responses`. Never panics -- a spawn failure is recorded in
+/// `spawn_error` so the app still starts without voice support.
 pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProcess> {
     let voice_pipeline_dir = repo_root.join("voice-pipeline");
     let python = venv_python(&voice_pipeline_dir);
@@ -100,6 +99,8 @@ pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProc
             return Arc::new(VoiceProcess {
                 stdin: Mutex::new(None),
                 responses: Mutex::new(None),
+                listen_results: Mutex::new(None),
+                listen_seq: AtomicU64::new(0),
                 ready: Arc::new(AtomicBool::new(false)),
                 spawn_error: Some(msg),
                 request_lock: Mutex::new(()),
@@ -112,6 +113,7 @@ pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProc
     let stdout = child.stdout.take().expect("piped stdout");
 
     let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    let (listen_tx, listen_rx) = mpsc::channel::<serde_json::Value>();
     let ready = Arc::new(AtomicBool::new(false));
     let ready_writer = ready.clone();
 
@@ -141,6 +143,9 @@ pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProc
                 Some("speak_done") => {
                     let _ = app.emit("voice-speak-done", ());
                 }
+                Some("listen_result") => {
+                    let _ = listen_tx.send(value);
+                }
                 _ => {
                     let _ = tx.send(value);
                 }
@@ -152,6 +157,8 @@ pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProc
     Arc::new(VoiceProcess {
         stdin: Mutex::new(Some(stdin)),
         responses: Mutex::new(Some(rx)),
+        listen_results: Mutex::new(Some(listen_rx)),
+        listen_seq: AtomicU64::new(0),
         ready,
         spawn_error: None,
         request_lock: Mutex::new(()),
@@ -159,10 +166,9 @@ pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProc
     })
 }
 
-/// Writes one JSON command line to the sidecar's stdin and waits (up to `timeout`) for the next
-/// response line. Serialized via `request_lock` since the sidecar processes one command at a
-/// time and `speak_done` events are drained out-of-band by the reader thread, so there is exactly
-/// one "next relevant line" per outstanding request.
+/// Writes one JSON command and waits for its ack. `speak_done` and `listen_result` are not
+/// delivered here. The lock is held only until that ack, so the next command can run while a
+/// listen capture or TTS playback is still in progress.
 fn send_command(
     process: &VoiceProcess,
     cmd: serde_json::Value,
@@ -205,10 +211,60 @@ pub fn voice_ready(voice: tauri::State<'_, VoiceState>) -> bool {
     voice.0.spawn_error.is_none() && voice.0.ready.load(Ordering::SeqCst)
 }
 
-/// Records from the mic, VAD-gated, and transcribes the resulting utterance. Blocks (on a
-/// background thread, not the async runtime) for up to `max_listen_sec` waiting for speech to
-/// start, then up to `max_utterance_sec` more while it's captured, plus STT time -- the timeout
-/// passed to the sidecar covers all of that with a margin for transcription itself.
+fn drain_listen_results(process: &VoiceProcess) {
+    let Ok(guard) = process.listen_results.lock() else {
+        return;
+    };
+    let Some(rx) = guard.as_ref() else {
+        return;
+    };
+    while rx.try_recv().is_ok() {}
+}
+
+fn recv_listen_result(
+    process: &VoiceProcess,
+    listen_id: u64,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("voice sidecar did not return a transcript in time".to_string());
+        }
+        let guard = process
+            .listen_results
+            .lock()
+            .map_err(|_| "voice listen lock poisoned".to_string())?;
+        let rx = guard.as_ref().ok_or("voice sidecar is not running")?;
+        match rx.recv_timeout(remaining) {
+            Ok(value) => {
+                if value.get("id").and_then(|v| v.as_u64()) == Some(listen_id) {
+                    return Ok(value);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err("voice sidecar did not return a transcript in time".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("voice sidecar stopped during listen".to_string());
+            }
+        }
+    }
+}
+
+fn listen_result_from_value(value: serde_json::Value) -> VoiceListenResult {
+    VoiceListenResult {
+        ok: value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
+        text: value.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        reason: value.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string()),
+    }
+}
+
+/// Records from the mic, VAD-gated, and transcribes the utterance. The sidecar acks at once and
+/// runs capture on a worker, so TTS can keep playing. This waits for that worker's result.
+/// Whisper's no-speech filter stays off in the sidecar; Silero already gated the clip.
+/// The headset mic is opened on a worker thread, which must initialize COM first.
 #[tauri::command]
 pub async fn voice_listen(
     voice: tauri::State<'_, VoiceState>,
@@ -218,20 +274,21 @@ pub async fn voice_listen(
     let process = voice.0.clone();
     let max_listen = max_listen_sec.unwrap_or(6.0);
     let max_utterance = max_utterance_sec.unwrap_or(10.0);
-    let timeout = Duration::from_secs_f64(max_listen + max_utterance + 15.0);
+    // Whisper shares the GPU with RWKV, so leave extra room past the capture window.
+    let result_timeout = Duration::from_secs_f64(max_listen + max_utterance + 30.0);
 
     tauri::async_runtime::spawn_blocking(move || {
+        let listen_id = process.listen_seq.fetch_add(1, Ordering::SeqCst);
+        drain_listen_results(&process);
         let cmd = serde_json::json!({
             "cmd": "listen",
+            "id": listen_id,
             "maxListenSec": max_listen,
             "maxUtteranceSec": max_utterance,
         });
-        let value = send_command(&process, cmd, timeout)?;
-        Ok(VoiceListenResult {
-            ok: value.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
-            text: value.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            reason: value.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        })
+        send_command(&process, cmd, QUICK_TIMEOUT)?;
+        let value = recv_listen_result(&process, listen_id, result_timeout)?;
+        Ok(listen_result_from_value(value))
     })
     .await
     .map_err(|e| e.to_string())?

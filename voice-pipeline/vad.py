@@ -15,6 +15,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 
+from hardware import physical_cpus
 from silero_vad import load_silero_vad, get_speech_timestamps
 
 SAMPLE_RATE = 16000
@@ -30,11 +31,14 @@ class VadResult:
 
 class VoiceActivityDetector:
     def __init__(self):
-        # torch.set_num_threads left at default (uses all CPU cores); silero-vad's own
-        # model is tiny (~1.8MB) so thread count barely matters for latency here. The
-        # torch build in this venv is CPU-only (torch==...+cpu, no CUDA wheel), so
-        # .to("cpu") below is not just a formality -- there is no GPU path to fall back to
-        # even if someone asked for one, which is exactly the split this phase requires.
+        # CPU-only torch on purpose (torch==...+cpu). One worker per physical core
+        # so VAD does not start a hyperthread pool beside Whisper and Piper.
+        self.cpu_threads = physical_cpus()
+        torch.set_num_threads(self.cpu_threads)
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
         t0 = time.perf_counter()
         self.model = load_silero_vad()
         self.model.to("cpu")

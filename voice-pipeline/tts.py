@@ -3,9 +3,9 @@
 Text-to-speech via piper-tts, CPU-only -- there's no meaningful GPU acceleration path
 for piper per phase2_prompt.md (it does expose a --cuda flag for its onnxruntime
 session, but the spec is explicit that TTS belongs on CPU in this phase's split, and
-piper's ONNX models are small enough that CPU synthesis for short responses is cheap;
-16 threads are not needed simultaneously by VAD, so TTS gets full use of spare CPU
-capacity without competing with the GPU pipeline).
+piper's ONNX models are small enough that CPU synthesis for short responses is cheap).
+The session uses one worker per physical core so Piper does not start a hyperthread
+pool while RWKV is generating on the same machine.
 """
 from __future__ import annotations
 
@@ -17,10 +17,31 @@ from typing import Optional
 
 import numpy as np
 
+from hardware import physical_cpus
 from piper import PiperVoice
 
 DEFAULT_VOICE_MODEL = "models/en_GB-alan-medium.onnx"
 DEFAULT_VOICE_CONFIG = "models/en_GB-alan-medium.onnx.json"
+
+
+def _limit_onnx_threads(threads: int) -> None:
+    import onnxruntime
+
+    if getattr(onnxruntime, "_xenon_threads_patched", False):
+        return
+    original = onnxruntime.InferenceSession
+
+    def session_with_threads(*args, **kwargs):
+        opts = kwargs.get("sess_options")
+        if opts is None:
+            opts = onnxruntime.SessionOptions()
+            kwargs["sess_options"] = opts
+        opts.intra_op_num_threads = max(1, threads)
+        opts.inter_op_num_threads = 1
+        return original(*args, **kwargs)
+
+    onnxruntime.InferenceSession = session_with_threads
+    onnxruntime._xenon_threads_patched = True
 
 
 @dataclass
@@ -35,6 +56,11 @@ class TextToSpeech:
     def __init__(self, model_path: str = DEFAULT_VOICE_MODEL, config_path: str = DEFAULT_VOICE_CONFIG,
                  use_cuda: bool = False):
         self.device = "cpu" if not use_cuda else "cuda"
+        # Piper has no thread argument. Its session uses every logical processor
+        # unless this is set first. intra-op on the physical cores, one inter-op
+        # thread, so synthesis during a reply does not oversubscribe the CPU.
+        self.cpu_threads = physical_cpus()
+        _limit_onnx_threads(self.cpu_threads)
         t0 = time.perf_counter()
         self.voice = PiperVoice.load(model_path, config_path=config_path, use_cuda=use_cuda)
         self.load_sec = time.perf_counter() - t0

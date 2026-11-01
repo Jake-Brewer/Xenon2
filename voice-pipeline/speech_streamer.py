@@ -85,6 +85,11 @@ class IncrementalSpeaker:
         self._total_synth_sec = 0.0
         self._worker = threading.Thread(target=self._playback_worker, daemon=True)
         self._worker.start()
+        # Sentence text is queued here so synthesis does not block the sidecar
+        # command loop. Mic capture can run while a reply is still being spoken.
+        self._text_q: "queue.Queue[Optional[str]]" = queue.Queue()
+        self._text_worker = threading.Thread(target=self._text_loop, daemon=True)
+        self._text_worker.start()
         self._last_chunk_done_event = threading.Event()
         self._pending = 0
         self._pending_lock = threading.Lock()
@@ -122,17 +127,25 @@ class IncrementalSpeaker:
         self._queue.put(tts_result.audio)
 
     def feed(self, fragment: str):
-        """Call once per streamed text fragment from XenonEngine.generate()'s on_partial."""
-        if not fragment:
-            return
-        self._buf += fragment
-        parts = _SENTENCE_END_RE.split(self._buf)
-        if len(parts) > 1:
-            # All but the last part are complete sentences; the last part is a
-            # possibly-incomplete tail that stays buffered for the next fragment(s).
-            for complete in parts[:-1]:
-                self._flush_sentence(complete)
-            self._buf = parts[-1]
+        """Queue one streamed text fragment. Synthesis happens off the caller thread."""
+        if fragment:
+            self._text_q.put(fragment)
+
+    def _text_loop(self):
+        while True:
+            item = self._text_q.get()
+            if item is None:
+                if self._buf.strip():
+                    self._flush_sentence(self._buf)
+                    self._buf = ""
+                self._queue.put(None)
+                return
+            self._buf += item
+            parts = _SENTENCE_END_RE.split(self._buf)
+            if len(parts) > 1:
+                for complete in parts[:-1]:
+                    self._flush_sentence(complete)
+                self._buf = parts[-1]
 
     def finish(self, wait_for_playback: bool = True) -> IncrementalSpeechResult:
         """Call after generate() returns. Flushes any remaining buffered text (even
@@ -140,11 +153,8 @@ class IncrementalSpeaker:
         queued audio has finished playing (useful for a CLI harness that shouldn't exit
         mid-speech; NOT required for the "time to first audio" latency metric, which is
         already fixed by the time this runs)."""
-        if self._buf.strip():
-            self._flush_sentence(self._buf)
-            self._buf = ""
-
-        self._queue.put(None)  # sentinel: stop the worker after remaining items drain
+        self._text_q.put(None)
+        self._text_worker.join(timeout=30)
 
         if wait_for_playback and self._chunks:
             self._last_chunk_done_event.wait(timeout=60)
