@@ -5,12 +5,26 @@
 // Drop them before starting Tauri. Windows has no GTK session, so this only
 // forwards the existing environment and runs the local Tauri CLI.
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const env = { ...process.env };
+
+// A rustup install without ~/.cargo/bin on PATH leaves the Tauri CLI unable to find cargo.
+// Use the installed toolchain directly in that case.
+if (spawnSync("cargo", ["--version"], { env, stdio: "ignore" }).error) {
+  const toolchains = path.join(os.homedir(), ".rustup", "toolchains");
+  const installed = fs.existsSync(toolchains) ? fs.readdirSync(toolchains) : [];
+  const toolchain = installed.find((name) => name.startsWith("stable")) ?? installed[0];
+  if (toolchain) {
+    const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+    env[pathKey] = `${path.join(toolchains, toolchain, "bin")}${path.delimiter}${env[pathKey] ?? ""}`;
+  }
+}
 
 if (process.platform !== "win32") {
   for (const key of [

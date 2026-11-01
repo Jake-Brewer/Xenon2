@@ -139,16 +139,17 @@ if (WIN32)
     set(_xenon_runtime_dlls "")
 
     if (XENON_HAS_CUDA)
-        # CUDA 12+ toolkits on Windows ship cublas64_*.dll/cublasLt64_*.dll under bin/x64
-        # rather than directly under bin/ (layout changed at some point in CUDA's history) --
-        # rwkv.dll links these dynamically (only cudart is statically linked, per
-        # rwkv.cpp/CMakeLists.txt), so without this the CUDA build fails to *run* with
-        # "cublas64_13.dll: cannot open shared object file", even though it built fine.
+        # CUDA 12+ toolkits on Windows ship these DLLs under bin/ or bin/x64 depending on the
+        # toolkit version. rwkv.dll links cuBLAS dynamically, and cuBLAS itself imports the
+        # shared cudart even though rwkv.dll links cudart statically. Without all three the
+        # CUDA build fails to *run* (0xC0000135) unless the toolkit's bin/ happens to be on PATH.
         file(GLOB _xenon_cublas_dlls
             "$ENV{CUDA_PATH}/bin/cublas64_*.dll"
             "$ENV{CUDA_PATH}/bin/cublasLt64_*.dll"
+            "$ENV{CUDA_PATH}/bin/cudart64_*.dll"
             "$ENV{CUDA_PATH}/bin/x64/cublas64_*.dll"
             "$ENV{CUDA_PATH}/bin/x64/cublasLt64_*.dll"
+            "$ENV{CUDA_PATH}/bin/x64/cudart64_*.dll"
         )
         list(APPEND _xenon_runtime_dlls ${_xenon_cublas_dlls})
     endif()
