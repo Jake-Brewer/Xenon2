@@ -177,6 +177,33 @@ def _to_16k(samples: np.ndarray, native_sr: int) -> np.ndarray:
     return np.ascontiguousarray(converted, dtype=np.float32)
 
 
+# Silero is level-sensitive. A laptop array mic can peak near 0.004 on speech, which scores
+# under the trigger threshold and never starts an utterance. Silero sees a leveled copy of
+# each frame. Whisper still gets the raw capture, and the sidecar normalizes that clip itself.
+# Only frames well above the room's noise floor are boosted. Boosting everything makes steady
+# room noise trip Silero, and Whisper then invents a word ("You") from an empty room.
+VAD_TARGET_PEAK = 0.25
+VAD_MAX_GAIN = 40.0
+VAD_LEVEL_FRAMES = 32  # about one second at 512 samples per frame
+VAD_FLOOR_FRAMES = 94  # about three seconds
+VAD_GATE_RATIO = 3.0
+
+
+class _VadLeveler:
+    def __init__(self) -> None:
+        self._peaks: deque[float] = deque(maxlen=VAD_LEVEL_FRAMES)
+        self._levels: deque[float] = deque(maxlen=VAD_FLOOR_FRAMES)
+
+    def __call__(self, chunk: np.ndarray) -> np.ndarray:
+        level = float(np.sqrt(np.mean(chunk * chunk)))
+        self._levels.append(level)
+        self._peaks.append(float(np.max(np.abs(chunk))))
+        if level < VAD_GATE_RATIO * min(self._levels) or level <= 0.0:
+            return chunk
+        gain = min(VAD_MAX_GAIN, VAD_TARGET_PEAK / max(self._peaks))
+        return np.clip(chunk * gain, -1.0, 1.0).astype(np.float32)
+
+
 @dataclass
 class MicCaptureResult:
     audio: Optional[np.ndarray]  # None if no speech was ever detected
@@ -227,6 +254,10 @@ def record_from_mic(
     raw_queue: queue.Queue[np.ndarray] = queue.Queue()
     heard = threading.Event()
     pending = np.zeros(0, dtype=np.float32)
+    leveler = _VadLeveler()
+    heard_peak = 0.0
+    heard_energy = 0.0
+    heard_samples = 0
 
     def _callback(indata, _frame_count, _time_info, status):
         if status:
@@ -236,9 +267,12 @@ def record_from_mic(
 
     def _finished(reason: str, detected: bool) -> MicCaptureResult:
         audio = np.concatenate(frames) if frames else None
-        peak = float(np.max(np.abs(audio))) if audio is not None and audio.size else 0.0
-        rms = float(np.sqrt(np.mean(audio * audio))) if audio is not None and audio.size else 0.0
-        if detected and peak < 0.003:
+        # Levels cover everything the mic delivered, so a timeout logs what was actually heard.
+        rms = math.sqrt(heard_energy / heard_samples) if heard_samples else 0.0
+        peak = heard_peak
+        if detected and audio is not None and audio.size:
+            peak = float(np.max(np.abs(audio)))
+        if detected and peak < 0.001:
             return MicCaptureResult(
                 audio=None, speech_detected=False,
                 listen_sec=time.perf_counter() - t_listen_start,
@@ -324,11 +358,14 @@ def record_from_mic(
             while pending.size >= FRAME_SAMPLES:
                 chunk = pending[:FRAME_SAMPLES]
                 pending = pending[FRAME_SAMPLES:]
+                heard_peak = max(heard_peak, float(np.max(np.abs(chunk))))
+                heard_energy += float(np.sum(chunk * chunk))
+                heard_samples += chunk.size
                 if speech_started:
                     frames.append(chunk)
                 else:
                     pre_roll.append(chunk)
-                event = vad_iterator(np.ascontiguousarray(chunk), return_seconds=True)
+                event = vad_iterator(np.ascontiguousarray(leveler(chunk)), return_seconds=True)
                 if event is None:
                     continue
                 if "start" in event and not speech_started:

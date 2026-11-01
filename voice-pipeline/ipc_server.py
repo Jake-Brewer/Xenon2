@@ -172,7 +172,8 @@ class VoiceServer:
         stt_result = self.stt.transcribe(speech_audio, sample_rate=SAMPLE_RATE)
         text = stt_result.text.strip()
         log(f"listen {detail} text={text!r}")
-        if not text:
+        # Whisper writes "You" for near-silent clips. Nobody asks Xenon just that.
+        if not text or text.rstrip(".!?").lower() == "you":
             return {"ok": False, "reason": "no_speech"}
         return {"ok": True, "text": text}
 
