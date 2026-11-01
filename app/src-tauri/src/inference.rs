@@ -887,7 +887,8 @@ fn generate_blocking(
 
     let is_sloth = agent == "sloth";
     let facts = if is_sloth {
-        sloth_memory::load_memory(&app).map(|m| m.facts).unwrap_or_default()
+        let stored = sloth_memory::load_memory(&app).map(|m| m.facts).unwrap_or_default();
+        sloth_memory::relevant_facts(&stored, &new_user_turn.content, sloth_memory::MAX_PROMPT_FACTS)
     } else {
         Vec::new()
     };

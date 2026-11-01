@@ -620,8 +620,9 @@ per-conversation setting -- a single chat can mix both):
   it into every Sloth-mode prompt as a "Known facts about the user" preamble, and after every
   successful Sloth reply, runs a second small/low-temperature `generate()` call asking the model
   whether the exchange revealed anything new and durable worth remembering, appending it to the
-  store if so (capped at the 30 most recent facts, oldest dropped first, so the preamble can never
-  alone blow past the model's context window).
+  store if so. The store keeps up to 10,000 facts, oldest dropped first. Only the 8 most relevant
+  to the current message go into the prompt (`sloth_memory::relevant_facts`, weighted keyword
+  match, newest facts filling spare slots), so a larger store does not slow replies down.
 
 Each assistant message records which agent generated it (`ChatMessage.agent`, `"dementia"` |
 `"sloth"`, persisted -- see `SCHEMA.md`); `ChatMessage.vue` shows a small "Sloth" badge on those
