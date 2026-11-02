@@ -350,6 +350,34 @@ Open, in priority order:
    `voice-pipeline/README.md` still names the old 0.4B model and `build-cuda-app`.
 2. The 5.5 GB `.pth` can be deleted once nobody needs to re-quantize without re-downloading.
 
+## Phase 9 — Semantic Sloth memory [ ]
+
+**Depends on**: Phase 8
+
+Sloth stores 10,000 facts in JSON and picks 8 by keyword, so "what is my pet called" misses "my
+dog is Rex". Replace that with vector search and remove the cap.
+
+Tasks:
+1. Store facts in SQLite (`rusqlite`, bundled) with `sqlite-vec`, and import `sloth_memory.json`
+   once, keeping the original file.
+2. Embed facts with a small local model (`all-MiniLM-L6-v2`, 384 dimensions, CPU, offline after
+   the first download). Embed in the voice sidecar, and fall back to keyword search when it is
+   not running, so typed chat keeps working.
+3. Rank by vector similarity plus keyword match, and page the Sloth Memory panel.
+4. Keep the store in the data directory and include it in Export Memory.
+
+`sqlite-vec` searches by brute force, which suits about 100,000 vectors. Above that, add an HNSW
+index. At one fact per Sloth turn at most, that size is years away.
+
+**Acceptance criteria**: an old fact is found by meaning with no shared keywords, and a Sloth turn
+with 100,000 facts adds under 100 ms.
+
+## Phase 10 — Learning from feedback [ ]
+
+**Depends on**: Phase 9 (the example bank reuses its search)
+
+See `ONLINE_LEARNING.md` for the research, the plan, and why training does not run between turns.
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
@@ -357,6 +385,8 @@ Open, in priority order:
   app offloads every layer when that build is present, with a CPU retry if CUDA init fails.
   This Iris Xe machine uses `./build_cpu.sh` instead.
 - Wake-word detection for always-listening mode.
+- Interrupting Xenon by talking over it. This needs echo cancellation on speakers, and a way to
+  cancel generation. The hands-free loop keeps the mic closed during speech for now.
 - Conversation branching (currently editing discards the old branch instead
   of preserving it).
 
