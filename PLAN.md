@@ -385,8 +385,10 @@ See `ONLINE_LEARNING.md` for the research, the plan, and why training does not r
   app offloads every layer when that build is present, with a CPU retry if CUDA init fails.
   This Iris Xe machine uses `./build_cpu.sh` instead.
 - Wake-word detection for always-listening mode.
-- Interrupting Xenon by talking over it. This needs echo cancellation on speakers, and a way to
-  cancel generation. The hands-free loop keeps the mic closed during speech for now.
+- Listening during replies on laptop speakers. Headsets work: speech heard during a reply builds
+  the next prompt. On speakers, WebRTC echo cancellation left phantom phrases and lost a second
+  voice in testing, so speech captured over a reply is dropped there.
+- Interrupting Xenon by talking over it. This also needs a way to cancel generation.
 - Conversation branching (currently editing discards the old branch instead
   of preserving it).
 

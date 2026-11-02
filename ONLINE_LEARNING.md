@@ -22,6 +22,36 @@ a voice conversation.
 A "bad" rating also has no target. Training needs the reply that should have been given, so a bad
 rating is only useful with a correction, or as a negative signal for ranking.
 
+## Design rules
+
+- **Gradual, not big changes.** Every update is small: a low learning rate, older examples replayed
+  alongside new ones, and a small adapter or state instead of rewritten weights. An update ships
+  only if it passes a fixed set of check prompts, and the previous version is kept for rollback.
+- **Training never interrupts a conversation.** It waits until GPU memory is free and the user is
+  idle. It stops at the next step when the user returns, keeps its checkpoint, and resumes at the
+  next idle period. Reloading RWKV and Whisper afterwards takes a few seconds.
+- **Option: keep chatting during training.** RWKV can run on the CPU (6.1 tok/s against 10.6 on the
+  GPU) while training holds the GPU, so a long run does not block the app.
+
+## Training without dequantizing
+
+The weights in Q5_1 are rounded to about 5 bits, so they cannot hold the tiny changes training
+makes, and `rwkv.cpp` has no training path. But nothing needs to be dequantized:
+
+- State tuning leaves the weights frozen and trains only the state.
+- LoRA leaves them frozen too. The base can load quantized for training (int8 or nf4, the numbers
+  below), with only a small float adapter learning. That is QLoRA.
+- Training starts from the original `.pth`, not from the Q5_1 file. Keep that file.
+- `rwkv.cpp`'s `merge_lora_into_ggml.py` only accepts FP16 or FP32 sources, so merging a LoRA needs
+  the FP16 file, followed by a fresh quantize. State tuning avoids this step, which is another
+  reason to try it first.
+
+## Running at full resolution
+
+The FP16 file is 5.9 GB, so with Whisper it cannot fit a 6 GB card. It would need some layers on the
+CPU, and the speed is unmeasured. Q5_1 is the practical choice here. Training at full bf16 precision
+needs 8.2 GB for state tuning, so training on this card means int8 (5.7 GB) or nf4 (4.7 GB).
+
 ## Plan: three speeds of learning
 
 ### 1. Next turn: example bank (build first)
@@ -86,7 +116,8 @@ All three speeds need the same data, so capture comes first.
 | RWKV-7 7.2B | Larger | No. About 6.8 GB at Q5_1 by scaling, more than the card holds. |
 | Small Transformer (for example Gemma 3 270M) | Mature training tools such as Unsloth | Fits, but gives up RWKV's fixed-size state, the point of this project. |
 
-Try G1 2.9B first. Confirm the pinned `rwkv.cpp` loads it, because the G1 releases list a longer
+G1 improves reply quality. It does not add online training: it uses the same tools, memory
+limits and plan as the current model. Try G1 2.9B first. Confirm the pinned `rwkv.cpp` loads it, because the G1 releases list a longer
 16,384 context than the 4,096 of the current model. Move to 1.5B only if weight training becomes
 more important than reply quality.
 
