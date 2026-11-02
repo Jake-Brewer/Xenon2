@@ -146,6 +146,9 @@ pub fn spawn_voice_process(repo_root: &PathBuf, app: AppHandle) -> Arc<VoiceProc
                 Some("listen_result") => {
                     let _ = listen_tx.send(value);
                 }
+                Some("speech_started") => {
+                    let _ = app.emit("voice-user-speaking", ());
+                }
                 _ => {
                     let _ = tx.send(value);
                 }
@@ -259,6 +262,17 @@ fn listen_result_from_value(value: serde_json::Value) -> VoiceListenResult {
         text: value.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
         reason: value.get("reason").and_then(|v| v.as_str()).map(|s| s.to_string()),
     }
+}
+
+/// Ends an open listen early, so ending a conversation releases the mic straight away.
+#[tauri::command]
+pub async fn voice_listen_cancel(voice: tauri::State<'_, VoiceState>) -> Result<(), String> {
+    let process = voice.0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        send_command(&process, serde_json::json!({ "cmd": "listen_cancel" }), QUICK_TIMEOUT).map(|_| ())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Records from the mic, VAD-gated, and transcribes the utterance. The sidecar acks at once and

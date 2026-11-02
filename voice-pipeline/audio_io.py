@@ -15,17 +15,19 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import scipy.signal as sps
 import soundfile as sf
 import sounddevice as sd
 
+import echo_canceller
 from vad import SAMPLE_RATE, VoiceActivityDetector
 from silero_vad import VADIterator
 
 FRAME_SAMPLES = 512  # silero-vad's recommended chunk size at 16kHz
+INPUT_LATENCY_SEC = 0.04  # typical WASAPI shared-mode capture delay, added to the output's own
 
 
 def load_wav_16k_mono(path: str) -> np.ndarray:
@@ -46,9 +48,23 @@ def play_audio(audio: np.ndarray, sample_rate: int, block: bool = True) -> None:
     if audio.size == 0:
         return
     _ensure_com()
-    sd.play(audio, sample_rate)
-    if block:
-        sd.wait()
+    canceller = echo_canceller.shared()
+    if canceller is None or not block:
+        sd.play(audio, sample_rate)
+        if block:
+            sd.wait()
+        return
+
+    # Written in short blocks so the canceller sees each block as it plays. sd.play would hand
+    # over the whole sentence at once, and the echo reference would arrive seconds early.
+    reference = _to_16k(np.asarray(audio, dtype=np.float32), sample_rate)
+    block_frames = max(1, sample_rate // 50)
+    reference_frames = echo_canceller.FRAME_SAMPLES * 2
+    with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32", latency="low") as stream:
+        canceller.set_delay(float(stream.latency) + INPUT_LATENCY_SEC)
+        for index, start in enumerate(range(0, len(audio), block_frames)):
+            canceller.render(reference[index * reference_frames : (index + 1) * reference_frames])
+            stream.write(np.asarray(audio[start : start + block_frames], dtype=np.float32).reshape(-1, 1))
 
 
 def _log_audio(msg: str) -> None:
@@ -213,6 +229,7 @@ class MicCaptureResult:
     device_name: str = ""
     peak: float = 0.0
     rms: float = 0.0
+    raw_peak: float = 0.0  # loudest mic sample during speech, before any processing
 
 
 def record_from_mic(
@@ -222,6 +239,8 @@ def record_from_mic(
     silence_end_ms: int = 900,
     speech_threshold: float = 0.35,
     device: Optional[int] = None,
+    on_speech_start: Optional[Callable[[], None]] = None,
+    cancel: Optional[threading.Event] = None,
 ) -> MicCaptureResult:
     """Stream the selected mic until an utterance ends.
 
@@ -255,6 +274,8 @@ def record_from_mic(
     heard = threading.Event()
     pending = np.zeros(0, dtype=np.float32)
     leveler = _VadLeveler()
+    canceller = echo_canceller.shared()
+    raw_peak = 0.0
     heard_peak = 0.0
     heard_energy = 0.0
     heard_samples = 0
@@ -276,12 +297,12 @@ def record_from_mic(
             return MicCaptureResult(
                 audio=None, speech_detected=False,
                 listen_sec=time.perf_counter() - t_listen_start,
-                reason="too_quiet", device_name=device_name, peak=peak, rms=rms,
+                reason="too_quiet", device_name=device_name, peak=peak, rms=rms, raw_peak=raw_peak,
             )
         return MicCaptureResult(
             audio=audio, speech_detected=detected,
             listen_sec=time.perf_counter() - t_listen_start,
-            reason=reason, device_name=device_name, peak=peak, rms=rms,
+            reason=reason, device_name=device_name, peak=peak, rms=rms, raw_peak=raw_peak,
         )
 
     def _start_input(device_index: int, native_sr: int, channels: int) -> sd.InputStream:
@@ -345,6 +366,8 @@ def record_from_mic(
         while True:
             now = time.perf_counter()
             elapsed = now - t_listen_start
+            if cancel is not None and cancel.is_set():
+                return _finished("cancelled", False)
             if not speech_started and elapsed > max_listen_sec:
                 return _finished("no_speech_timeout", False)
             if speech_started and (now - t_speech_start) > max_utterance_sec:
@@ -354,7 +377,12 @@ def record_from_mic(
                 raw = raw_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            pending = np.concatenate((pending, _to_16k(raw, native_sr)))
+            if speech_started and raw.size:
+                raw_peak = max(raw_peak, float(np.max(np.abs(raw))))
+            converted = _to_16k(raw, native_sr)
+            if canceller is not None:
+                converted = canceller.capture(converted)
+            pending = np.concatenate((pending, converted))
             while pending.size >= FRAME_SAMPLES:
                 chunk = pending[:FRAME_SAMPLES]
                 pending = pending[FRAME_SAMPLES:]
@@ -373,6 +401,8 @@ def record_from_mic(
                     t_speech_start = time.perf_counter()
                     frames.extend(pre_roll)
                     pre_roll.clear()
+                    if on_speech_start is not None:
+                        on_speech_start()
                 elif "end" in event and speech_started:
                     return _finished("speech_end", True)
     finally:

@@ -8,7 +8,7 @@
 // straight into the matching store actions, which know how to find the right message (by id, not
 // by array position) to update.
 
-import { onMounted, onUnmounted, ref } from "vue";
+import { onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
@@ -133,10 +133,10 @@ async function sendMessage(text: string) {
   scrollToBottom();
 }
 
-// Voice transcripts share sendMessage with typed text. Ones that arrive while RWKV is
-// generating, or while the reply is still being spoken, stay in this queue and go out
-// when both are free. Playback of one turn is not cut off to start the next.
-const pendingVoice: string[] = [];
+// Voice transcripts share sendMessage with typed text. The mic stays open while Xenon
+// generates and speaks, so everything heard in that time builds up here and goes out as one
+// prompt once Xenon has finished and the user has stopped talking.
+const pendingVoice = ref<string[]>([]);
 let pumpingVoice = false;
 const speechOutActive = ref(false);
 let speakStartOk = false;
@@ -165,23 +165,38 @@ function requestSpeakFinish() {
 function enqueueVoice(text: string) {
   const trimmed = text.trim();
   if (!trimmed) return;
-  pendingVoice.push(trimmed);
+  pendingVoice.value.push(trimmed);
   void pumpVoice();
+}
+
+function voiceCanSend(): boolean {
+  return (
+    pendingVoice.value.length > 0 &&
+    !store.generating &&
+    !speechOutActive.value &&
+    !store.voiceUserSpeaking
+  );
 }
 
 async function pumpVoice() {
   if (pumpingVoice) return;
   pumpingVoice = true;
   try {
-    while (pendingVoice.length && !store.generating && !speechOutActive.value) {
-      const next = pendingVoice.shift();
-      if (next) await startVoiceTurn(next);
+    while (voiceCanSend()) {
+      await startVoiceTurn(pendingVoice.value.splice(0).join(" "));
     }
   } finally {
     pumpingVoice = false;
-    if (pendingVoice.length && !store.generating && !speechOutActive.value) void pumpVoice();
+    if (voiceCanSend()) void pumpVoice();
   }
 }
+
+watch(
+  () => store.voiceUserSpeaking,
+  (speaking) => {
+    if (!speaking) void pumpVoice();
+  }
+);
 
 async function startVoiceTurn(text: string) {
   speechOutActive.value = true;
@@ -197,7 +212,7 @@ async function startVoiceTurn(text: string) {
   }
   const started = await store.sendMessage(text, true);
   if (!started) {
-    pendingVoice.unshift(text);
+    pendingVoice.value.unshift(text);
     if (speakStartOk) requestSpeakFinish();
     else speechOutActive.value = false;
     return;
@@ -420,6 +435,7 @@ onUnmounted(() => {
           :disabled="store.generating"
           :voice-ready="store.voiceReady"
           :voice-busy="store.generating || speechOutActive"
+          :pending-voice="pendingVoice.join(' ')"
           @send="sendMessage"
           @voice-send="onVoiceSend"
         />

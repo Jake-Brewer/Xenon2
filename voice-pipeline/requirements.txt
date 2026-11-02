@@ -17,6 +17,10 @@ soundfile==0.14.0
 scipy==1.17.1
 numpy==2.4.6
 torch==2.13.0
+# WebRTC echo cancellation, noise suppression and gain control. See echo_canceller.py.
+livekit==1.2.0
+# Reads and sets the Windows mic level. See mic_level.py.
+pycaw==20260927; sys_platform == "win32"
 
 # --- GPU support for faster-whisper (CTranslate2 backend) ---------------------------------
 # ctranslate2 (faster-whisper's backend) is pulled in automatically as a faster-whisper

@@ -184,6 +184,7 @@ pub fn run() {
             sloth_memory::clear_sloth_facts,
             voice::voice_ready,
             voice::voice_listen,
+            voice::voice_listen_cancel,
             voice::voice_speak_start,
             voice::voice_speak_feed,
             voice::voice_speak_finish,

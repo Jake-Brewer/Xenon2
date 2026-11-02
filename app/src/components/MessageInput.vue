@@ -2,13 +2,14 @@
 // MessageInput.vue -- text box + send button + mic button, all fully functional (Phase 7).
 //
 // Clicking the mic starts a hands-free conversation through the voice-pipeline sidecar
-// (`voice_listen`, see app/src-tauri/src/voice.rs): listen, send, wait for the spoken reply,
-// listen again, until the button is clicked again. A transcript is emitted as `voice-send`, and
-// App.vue sends it through the same store.sendMessage path as typed text. The mic stays closed
-// while Xenon speaks, so speakers cannot feed its own voice back in as a new turn.
+// (`voice_listen`, see app/src-tauri/src/voice.rs). The mic stays open until the button is
+// clicked again, including while Xenon speaks. Each transcript is emitted as `voice-send`, and
+// App.vue collects them into the next prompt, sent through the same store.sendMessage path as
+// typed text once Xenon has finished. The sidecar cancels Xenon's own voice out of the mic.
 
-import { nextTick, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useChatStore } from "../stores/chat";
 
 // Phase 7 follow-up: Dementia/Sloth agent toggle. Reads/writes the store directly (like the mic
@@ -27,6 +28,8 @@ const props = defineProps<{
   /** True while a reply is generating or its speech is still playing. A transcript captured
    * then is kept and sent later instead of being dropped. */
   voiceBusy?: boolean;
+  /** Words heard so far for the next prompt, shown so the user can see it building up. */
+  pendingVoice?: string;
 }>();
 
 const emit = defineEmits<{
@@ -39,11 +42,21 @@ const conversationOn = ref(false);
 const micStatus = ref("");
 let loopRunning = false;
 
-/** One listen window. Silence just starts another, so a pause never ends the conversation. */
-const LISTEN_WINDOW_SEC = 8;
+/** Silence starts another window, so a pause never ends the conversation. Long windows, because
+ * reopening a Bluetooth mic can interrupt whatever the headset is playing. */
+const LISTEN_WINDOW_SEC = 30;
 const MAX_UTTERANCE_SEC = 30;
-/** Lets the room go quiet after speech ends, so the mic does not catch the last word. */
-const ECHO_TAIL_MS = 350;
+let unlistenSpeaking: UnlistenFn | null = null;
+
+const statusText = computed(() => {
+  if (props.pendingVoice) return `Next: ${props.pendingVoice}`;
+  if (!conversationOn.value) return micStatus.value;
+  if (props.voiceReady === false) return "Starting voice...";
+  if (store.voiceUserSpeaking) return "Hearing you...";
+  if (store.generating) return "Thinking, still listening...";
+  if (props.voiceBusy) return "Speaking, still listening...";
+  return "Listening...";
+});
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -63,26 +76,20 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-async function waitUntilFree() {
-  await nextTick();
-  while (conversationOn.value && (props.voiceBusy || props.voiceReady === false)) {
-    if (props.voiceReady === false) micStatus.value = "Starting voice...";
-    else micStatus.value = store.generating ? "Thinking..." : "Speaking...";
-    await sleep(120);
-  }
-}
-
 function endConversation(status = "") {
   conversationOn.value = false;
+  store.voiceUserSpeaking = false;
   micStatus.value = status;
+  invoke("voice_listen_cancel").catch((err) => console.warn("[MessageInput] cancel failed:", err));
 }
 
 async function conversationLoop() {
   while (conversationOn.value) {
-    await waitUntilFree();
-    if (!conversationOn.value) return;
+    if (props.voiceReady === false) {
+      await sleep(200);
+      continue;
+    }
 
-    micStatus.value = "Listening...";
     let result: { ok: boolean; text?: string; reason?: string };
     try {
       result = await invoke("voice_listen", {
@@ -94,12 +101,11 @@ async function conversationLoop() {
       endConversation("Voice input unavailable");
       return;
     }
+    store.voiceUserSpeaking = false;
     if (!conversationOn.value) return;
 
     if (result.ok && result.text) {
       emit("voice-send", result.text);
-      await waitUntilFree();
-      await sleep(ECHO_TAIL_MS);
     } else if (result.reason === "error") {
       endConversation("Voice input unavailable");
       return;
@@ -124,8 +130,15 @@ async function toggleMic() {
   }
 }
 
+onMounted(async () => {
+  unlistenSpeaking = await listen("voice-user-speaking", () => {
+    if (conversationOn.value) store.voiceUserSpeaking = true;
+  });
+});
+
 onUnmounted(() => {
   conversationOn.value = false;
+  unlistenSpeaking?.();
 });
 </script>
 
@@ -170,7 +183,7 @@ onUnmounted(() => {
           <line x1="8" y1="23" x2="16" y2="23" />
         </svg>
       </button>
-      <div v-if="micStatus" class="mic-status">{{ micStatus }}</div>
+      <div v-if="statusText" class="mic-status">{{ statusText }}</div>
     </div>
 
     <textarea
@@ -292,9 +305,9 @@ onUnmounted(() => {
 .mic-status {
   position: absolute;
   bottom: 2.7rem;
-  left: 50%;
-  transform: translateX(-50%);
-  white-space: nowrap;
+  left: 0;
+  width: max-content;
+  max-width: min(60vw, 520px);
   background: #232325;
   border: 1px solid rgba(255, 255, 255, 0.1);
   color: #ccc;

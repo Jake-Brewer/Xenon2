@@ -94,6 +94,9 @@ interface ChatState {
    * decide whether to also forward text to the voice sidecar's TTS via `voice_speak_feed`/
    * `voice_speak_finish`. Typed replies are never spoken aloud. */
   currentTurnIsVoice: boolean;
+  /** True from the moment the mic hears speech until its transcript is back. The next prompt
+   * waits for this, so Xenon finishing a reply does not cut a sentence in half. */
+  voiceUserSpeaking: boolean;
 
   // --- Phase 7 follow-up: Dementia/Sloth agent toggle + Sloth's persistent memory ---
   /** Which agent the *next* generation call uses. A mid-conversation toggle (see
@@ -142,6 +145,7 @@ export const useChatStore = defineStore("chat", {
     dataDir: null,
     voiceReady: false,
     currentTurnIsVoice: false,
+    voiceUserSpeaking: false,
     activeAgent: "dementia",
     slothFacts: [],
   }),
