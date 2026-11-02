@@ -65,6 +65,8 @@ from tts import TextToSpeech
 from audio_io import SAMPLE_RATE, record_from_mic, select_input_device
 from speech_streamer import IncrementalSpeaker
 
+PHANTOM_TRANSCRIPTS = {"you", "thank you", "thanks for watching", "thank you for watching"}
+
 _stdout_lock = threading.Lock()
 
 
@@ -84,15 +86,8 @@ class VoiceServer:
         log(f"voice threads: {_CPU_THREADS} physical / {logical_cpus()} logical")
         log("loading VAD...")
         self.vad = VoiceActivityDetector()
-        log("loading STT (faster-whisper, small)...")
-        # Prefer the GPU (RTX 2060). This Iris Xe machine has no CUDA device, so fall
-        # back to CPU int8 instead of leaving the mic dead.
-        try:
-            self.stt = SpeechToText(model_size="small", device="cuda", compute_type="float16")
-            log("STT on CUDA")
-        except Exception as exc:
-            log(f"CUDA STT unavailable ({exc}); loading CPU int8")
-            self.stt = SpeechToText(model_size="small", device="cpu", compute_type="int8")
+        log("loading STT (faster-whisper)...")
+        self.stt = self._load_stt()
         log("loading TTS (piper)...")
         self.tts = TextToSpeech()
         try:
@@ -106,6 +101,22 @@ class VoiceServer:
         self._speaker_lock = threading.Lock()
         self._listen_lock = threading.Lock()
         self._listen_thread: threading.Thread | None = None
+
+    def _load_stt(self) -> SpeechToText:
+        """turbo uses about 1.8 GB on the GPU and fits beside RWKV on a 6 GB card. A tighter
+        GPU falls back to small, and a machine with no CUDA device falls back to the CPU."""
+        for model_size, device, compute_type in (
+            ("large-v3-turbo", "cuda", "float16"),
+            ("small", "cuda", "float16"),
+            ("small", "cpu", "int8"),
+        ):
+            try:
+                stt = SpeechToText(model_size=model_size, device=device, compute_type=compute_type)
+                log(f"STT {model_size} on {device}")
+                return stt
+            except Exception as exc:  # noqa: BLE001 -- try the next option
+                log(f"STT {model_size} on {device} unavailable ({exc})")
+        raise RuntimeError("no speech-to-text model could be loaded")
 
     def handle_listen(self, cmd: dict) -> None:
         """Ack immediately and capture on a worker so TTS commands stay responsive."""
@@ -172,8 +183,8 @@ class VoiceServer:
         stt_result = self.stt.transcribe(speech_audio, sample_rate=SAMPLE_RATE)
         text = stt_result.text.strip()
         log(f"listen {detail} text={text!r}")
-        # Whisper writes "You" for near-silent clips. Nobody asks Xenon just that.
-        if not text or text.rstrip(".!?").lower() == "you":
+        # Whisper writes these for noise and near-silence. The hands-free loop would answer them.
+        if not text or text.rstrip(".!?").lower() in PHANTOM_TRANSCRIPTS:
             return {"ok": False, "reason": "no_speech"}
         return {"ok": True, "text": text}
 

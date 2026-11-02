@@ -219,7 +219,7 @@ def record_from_mic(
     vad: VoiceActivityDetector,
     max_listen_sec: float = 6.0,
     max_utterance_sec: float = 10.0,
-    silence_end_ms: int = 700,
+    silence_end_ms: int = 900,
     speech_threshold: float = 0.35,
     device: Optional[int] = None,
 ) -> MicCaptureResult:

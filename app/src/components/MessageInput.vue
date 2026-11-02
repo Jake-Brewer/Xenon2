@@ -1,12 +1,13 @@
 <script setup lang="ts">
 // MessageInput.vue -- text box + send button + mic button, all fully functional (Phase 7).
 //
-// Clicking the mic starts real VAD-gated mic capture via the voice-pipeline sidecar
-// (`voice_listen`, see app/src-tauri/src/voice.rs). The button stays usable while a reply
-// is generating. A transcript is emitted as `voice-send`. App.vue sends it through the same
-// store.sendMessage path as typed text, or holds it until the engine and playback are free.
+// Clicking the mic starts a hands-free conversation through the voice-pipeline sidecar
+// (`voice_listen`, see app/src-tauri/src/voice.rs): listen, send, wait for the spoken reply,
+// listen again, until the button is clicked again. A transcript is emitted as `voice-send`, and
+// App.vue sends it through the same store.sendMessage path as typed text. The mic stays closed
+// while Xenon speaks, so speakers cannot feed its own voice back in as a new turn.
 
-import { ref } from "vue";
+import { nextTick, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useChatStore } from "../stores/chat";
 
@@ -34,8 +35,19 @@ const emit = defineEmits<{
 }>();
 
 const text = ref("");
-const listening = ref(false);
+const conversationOn = ref(false);
 const micStatus = ref("");
+let loopRunning = false;
+
+/** One listen window. Silence just starts another, so a pause never ends the conversation. */
+const LISTEN_WINDOW_SEC = 8;
+const MAX_UTTERANCE_SEC = 30;
+/** Lets the room go quiet after speech ends, so the mic does not catch the last word. */
+const ECHO_TAIL_MS = 350;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
 
 function submit() {
   const trimmed = text.value.trim();
@@ -51,47 +63,70 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-function listenFailure(reason?: string): string {
-  if (reason === "no_speech_timeout") return "No speech detected";
-  if (reason === "too_quiet") return "Mic was too quiet";
-  if (reason === "busy") return "Still listening";
-  if (reason === "error") return "Voice input unavailable";
-  return "Didn't catch that";
+async function waitUntilFree() {
+  await nextTick();
+  while (conversationOn.value && (props.voiceBusy || props.voiceReady === false)) {
+    if (props.voiceReady === false) micStatus.value = "Starting voice...";
+    else micStatus.value = store.generating ? "Thinking..." : "Speaking...";
+    await sleep(120);
+  }
+}
+
+function endConversation(status = "") {
+  conversationOn.value = false;
+  micStatus.value = status;
+}
+
+async function conversationLoop() {
+  while (conversationOn.value) {
+    await waitUntilFree();
+    if (!conversationOn.value) return;
+
+    micStatus.value = "Listening...";
+    let result: { ok: boolean; text?: string; reason?: string };
+    try {
+      result = await invoke("voice_listen", {
+        maxListenSec: LISTEN_WINDOW_SEC,
+        maxUtteranceSec: MAX_UTTERANCE_SEC,
+      });
+    } catch (err) {
+      console.warn("[MessageInput] voice_listen failed:", err);
+      endConversation("Voice input unavailable");
+      return;
+    }
+    if (!conversationOn.value) return;
+
+    if (result.ok && result.text) {
+      emit("voice-send", result.text);
+      await waitUntilFree();
+      await sleep(ECHO_TAIL_MS);
+    } else if (result.reason === "error") {
+      endConversation("Voice input unavailable");
+      return;
+    } else if (result.reason === "busy") {
+      await sleep(300);
+    }
+  }
 }
 
 async function toggleMic() {
-  if (listening.value) return;
-  listening.value = true;
-  micStatus.value = "Listening...";
+  if (conversationOn.value) {
+    endConversation();
+    return;
+  }
+  conversationOn.value = true;
+  if (loopRunning) return;
+  loopRunning = true;
   try {
-    const result = await invoke<{ ok: boolean; text?: string; reason?: string }>("voice_listen", {
-      maxListenSec: 6,
-      maxUtteranceSec: 10,
-    });
-    if (result.ok && result.text) {
-      emit("voice-send", result.text);
-      micStatus.value = props.voiceBusy ? "Queued until Xenon is free" : "";
-      if (props.voiceBusy) {
-        window.setTimeout(() => {
-          if (micStatus.value === "Queued until Xenon is free") micStatus.value = "";
-        }, 2500);
-      }
-    } else {
-      micStatus.value = listenFailure(result.reason);
-      window.setTimeout(() => {
-        if (!listening.value) micStatus.value = "";
-      }, 2000);
-    }
-  } catch (err) {
-    console.warn("[MessageInput] voice_listen failed:", err);
-    micStatus.value = "Voice input unavailable";
-    window.setTimeout(() => {
-      if (!listening.value) micStatus.value = "";
-    }, 3000);
+    await conversationLoop();
   } finally {
-    listening.value = false;
+    loopRunning = false;
   }
 }
+
+onUnmounted(() => {
+  conversationOn.value = false;
+});
 </script>
 
 <template>
@@ -120,8 +155,8 @@ async function toggleMic() {
     <div class="mic-wrap">
       <button
         class="mic-btn"
-        :class="{ on: listening }"
-        :title="voiceReady === false ? 'Voice input is still starting up...' : 'Voice input'"
+        :class="{ on: conversationOn }"
+        :title="conversationOn ? 'End voice conversation' : voiceReady === false ? 'Voice is still starting up...' : 'Start voice conversation'"
         @click="toggleMic"
       >
         <!-- Inline SVG, not an emoji glyph -- the 🎤 emoji was found to render as an unrecognizable

@@ -172,12 +172,9 @@ class SpeechToText:
         segments, info = self.model.transcribe(
             audio,
             language="en",
-            beam_size=1,
+            beam_size=5,
             vad_filter=False,
             condition_on_previous_text=False,
-            # Silero already decided this clip contains speech. Whisper's own
-            # no-speech filter was discarding quiet headset audio.
-            no_speech_threshold=None,
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         transcribe_sec = time.perf_counter() - t0

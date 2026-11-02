@@ -157,7 +157,8 @@ class IncrementalSpeaker:
         self._text_worker.join(timeout=30)
 
         if wait_for_playback and self._chunks:
-            self._last_chunk_done_event.wait(timeout=60)
+            # Long enough for a full 200-token reply. Hands-free listening resumes after this.
+            self._last_chunk_done_event.wait(timeout=300)
 
         self._worker.join(timeout=5)
 
