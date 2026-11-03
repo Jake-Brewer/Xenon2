@@ -10,6 +10,8 @@ Tools for learning from feedback by state tuning, on this project's RTX 2060 mac
 | `state_tune.py` | Runs RWKV-PEFT's trainer with the frozen weights in 8-bit, so the 2.9B model fits a 6 GB card. |
 | `make_spike_data.py` | Writes the spike's 40 pirate-style training exchanges and 8 held-out questions. |
 | `make_python_data.py` | Writes 40 short, runnable Python answers and 8 held-out questions, to teach Xenon to answer coding questions well. |
+| `make_python_sft.py` | Builds a 4000-pair Python set (about 1.6M tokens) from bigcode's execution-tested self-oss-instruct data, with MBPP and HumanEval held out for scoring. No length cap. |
+| `eval_code.py` | Scores the running app on MBPP or HumanEval: the share of answers whose code passes the problem's tests. |
 | `export_feedback.py` | Turns the app's `feedback.jsonl` into training data: good replies as written, bad ones replaced by their correction. |
 
 ## Environment (WSL, no sudo)
@@ -46,7 +48,28 @@ WANDB_MODE=disabled python /mnt/c/Users/jake/Documents/src/github/mccrea/Xenon2/
 disk, which reads far faster than across `/mnt/c`. Close the Xenon2 app first: training needs the
 whole GPU.
 
-## Python run
+## Python coding run (long context)
+
+RWKV has no context window, so training shouldn't need one either. RWKV-PEFT's infctx mode
+trains each example in `--chunk_ctx` pieces and carries the state between them, so VRAM depends
+on the chunk, not the example. It works with LoRA, not with `--peft state`, which forces plain
+state mode. LoRA suits coding better anyway: a tuned state shifts style, and LoRA weights can
+hold new knowledge. rwkv.cpp's `python/merge_lora_into_ggml.py` merges the result into the model.
+
+```bash
+python make_python_sft.py ~/xenon2-train/python-sft     # in the env; downloads ~90 MB once
+# then, as in "First run" but with:
+#   --data_file ~/xenon2-train/python-sft/python_sft_train.jsonl --proj_dir ~/xenon2-train/python-sft/out
+#   --peft lora --train_type infctx --chunk_ctx 512 --ctx_len 2560 --micro_bsz 1
+```
+
+Score before and after, with the app running the model under test:
+
+```
+python eval_code.py mbpp_test.jsonl --limit 40
+```
+
+## Python run (short lessons)
 
 After the spike shows the pipeline works, run the same command on the Python set, after
 `python make_python_data.py ~/xenon2-train/python`. Change these arguments: `--proj_dir

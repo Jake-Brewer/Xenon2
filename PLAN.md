@@ -393,6 +393,41 @@ See `ONLINE_LEARNING.md` for the research, the plan, and why training does not r
 Done: ratings with corrections, `feedback.jsonl` (exported and merged on import), and the example
 bank, which changes later answers from ratings with no training. Next: the state-tuning spike.
 
+## Phase 11 — VS Code integration [x] (2026-11-03), model comparison [ ] (in progress)
+
+**Depends on**: Phase 1 (the engine), nothing else — no memory/example-bank reuse here.
+
+Xenon now helps code from inside VS Code, fully offline, using the model the app already has
+loaded. Two new pieces, both on `feature/vscode`:
+
+- **`app/src-tauri/src/code_api.rs`**: an OpenAI-compatible `/v1/chat/completions` server on
+  `127.0.0.1` (default port 47811, next free port after that), token-protected (random token
+  written with the port to `<app data dir>/code-api.json` for clients to find), streamed over
+  server-sent events. It shares the chat window's engine lock and keeps its own prefix-matched
+  state cache (`EngineInner::code_cache`) so a follow-up question only prefills the new turns,
+  not the whole conversation again. `Style::for_model` switches the prompt's speaker labels
+  (`Xenon:` vs. G1's `Assistant:` + `<think></think>`) based on the loaded model's filename.
+  `XENON_MODEL` env var picks a different `models/*.bin` file, for comparing models without a
+  rebuild. 28 Rust unit tests.
+- **`vscode-xenon/`**: a VS Code extension — sidebar chat (streams, Copy/Insert/Replace buttons
+  on code blocks), editor commands (Ask, Explain, Fix, Write Tests, Add Docs), a status bar item,
+  and an `@xenon` participant for VS Code's own Chat view. Code already sent in a chat isn't
+  resent on a follow-up. 8 Node unit tests. Packaged as a `.vsix` and installed locally.
+
+No context limit: RWKV has no fixed context window, so `code_api.rs` keeps system/file text whole
+rather than truncating it, and the extension's `xenon.maxContextChars` setting accepts `0` for "no
+cap" (still capped in practice by read speed — prefill runs ~35 tok/s on the RTX 2060, since the
+vendored ggml has no GPU kernel for RWKV-7's WKV op, only a CPU one; see `rwkv_operators_wkv_v7.inc`).
+
+**Model comparison, in progress**: downloaded and converted `RWKV-7 G1l 2.9B` (2026-10-31,
+`BlinkDL/rwkv7-g1`) to the same Q5_1 quantization as the current `RWKV-7 World v3 2.9B`, to see
+whether G1 (trained with "thinking" and tool-use data) codes better. `training/make_python_sft.py`
+builds a 4000-pair training set from bigcode's execution-tested `self-oss-instruct-sc2-exec-filter-50k`
+(ODC-By), with MBPP/HumanEval held out, for an infctx LoRA tune. `training/eval_code.py` scores
+pass@1 against the running app. World v3's baseline pass@1 on MBPP is being measured now; G1l's
+baseline and both models' post-training scores are next, then the better model becomes the app's
+default (`XENON_MODEL` goes away or becomes dev-only).
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
