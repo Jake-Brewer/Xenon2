@@ -9,6 +9,8 @@ Tools for learning from feedback by state tuning, on this project's RTX 2060 mac
 |---|---|
 | `state_tune.py` | Runs RWKV-PEFT's trainer with the frozen weights in 8-bit, so the 2.9B model fits a 6 GB card. |
 | `make_spike_data.py` | Writes the spike's 40 pirate-style training exchanges and 8 held-out questions. |
+| `make_python_data.py` | Writes 40 short, runnable Python answers and 8 held-out questions, to teach Xenon to answer coding questions well. |
+| `export_feedback.py` | Turns the app's `feedback.jsonl` into training data: good replies as written, bad ones replaced by their correction. |
 
 ## Environment (WSL, no sudo)
 
@@ -43,3 +45,11 @@ WANDB_MODE=disabled python /mnt/c/Users/jake/Documents/src/github/mccrea/Xenon2/
 `rwkv7-2.9b.pth` is a copy of `models/RWKV-x070-World-2.9B-v3-20250211-ctx4096.pth` on WSL's own
 disk, which reads far faster than across `/mnt/c`. Close the Xenon2 app first: training needs the
 whole GPU.
+
+## Python run
+
+After the spike shows the pipeline works, run the same command on the Python set, after
+`python make_python_data.py ~/xenon2-train/python`. Change these arguments: `--proj_dir
+~/xenon2-train/python/out --data_file ~/xenon2-train/python/python_train.jsonl --ctx_len 384
+--micro_bsz 2`. Code answers are longer than the spike's one-liners, so they need the longer context.
+Feedback data from `export_feedback.py` can be added to the same JSONL file.
