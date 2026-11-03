@@ -195,10 +195,16 @@ fn physical_cpus() -> Option<u32> {
 
 #[cfg(not(windows))]
 fn physical_cpus() -> Option<u32> {
-    std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list")
-        .ok()
-        .map(|_| logical_cpus() / 2)
-        .filter(|n| *n >= 1)
+    // "0,6" or "0-1" lists cpu0's hyperthread siblings. One entry means no hyperthreading.
+    let raw = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list").ok()?;
+    let mut siblings = 0u32;
+    for part in raw.trim().split(',').filter(|p| !p.is_empty()) {
+        siblings += match part.split_once('-') {
+            Some((start, end)) => end.trim().parse::<u32>().ok()? - start.trim().parse::<u32>().ok()? + 1,
+            None => 1,
+        };
+    }
+    Some((logical_cpus() / siblings.max(1)).max(1))
 }
 
 /// Free VRAM in MiB, when `nvidia-smi` can answer. Used to decide how many RWKV layers fit

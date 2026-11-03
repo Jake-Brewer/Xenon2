@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import queue
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -103,12 +104,16 @@ class IncrementalSpeaker:
             with self._first_audio_lock:
                 if self._first_audio_started_at is None:
                     self._first_audio_started_at = time.perf_counter()
-            if self.speak and audio.size > 0:
-                play_audio(audio, self._sample_rate, block=True)
-            with self._pending_lock:
-                self._pending -= 1
-                if self._pending == 0:
-                    self._last_chunk_done_event.set()
+            try:
+                if self.speak and audio.size > 0:
+                    play_audio(audio, self._sample_rate, block=True)
+            except Exception as exc:  # noqa: BLE001 -- a lost device must not stall speak_done
+                print(f"[audio] playback failed: {exc}", file=sys.stderr, flush=True)
+            finally:
+                with self._pending_lock:
+                    self._pending -= 1
+                    if self._pending == 0:
+                        self._last_chunk_done_event.set()
 
     def _flush_sentence(self, sentence: str):
         sentence = sentence.strip()

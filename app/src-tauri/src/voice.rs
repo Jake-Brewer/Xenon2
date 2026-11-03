@@ -289,7 +289,7 @@ pub async fn voice_listen(
     let max_listen = max_listen_sec.unwrap_or(6.0);
     let max_utterance = max_utterance_sec.unwrap_or(10.0);
     // Whisper shares the GPU with RWKV, so leave extra room past the capture window.
-    let result_timeout = Duration::from_secs_f64(max_listen + max_utterance + 30.0);
+    let result_timeout = Duration::from_secs_f64(max_listen + max_utterance + 60.0);
 
     tauri::async_runtime::spawn_blocking(move || {
         let listen_id = process.listen_seq.fetch_add(1, Ordering::SeqCst);

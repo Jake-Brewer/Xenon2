@@ -54,14 +54,14 @@ import sys
 import threading
 import traceback
 
-import numpy as np
-
 from hardware import logical_cpus, physical_cpus
 
 # Numeric libraries read these at import. Set them before VAD/STT/TTS load.
 _CPU_THREADS = physical_cpus()
 os.environ.setdefault("OMP_NUM_THREADS", str(_CPU_THREADS))
 os.environ.setdefault("MKL_NUM_THREADS", str(_CPU_THREADS))
+
+import numpy as np  # noqa: E402 -- after the thread limits above
 
 import echo_canceller
 import mic_level
@@ -73,6 +73,12 @@ from speech_streamer import IncrementalSpeaker
 
 PHANTOM_TRANSCRIPTS = {"you", "thank you", "thanks for watching", "thank you for watching"}
 ECHO_WORD_SHARE = 0.75  # a transcript this much made of Xenon's own recent words is echo
+ECHO_MIN_WORDS = 4
+COMMON_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "can", "do", "for", "i", "if", "in", "is",
+    "it", "its", "it's", "me", "my", "no", "not", "of", "on", "or", "so", "that", "the", "this",
+    "to", "was", "we", "what", "would", "yes", "you", "your",
+}
 # A headset mic barely hears Xenon. On laptop speakers, echo cancellation leaves enough behind
 # that Whisper invents phrases and misses the user, so speech captured over a reply is dropped.
 HEADSET_WORDS = ("headset", "headphone", "earphone", "openrun")
@@ -169,13 +175,13 @@ class VoiceServer:
         max_listen_sec = float(cmd.get("maxListenSec", 6.0))
         max_utterance_sec = float(cmd.get("maxUtteranceSec", 10.0))
         listen_id = cmd.get("id")
-        spoke_during_capture = self._canceller is not None and self._canceller.speaking
+        # Whether Xenon was speaking while the user spoke: checked when their speech starts and
+        # when it ends. A window opened during a reply often holds a turn spoken after it.
+        spoke_during_capture = False
 
         def on_speech_start() -> None:
             nonlocal spoke_during_capture
-            spoke_during_capture = spoke_during_capture or (
-                self._canceller is not None and self._canceller.speaking
-            )
+            spoke_during_capture = self._canceller is not None and self._canceller.speaking
             send({"type": "speech_started", "id": listen_id})
 
         mic_result = record_from_mic(
@@ -229,8 +235,9 @@ class VoiceServer:
 
     def _is_own_echo(self, text: str) -> bool:
         """Backstop for echo the canceller leaves behind, which Whisper transcribes accurately."""
-        words = _words(text)
-        if not words:
+        words = [w for w in _words(text) if w not in COMMON_WORDS]
+        # A short answer such as "yes I would" reuses Xenon's words by nature.
+        if len(words) < ECHO_MIN_WORDS:
             return False
         return sum(word in self._spoken_words for word in words) / len(words) >= ECHO_WORD_SHARE
 
@@ -239,7 +246,9 @@ class VoiceServer:
             if self._speaker is not None:
                 # A previous turn's speaker was never finished (e.g. an error mid-stream) --
                 # tear it down without waiting on playback rather than leaking threads.
-                self._speaker.finish(wait_for_playback=False)
+                threading.Thread(
+                    target=self._speaker.finish, kwargs={"wait_for_playback": False}, daemon=True
+                ).start()
             self._speaker = IncrementalSpeaker(self.tts, speak=True)
             self._spoken_words = set()
         send({"type": "ack", "cmd": "speak_start"})
@@ -250,7 +259,7 @@ class VoiceServer:
             speaker = self._speaker
         if speaker is not None and text:
             speaker.feed(text)
-            self._spoken_words.update(_words(text))
+            self._spoken_words.update(w for w in _words(text) if w not in COMMON_WORDS)
         send({"type": "ack", "cmd": "speak_feed"})
 
     def handle_speak_finish(self) -> None:

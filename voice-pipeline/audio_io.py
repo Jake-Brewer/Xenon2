@@ -83,7 +83,8 @@ def _ensure_com() -> None:
     if getattr(_com_state, "ready", False) or sys.platform != "win32":
         _com_state.ready = True
         return
-    # COINIT_MULTITHREADED. 0 is S_OK, 1 is S_FALSE (already initialized).
+    # 0x2 is COINIT_APARTMENTTHREADED, which comtypes in mic_level.py also expects on this
+    # thread. 0 is S_OK, 1 is S_FALSE (already initialized).
     hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
     if hr not in (0, 1) and (hr & 0xFFFFFFFF) != 0x80010106:
         _log_audio(f"CoInitializeEx returned {hr:#010x}")

@@ -14,7 +14,6 @@ QUIET_PEAK = 0.12
 LOUD_PEAK = 0.70
 RAISE_DB = 2.0
 LOWER_DB = 4.0
-MIN_DB = -24.0  # some headset mics top out at 0 dB, so the floor must sit below that
 MAX_DB = 24.0
 
 
@@ -33,17 +32,18 @@ def _endpoint(device_name: str):
     return None
 
 
-def next_level(current_db: float, peak: float, device_min: float = MIN_DB, device_max: float = MAX_DB) -> Optional[float]:
+def next_level(current_db: float, peak: float, device_min: float = -96.0, device_max: float = MAX_DB) -> Optional[float]:
     """The level to move to for an utterance with this peak, or None to stay put. Each device has
     its own range, and asking for a level outside it fails."""
     if peak > LOUD_PEAK:
-        target = current_db - LOWER_DB
+        target = max(device_min, current_db - LOWER_DB)
+        moved = target < current_db - 0.1
     elif peak < QUIET_PEAK:
-        target = current_db + RAISE_DB
+        target = min(MAX_DB, device_max, current_db + RAISE_DB)
+        moved = target > current_db + 0.1
     else:
         return None
-    target = min(MAX_DB, device_max, max(MIN_DB, device_min, target))
-    return None if abs(target - current_db) < 0.1 else target
+    return target if moved else None
 
 
 def adjust_for_utterance(device_name: str, peak: float) -> None:
