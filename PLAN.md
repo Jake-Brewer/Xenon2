@@ -350,7 +350,7 @@ Open, in priority order:
    `voice-pipeline/README.md` still names the old 0.4B model and `build-cuda-app`.
 2. The 5.5 GB `.pth` can be deleted once nobody needs to re-quantize without re-downloading.
 
-## Phase 9 — Semantic Sloth memory [ ]
+## Phase 9 — Semantic Sloth memory [x] (2026-11-02)
 
 **Depends on**: Phase 8
 
@@ -371,6 +371,18 @@ index. At one fact per Sloth turn at most, that size is years away.
 
 **Acceptance criteria**: an old fact is found by meaning with no shared keywords, and a Sloth turn
 with 100,000 facts adds under 100 ms.
+
+**Done, with two changes from the tasks above:**
+- Plain SQLite (`rusqlite`, bundled) with the search in Rust, not `sqlite-vec`. The crate is still
+  an alpha release and searches by brute force anyway.
+- Embeddings use ONNX Runtime and `tokenizers`, already installed for Piper and faster-whisper, not
+  `fastembed`, which would have added about a dozen packages.
+
+**Verified:** in the real app, "What is my pet called?" in a fresh Sloth chat answered "Your pet is
+named Rex." from the fact "The user's dog is named Rex". The 4 facts in the old JSON store were
+imported and embedded. Searching 100,000 embedded facts takes 69 ms in a release build (about 1.5
+s in the debug `tauri dev` build), after caching each fact's keywords at load. The Memory panel
+lists the newest 1,000 facts.
 
 ## Phase 10 — Learning from feedback [ ]
 

@@ -620,9 +620,11 @@ per-conversation setting -- a single chat can mix both):
   it into every Sloth-mode prompt as a "Known facts about the user" preamble, and after every
   successful Sloth reply, runs a second small/low-temperature `generate()` call asking the model
   whether the exchange revealed anything new and durable worth remembering, appending it to the
-  store if so. The store keeps up to 10,000 facts, oldest dropped first. Only the 8 most relevant
-  to the current message go into the prompt (`sloth_memory::relevant_facts`, weighted keyword
-  match, newest facts filling spare slots), so a larger store does not slow replies down.
+  store if so. Facts live in SQLite in the data directory with no cap, each with a sentence
+  embedding from the voice sidecar (`voice-pipeline/embedder.py`). Only the 8 most relevant to the
+  current message go into the prompt (`sloth_memory::relevant_facts`: similarity of meaning, nudged
+  by shared keywords, with keywords alone when the sidecar is not running), so a larger store does
+  not slow replies down. See `PLAN.md`'s Phase 9.
 
 Each assistant message records which agent generated it (`ChatMessage.agent`, `"dementia"` |
 `"sloth"`, persisted -- see `SCHEMA.md`); `ChatMessage.vue` shows a small "Sloth" badge on those

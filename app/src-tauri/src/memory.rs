@@ -292,6 +292,7 @@ pub async fn export_memory(
     let conversations_dir = PathBuf::from(effective_conversations_dir(app.clone())?);
     let session_path = app_data.join("session.json");
     let feedback_path = crate::feedback::feedback_path(&app)?;
+    let sloth_path = crate::sloth_memory::db_path(&app)?;
 
     let app_clone = app.clone();
     let dest_root_for_closure = dest_root.clone();
@@ -333,6 +334,14 @@ pub async fn export_memory(
             plan.push(PlanEntry {
                 src: session_path.clone(),
                 rel: "conversations/session.json".to_string(),
+            });
+        }
+
+        // Sloth's cross-conversation memory. See sloth_memory.rs.
+        if sloth_path.exists() {
+            plan.push(PlanEntry {
+                src: sloth_path.clone(),
+                rel: "memory/sloth_memory.sqlite".to_string(),
             });
         }
 
@@ -404,6 +413,7 @@ pub async fn import_memory(
     let conversations_dir = PathBuf::from(effective_conversations_dir(app.clone())?);
     let session_dest = app_data.join("session.json");
     let feedback_dest = crate::feedback::feedback_path(&app)?;
+    let sloth_dest = crate::sloth_memory::db_path(&app)?;
 
     let app_clone = app.clone();
     let source_root_for_closure = source_root.clone();
@@ -498,7 +508,11 @@ pub async fn import_memory(
             total_bytes += copied;
         }
 
-        // Ratings are merged, not copied over, so ratings made on this machine are kept.
+        // Sloth facts and ratings are merged, not copied over, so this machine's own are kept.
+        let bundle_sloth = source_root.join("memory").join("sloth_memory.sqlite");
+        if bundle_sloth.exists() {
+            crate::sloth_memory::merge_from(&sloth_dest, &bundle_sloth)?;
+        }
         let bundle_feedback = source_root.join("feedback").join("feedback.jsonl");
         if bundle_feedback.exists() {
             crate::feedback::merge_into(&feedback_dest, &bundle_feedback)?;

@@ -264,6 +264,29 @@ fn listen_result_from_value(value: serde_json::Value) -> VoiceListenResult {
     }
 }
 
+/// Sentence embeddings for Sloth's memory (see voice-pipeline/embedder.py), or None when the
+/// sidecar is not running, still loading, or the model is unavailable. Sloth then matches on
+/// keywords for that turn. Only asked once the sidecar is ready: it reads commands only after
+/// its models load, and a reply that arrives after the timeout would be taken as the answer to
+/// the next command.
+pub fn embed_texts(app: &AppHandle, texts: &[String]) -> Option<Vec<Vec<f32>>> {
+    use tauri::Manager;
+    let voice = app.try_state::<VoiceState>()?;
+    let process = voice.0.clone();
+    if texts.is_empty() || process.spawn_error.is_some() || !process.ready.load(Ordering::SeqCst) {
+        return None;
+    }
+    let value = match send_command(&process, serde_json::json!({ "cmd": "embed", "texts": texts }), QUICK_TIMEOUT) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("[voice] embeddings unavailable this turn: {err}");
+            return None;
+        }
+    };
+    let vectors: Vec<Vec<f32>> = serde_json::from_value(value.get("vectors")?.clone()).ok()?;
+    (vectors.len() == texts.len()).then_some(vectors)
+}
+
 /// Ends an open listen early, so ending a conversation releases the mic straight away.
 #[tauri::command]
 pub async fn voice_listen_cancel(voice: tauri::State<'_, VoiceState>) -> Result<(), String> {

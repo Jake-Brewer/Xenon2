@@ -39,6 +39,10 @@ This document (and the export/import commands) are built against those real path
   conversations/
     <conversation-id>.json           # one file per saved conversation, per SCHEMA.md
     session.json                     # last-active conversation + path bookkeeping (see below)
+  memory/
+    sloth_memory.sqlite              # Sloth's facts and their embeddings (sloth_memory.rs)
+  feedback/
+    feedback.jsonl                   # reply ratings for learning from feedback (feedback.rs)
 ```
 
 Notes:
@@ -98,6 +102,9 @@ Concretely, Import copies:
   **rewritten** to point at this machine's effective conversations directory (the source machine's
   original paths are meaningless on a different machine), then written to this machine's
   `session.json`. `lastActiveConversationId` is carried over unchanged.
+
+Sloth's facts and the ratings are merged, not overwritten: import adds the facts and ratings this
+machine does not already have, so neither machine's are lost.
 
 Existing local files with the same name are overwritten — Import is meant for "restore/replace this
 machine's memory from a bundle," not a non-destructive merge. If a bundle is imported onto a machine

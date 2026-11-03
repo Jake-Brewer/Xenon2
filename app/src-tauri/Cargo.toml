@@ -24,4 +24,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.17.2"
 chrono = "0.4"
+# Sloth's memory store. Bundled, so no system SQLite is needed.
+rusqlite = { version = "0.41", features = ["bundled"] }
 

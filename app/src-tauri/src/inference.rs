@@ -709,12 +709,45 @@ fn run_fact_extraction(
         return;
     }
 
-    match sloth_memory::append_fact(app, trimmed.to_string(), now_millis()) {
+    let embedding = crate::voice::embed_texts(app, &[trimmed.to_string()]).and_then(|mut v| v.pop());
+    match sloth_memory::append_fact(app, trimmed.to_string(), now_millis(), embedding) {
         Ok(facts) => {
             let _ = app.emit("sloth-facts-updated", facts);
         }
         Err(e) => eprintln!("[sloth_memory] could not persist extracted fact: {e}"),
     }
+}
+
+/// How many facts without an embedding get one per Sloth turn, so facts saved while the embedder
+/// was unavailable (or imported from the old JSON store) catch up without one long pause.
+const EMBED_BACKFILL_PER_TURN: usize = 64;
+
+/// The facts sent with one Sloth turn: found by meaning when the voice sidecar can embed the
+/// message, by keywords otherwise. Also embeds a batch of facts that have no embedding yet.
+fn sloth_facts_for(app: &AppHandle, message: &str) -> Vec<sloth_memory::SlothFact> {
+    let stored = match sloth_memory::load_facts(app) {
+        Ok(facts) => facts,
+        Err(e) => {
+            eprintln!("[sloth_memory] could not load facts: {e}");
+            return Vec::new();
+        }
+    };
+    let missing = sloth_memory::missing_embeddings(&stored, EMBED_BACKFILL_PER_TURN);
+    let mut texts = vec![message.to_string()];
+    texts.extend(missing.iter().map(|f| f.text.clone()));
+
+    let (query, stored) = match crate::voice::embed_texts(app, &texts) {
+        Some(mut vectors) => {
+            let query = vectors.remove(0);
+            let items: Vec<(String, Vec<f32>)> = missing.iter().map(|f| f.id.clone()).zip(vectors).collect();
+            if let Err(e) = sloth_memory::store_embeddings(app, &items) {
+                eprintln!("[sloth_memory] could not save embeddings: {e}");
+            }
+            (Some(query), sloth_memory::load_facts(app).unwrap_or(stored))
+        }
+        None => (None, stored),
+    };
+    sloth_memory::relevant_facts(&stored, message, query.as_deref(), sloth_memory::MAX_PROMPT_FACTS)
 }
 
 /// Deterministic answer for time/date questions, bypassing the model entirely. Added
@@ -892,12 +925,7 @@ fn generate_blocking(
     }
 
     let is_sloth = agent == "sloth";
-    let facts = if is_sloth {
-        let stored = sloth_memory::load_memory(&app).map(|m| m.facts).unwrap_or_default();
-        sloth_memory::relevant_facts(&stored, &new_user_turn.content, sloth_memory::MAX_PROMPT_FACTS)
-    } else {
-        Vec::new()
-    };
+    let facts = if is_sloth { sloth_facts_for(&app, &new_user_turn.content) } else { Vec::new() };
 
     // Never generate directly into the authoritative cached state (`base_state`) -- see
     // `ensure_cache_extended`'s doc comment on why the cache only ever advances from

@@ -32,6 +32,8 @@ Commands:
     Capture and transcription run on a worker so speak_* can proceed while the
     mic is open. A second listen while one is running acks, then returns
     reason "busy".
+  {"cmd": "embed", "texts": ["..."]}
+    -> {"type": "embeddings", "vectors": [[384 floats], ...]}, or an error while loading
   {"cmd": "listen_cancel"}
     -> {"type": "ack", "cmd": "listen_cancel"}, and the open listen ends with reason "cancelled"
   {"cmd": "speak_start"}
@@ -64,6 +66,7 @@ os.environ.setdefault("MKL_NUM_THREADS", str(_CPU_THREADS))
 import numpy as np  # noqa: E402 -- after the thread limits above
 
 import echo_canceller
+import embedder
 import mic_level
 from vad import VoiceActivityDetector
 from stt import SpeechToText
@@ -104,6 +107,7 @@ def _words(text: str) -> list[str]:
 class VoiceServer:
     def __init__(self):
         log(f"voice threads: {_CPU_THREADS} physical / {logical_cpus()} logical")
+        embedder.load_in_background(log)
         log("loading VAD...")
         self.vad = VoiceActivityDetector()
         log("loading STT (faster-whisper)...")
@@ -241,6 +245,13 @@ class VoiceServer:
             return False
         return sum(word in self._spoken_words for word in words) / len(words) >= ECHO_WORD_SHARE
 
+    def handle_embed(self, cmd: dict) -> None:
+        """Sentence embeddings for Sloth's memory. Answers with an error while the model is
+        still loading, and Sloth uses keyword matching for that turn."""
+        texts = [str(t) for t in cmd.get("texts", [])][:256]
+        vectors = embedder.embed(texts, timeout=3.0)
+        send({"type": "embeddings", "vectors": np.round(vectors, 6).tolist()})
+
     def handle_speak_start(self) -> None:
         with self._speaker_lock:
             if self._speaker is not None:
@@ -293,6 +304,8 @@ class VoiceServer:
                     send({"type": "pong"})
                 elif name == "listen":
                     self.handle_listen(cmd)
+                elif name == "embed":
+                    self.handle_embed(cmd)
                 elif name == "listen_cancel":
                     self._listen_cancel.set()
                     send({"type": "ack", "cmd": "listen_cancel"})
