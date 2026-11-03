@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
+use crate::example_bank;
 use crate::ffi;
 use crate::sloth_memory;
 
@@ -447,7 +448,7 @@ fn history_text(turns: &[ChatTurn]) -> String {
 /// and Sloth's persistent facts injection (skipped entirely for Dementia turns, which always
 /// pass an empty `facts` slice, so Dementia's volatile header is byte-for-byte what it always
 /// was pre-Phase-8, just at a different position in the overall prompt).
-fn volatile_header_text(facts: &[sloth_memory::SlothFact]) -> String {
+fn volatile_header_text(facts: &[sloth_memory::SlothFact], examples: &[example_bank::Example]) -> String {
     let mut out = String::new();
 
     let now = chrono::Local::now();
@@ -478,6 +479,16 @@ fn volatile_header_text(facts: &[sloth_memory::SlothFact]) -> String {
         "User: What time is it?\n\n\
          Xenon: It's currently {now_time_only}.\n\n"
     ));
+
+    // Replies the user rated, closest to the new message last, so the model imitates them. See
+    // example_bank.rs.
+    for example in examples {
+        out.push_str("User: ");
+        out.push_str(&example.question);
+        out.push_str("\n\nXenon: ");
+        out.push_str(&example.answer);
+        out.push_str("\n\n");
+    }
 
     out
 }
@@ -926,6 +937,10 @@ fn generate_blocking(
 
     let is_sloth = agent == "sloth";
     let facts = if is_sloth { sloth_facts_for(&app, &new_user_turn.content) } else { Vec::new() };
+    let examples = example_bank::examples_for(&app, &new_user_turn.content);
+    if !examples.is_empty() {
+        eprintln!("xenon2: {} rated example(s) in this prompt", examples.len());
+    }
 
     // Never generate directly into the authoritative cached state (`base_state`) -- see
     // `ensure_cache_extended`'s doc comment on why the cache only ever advances from
@@ -936,7 +951,7 @@ fn generate_blocking(
 
     let suffix = format!(
         "{}User: {}\n\nXenon:",
-        volatile_header_text(&facts),
+        volatile_header_text(&facts, &examples),
         new_user_turn.content.trim()
     );
     let suffix_c = match CString::new(suffix) {

@@ -1,3 +1,4 @@
+mod example_bank;
 mod feedback;
 mod ffi;
 mod inference;

@@ -384,11 +384,14 @@ imported and embedded. Searching 100,000 embedded facts takes 69 ms in a release
 s in the debug `tauri dev` build), after caching each fact's keywords at load. The Memory panel
 lists the newest 1,000 facts.
 
-## Phase 10 — Learning from feedback [ ]
+## Phase 10 — Learning from feedback [ ] (in progress)
 
 **Depends on**: Phase 9 (the example bank reuses its search)
 
 See `ONLINE_LEARNING.md` for the research, the plan, and why training does not run between turns.
+
+Done: ratings with corrections, `feedback.jsonl` (exported and merged on import), and the example
+bank, which changes later answers from ratings with no training. Next: the state-tuning spike.
 
 ## Future work (not yet scheduled)
 

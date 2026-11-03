@@ -99,10 +99,21 @@ this size on this class of hardware.
 
 All three speeds need the same data, so capture comes first.
 
-1. **Ratings:** thumbs up/down on assistant messages, plus an optional correction.
-2. **`feedback.jsonl`:** one record per rating, in the data directory, with the prompt, reply,
-   rating, correction, model name and agent. Include it in Export Memory.
-3. **Example bank:** retrieval using the same search as Sloth.
+1. **Ratings** [done]: thumbs up/down on assistant messages, plus an optional correction.
+2. **`feedback.jsonl`** [done]: one record per rating, in the data directory, with the prompt,
+   reply, rating, correction, model name and agent. Export includes it, and import merges it.
+3. **Example bank** [done]: `app/src-tauri/src/example_bank.rs`. Good replies and corrections whose
+   question means about the same as the new message (cosine similarity 0.55 or more, using Sloth's
+   embedder) go into the prompt, at most 2. Measured in the real app with a pirate-style correction
+   to "What is the capital of France?", then "What is the capital of Italy?" in a fresh chat:
+   - no ratings: "The capital of Italy is Rome."
+   - one correction: "The capital of Italy is Rome, known as the Eternal City." The structure moved,
+     the voice did not.
+   - two corrections (France and Spain): "Arr matey, 'tis Rome, the jewel of Italy!" in 3 of 3
+     runs.
+   - an unrelated question ("How many legs does a spider have?") got no example and a normal
+     answer.
+   One rating nudges and two change the answer, the gradual behaviour this plan aims for.
 4. **Training spike:** on WSL, state-tune the 1.5B model on a few dozen examples, and measure the
    time, the quality change, and whether `rwkv.cpp` can load the result.
 
