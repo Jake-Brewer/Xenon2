@@ -12,7 +12,7 @@
 // conversation being serialized never has a message still mid-stream or holding an error
 // placeholder as its "real" content.
 
-import type { Conversation, ChatMessage, Role } from "./types";
+import type { Conversation, ChatMessage, Rating, Role } from "./types";
 
 export interface ConversationFileMessage {
   id: string;
@@ -21,6 +21,8 @@ export interface ConversationFileMessage {
   timestamp: number;
   edited?: boolean;
   agent?: "dementia" | "sloth";
+  rating?: Rating;
+  correction?: string;
 }
 
 export interface ConversationFile {
@@ -60,6 +62,8 @@ export function toConversationFile(convo: Conversation, fallbackModel: string): 
       };
       if (m.edited) out.edited = true;
       if (m.agent) out.agent = m.agent;
+      if (m.rating) out.rating = m.rating;
+      if (m.correction) out.correction = m.correction;
       return out;
     }),
   };
@@ -82,6 +86,8 @@ export function fromConversationFile(file: ConversationFile): Conversation {
         timestamp: m.timestamp,
         edited: m.edited,
         agent: m.agent,
+        rating: m.rating,
+        correction: m.correction,
       })
     ),
   };

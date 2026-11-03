@@ -32,7 +32,14 @@ export interface ChatMessage {
    * The active agent is a mid-conversation toggle (store.activeAgent), not a per-conversation
    * setting, so a single conversation can contain a mix of both. */
   agent?: "dementia" | "sloth";
+  /** The user's rating of an assistant reply, collected for learning from feedback (see
+   * ONLINE_LEARNING.md). Cleared when the reply is regenerated, since that is a new reply. */
+  rating?: Rating;
+  /** What the user said Xenon should have replied instead. */
+  correction?: string;
 }
+
+export type Rating = "good" | "bad";
 
 export interface Conversation {
   id: string;

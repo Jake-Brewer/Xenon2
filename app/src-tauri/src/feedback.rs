@@ -78,16 +78,18 @@ pub fn read_entries(path: &Path) -> Vec<FeedbackEntry> {
         .collect()
 }
 
-/// The current rating for each message, in the order messages were first rated. Cleared ratings
-/// are left out.
+/// The current rating for each rated reply, in the order they were first rated. Cleared ratings
+/// are left out. A regenerated reply keeps its message id, so the reply text is part of the key:
+/// rating the new reply must not overwrite what the user said about the old one.
 pub fn latest_by_message(entries: &[FeedbackEntry]) -> Vec<FeedbackEntry> {
-    let mut order: Vec<String> = Vec::new();
-    let mut latest: HashMap<String, FeedbackEntry> = HashMap::new();
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut latest: HashMap<(String, String), FeedbackEntry> = HashMap::new();
     for entry in entries {
-        if !latest.contains_key(&entry.message_id) {
-            order.push(entry.message_id.clone());
+        let key = (entry.message_id.clone(), entry.reply.clone());
+        if !latest.contains_key(&key) {
+            order.push(key.clone());
         }
-        latest.insert(entry.message_id.clone(), entry.clone());
+        latest.insert(key, entry.clone());
     }
     order
         .into_iter()
@@ -185,6 +187,17 @@ mod tests {
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].id, "3");
         assert_eq!(summarize(&entries), FeedbackSummary { good: 0, bad: 1, corrections: 1 });
+    }
+
+    #[test]
+    fn a_regenerated_reply_keeps_its_own_rating() {
+        let mut old = entry("1", "a", "good", None);
+        old.reply = "first reply".to_string();
+        let mut new = entry("2", "a", "bad", None);
+        new.reply = "second reply".to_string();
+        let current = latest_by_message(&[old, new]);
+        assert_eq!(current.len(), 2);
+        assert_eq!(summarize(&current), FeedbackSummary { good: 1, bad: 1, corrections: 0 });
     }
 
     #[test]

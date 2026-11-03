@@ -17,6 +17,7 @@ import Sidebar from "./components/Sidebar.vue";
 import ChatMessageVue from "./components/ChatMessage.vue";
 import MessageInput from "./components/MessageInput.vue";
 import { useChatStore } from "./stores/chat";
+import type { Rating } from "./types";
 
 const store = useChatStore();
 
@@ -243,6 +244,12 @@ async function regenerateMessage(messageId: string) {
   scrollToBottom();
 }
 
+async function rateMessage(messageId: string, rating: Rating | null, correction?: string) {
+  const conversationId = store.activeConversation?.id;
+  if (!conversationId) return;
+  await store.rateMessage(conversationId, messageId, rating, correction);
+}
+
 async function deleteMessage(messageId: string) {
   const conversationId = store.activeConversation?.id;
   if (!conversationId) return;
@@ -417,6 +424,7 @@ onUnmounted(() => {
               @edit="(newText) => editMessage(m.id, newText)"
               @regenerate="() => regenerateMessage(m.id)"
               @delete="() => deleteMessage(m.id)"
+              @rate="(rating, correction) => rateMessage(m.id, rating, correction)"
             />
           </div>
         </template>

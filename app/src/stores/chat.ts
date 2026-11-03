@@ -31,7 +31,7 @@
 
 import { defineStore } from "pinia";
 import { invoke } from "@tauri-apps/api/core";
-import type { Conversation, ChatMessage } from "../types";
+import type { Conversation, ChatMessage, Rating } from "../types";
 import { newId } from "../types";
 import {
   toConversationFile,
@@ -508,8 +508,50 @@ export const useChatStore = defineStore("chat", {
       targetMsg.errored = false;
       targetMsg.timestamp = Date.now();
       targetMsg.agent = this.activeAgent;
+      targetMsg.rating = undefined;
+      targetMsg.correction = undefined;
 
       await this.runGeneration(convo.id, targetMsg, history);
+    },
+
+    /** Rates an assistant reply and records it in feedback.jsonl with the full history that led
+     * to it (see feedback.rs). `null` clears the rating. A correction is what Xenon should have
+     * said, the part a "bad" rating needs before it can be learned from. */
+    async rateMessage(
+      conversationId: string,
+      messageId: string,
+      rating: Rating | null,
+      correction?: string
+    ): Promise<void> {
+      const convo = this.findConversation(conversationId);
+      if (!convo) return;
+      const idx = convo.messages.findIndex((m) => m.id === messageId);
+      const msg = convo.messages[idx];
+      if (!msg || msg.role !== "assistant" || msg.streaming || msg.errored) return;
+
+      const cleaned = rating === "bad" ? correction?.trim() || undefined : undefined;
+      msg.rating = rating ?? undefined;
+      msg.correction = cleaned;
+
+      try {
+        await invoke("record_feedback", {
+          entry: {
+            id: newId(),
+            createdAt: Date.now(),
+            conversationId,
+            messageId,
+            rating: rating ?? "none",
+            correction: cleaned,
+            history: convo.messages.slice(0, idx).map((m) => ({ role: m.role, content: m.content })),
+            reply: msg.content,
+            model: convo.model ?? this.modelName,
+            agent: msg.agent ?? "dementia",
+          },
+        });
+      } catch (err) {
+        this.fileError = `Could not save the rating: ${String(err)}`;
+      }
+      await this.autoSave(conversationId);
     },
 
     /** Delete a message. Deleting a user message also removes its immediately-following assistant

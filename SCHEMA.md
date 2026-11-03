@@ -65,6 +65,8 @@ Phase 5's acceptance criteria).
 | `content` | string | yes | The message text. |
 | `timestamp` | integer (epoch ms) | yes | Matches `ChatMessage.timestamp`. |
 | `edited` | boolean | no | Omitted entirely when `false`/unset (not written as `"edited": false`) — present and `true` only once a user message has been edited. Matches `ChatMessage.edited`. |
+| `rating` | `"good"` \| `"bad"` | no | The user's rating of an assistant reply. Omitted when unrated, and cleared when the reply is regenerated. Every change is also appended to `feedback.jsonl` (see `ONLINE_LEARNING.md` and `app/src-tauri/src/feedback.rs`). |
+| `correction` | string | no | What the user said Xenon should have replied instead. Only set with a `"bad"` rating. |
 | `agent` | `"dementia"` \| `"sloth"` | no | Phase 7 follow-up. Which agent generated this reply — omitted on user messages and on any message saved before this field existed (treated as `"dementia"`, the default/no-memory behavior). See `app/README.md`'s "Dementia/Sloth" section. |
 
 ## Differences from the in-memory `Conversation`/`ChatMessage` type

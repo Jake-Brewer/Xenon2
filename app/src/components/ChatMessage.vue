@@ -10,9 +10,13 @@
 // also removes its immediately-following assistant reply, if any -- a user turn and its reply are
 // treated as one deletable unit rather than leaving an orphaned reply with no prompt above it.
 // Confirmed via a native confirm() before emitting, since this is destructive and there's no undo.
+//
+// Assistant replies can be rated good or bad for learning from feedback (see ONLINE_LEARNING.md).
+// A bad rating opens an optional box for what Xenon should have said. Clicking the active rating
+// again clears it.
 
 import { ref } from "vue";
-import type { ChatMessage } from "../types";
+import type { ChatMessage, Rating } from "../types";
 
 const props = defineProps<{
   message: ChatMessage;
@@ -25,10 +29,40 @@ const emit = defineEmits<{
   (e: "edit", newText: string): void;
   (e: "regenerate"): void;
   (e: "delete"): void;
+  (e: "rate", rating: Rating | null, correction?: string): void;
 }>();
 
 const isEditing = ref(false);
 const draft = ref("");
+const correcting = ref(false);
+const correctionDraft = ref("");
+
+function rate(rating: Rating) {
+  if (props.message.streaming || props.message.errored) return;
+  if (props.message.rating === rating) {
+    correcting.value = false;
+    emit("rate", null);
+    return;
+  }
+  emit("rate", rating);
+  correcting.value = rating === "bad";
+  correctionDraft.value = props.message.correction ?? "";
+}
+
+function saveCorrection() {
+  emit("rate", "bad", correctionDraft.value.trim() || undefined);
+  correcting.value = false;
+}
+
+function onCorrectionKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    saveCorrection();
+  } else if (e.key === "Escape") {
+    e.preventDefault();
+    correcting.value = false;
+  }
+}
 
 function startEdit() {
   if (props.disabled) return;
@@ -97,6 +131,23 @@ function onDelete() {
         </div>
         <div v-if="message.edited" class="edited-tag">(edited)</div>
         <div v-if="message.agent === 'sloth'" class="agent-badge sloth">Sloth</div>
+        <div v-if="message.correction && !correcting" class="correction-note">
+          Should have said: {{ message.correction }}
+        </div>
+        <div v-if="correcting" class="correction">
+          <textarea
+            v-model="correctionDraft"
+            class="edit-box"
+            rows="2"
+            placeholder="What should Xenon have said? (optional)"
+            autofocus
+            @keydown="onCorrectionKeydown"
+          ></textarea>
+          <div class="edit-actions">
+            <button class="edit-btn confirm" title="Save (Enter)" @click="saveCorrection">✓</button>
+            <button class="edit-btn cancel" title="Skip (Esc)" @click="correcting = false">✕</button>
+          </div>
+        </div>
 
         <div class="icons">
           <template v-if="message.role === 'user'">
@@ -113,6 +164,31 @@ function onDelete() {
             </button>
           </template>
           <template v-else>
+            <template v-if="!message.streaming && !message.errored">
+              <button
+                class="icon-btn rate"
+                :class="{ active: message.rating === 'good' }"
+                :title="message.rating === 'good' ? 'Clear rating' : 'Good reply'"
+                @click="rate('good')"
+              >
+                <!-- SVG, not 👍/👎: emoji render as garbled glyphs in this WebView2 (see below). -->
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M7 10v12" />
+                  <path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88Z" />
+                </svg>
+              </button>
+              <button
+                class="icon-btn rate"
+                :class="{ active: message.rating === 'bad' }"
+                :title="message.rating === 'bad' ? 'Clear rating' : 'Bad reply'"
+                @click="rate('bad')"
+              >
+                <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M17 14V2" />
+                  <path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z" />
+                </svg>
+              </button>
+            </template>
             <button class="icon-btn" title="Regenerate" @click="onRegenerate">⟳</button>
             <button class="icon-btn" title="Delete" @click="onDelete">
               <!-- Inline SVG -- 🗑 was found to render as a garbled fallback glyph in this
@@ -293,5 +369,25 @@ function onDelete() {
 
 .icon-btn:hover {
   background: rgba(0, 0, 0, 0.8);
+}
+
+.icon-btn.rate.active {
+  background: #2f6feb;
+}
+
+/* A rated reply keeps its rating visible without hovering. */
+.bubble:has(.icon-btn.rate.active) .icons {
+  opacity: 1;
+}
+
+.correction {
+  margin-top: 0.45rem;
+}
+
+.correction-note {
+  margin-top: 0.3rem;
+  font-size: 0.75rem;
+  opacity: 0.75;
+  font-style: italic;
 }
 </style>
