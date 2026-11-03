@@ -46,6 +46,12 @@ pub struct ConversationFileMessage {
     /// on user messages and on any message saved before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// "good" or "bad" when the user rated this reply. See feedback.rs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<String>,
+    /// What the user said Xenon should have replied instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<String>,
 }
 
 /// The full on-disk shape of one saved conversation. Mirrors `SCHEMA.md` field-for-field.

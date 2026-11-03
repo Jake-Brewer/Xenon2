@@ -1,3 +1,4 @@
+mod feedback;
 mod ffi;
 mod inference;
 mod memory;
@@ -179,6 +180,8 @@ pub fn run() {
             memory::pick_folder_dialog,
             memory::export_memory,
             memory::import_memory,
+            feedback::record_feedback,
+            feedback::feedback_summary,
             sloth_memory::list_sloth_facts,
             sloth_memory::delete_sloth_fact,
             sloth_memory::clear_sloth_facts,

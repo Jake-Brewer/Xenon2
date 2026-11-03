@@ -79,6 +79,15 @@ pub fn save_settings(app: AppHandle, settings: Settings) -> Result<(), String> {
     fs::write(&path, json).map_err(|e| format!("Could not write '{}': {e}", path.display()))
 }
 
+/// The configured data directory, or the local app-data directory when none is set. Files that
+/// belong with the user's data rather than with the install, such as `feedback.jsonl`, live here.
+pub fn effective_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    match load_settings(app.clone())?.data_dir {
+        Some(d) if !d.trim().is_empty() => Ok(PathBuf::from(d)),
+        _ => app_data_dir(app),
+    }
+}
+
 /// Where conversations are currently saved to/loaded from: `<dataDir>/conversations` if the
 /// "data directory location" setting is configured, otherwise `<app_data_dir>/conversations` --
 /// exactly the Phase 5 default. This is the one function `persistence.rs`'s
@@ -282,6 +291,7 @@ pub async fn export_memory(
     let app_data = app_data_dir(&app)?;
     let conversations_dir = PathBuf::from(effective_conversations_dir(app.clone())?);
     let session_path = app_data.join("session.json");
+    let feedback_path = crate::feedback::feedback_path(&app)?;
 
     let app_clone = app.clone();
     let dest_root_for_closure = dest_root.clone();
@@ -323,6 +333,14 @@ pub async fn export_memory(
             plan.push(PlanEntry {
                 src: session_path.clone(),
                 rel: "conversations/session.json".to_string(),
+            });
+        }
+
+        // Ratings for learning from feedback. See feedback.rs.
+        if feedback_path.exists() {
+            plan.push(PlanEntry {
+                src: feedback_path.clone(),
+                rel: "feedback/feedback.jsonl".to_string(),
             });
         }
 
@@ -385,6 +403,7 @@ pub async fn import_memory(
     let app_data = app_data_dir(&app)?;
     let conversations_dir = PathBuf::from(effective_conversations_dir(app.clone())?);
     let session_dest = app_data.join("session.json");
+    let feedback_dest = crate::feedback::feedback_path(&app)?;
 
     let app_clone = app.clone();
     let source_root_for_closure = source_root.clone();
@@ -477,6 +496,12 @@ pub async fn import_memory(
                 total_files,
             )?;
             total_bytes += copied;
+        }
+
+        // Ratings are merged, not copied over, so ratings made on this machine are kept.
+        let bundle_feedback = source_root.join("feedback").join("feedback.jsonl");
+        if bundle_feedback.exists() {
+            crate::feedback::merge_into(&feedback_dest, &bundle_feedback)?;
         }
 
         // session.json is imported last, overwriting the local one -- this is the "restore memory
