@@ -1,0 +1,133 @@
+{
+  "name": "vscode-xenon",
+  "displayName": "Xenon",
+  "description": "Offline coding help from the Xenon2 app's local RWKV model.",
+  "version": "0.1.0",
+  "publisher": "xenon2",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jake-Brewer/Xenon2"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "xenon",
+          "title": "Xenon",
+          "icon": "media/xenon.svg"
+        }
+      ]
+    },
+    "views": {
+      "xenon": [
+        {
+          "type": "webview",
+          "id": "xenon.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "xenon.ask", "title": "Ask Xenon…", "category": "Xenon" },
+      { "command": "xenon.explain", "title": "Explain This Code", "category": "Xenon" },
+      { "command": "xenon.fix", "title": "Find and Fix Bugs", "category": "Xenon" },
+      { "command": "xenon.tests", "title": "Write Tests", "category": "Xenon" },
+      { "command": "xenon.docs", "title": "Add Documentation", "category": "Xenon" },
+      { "command": "xenon.newChat", "title": "New Chat", "category": "Xenon", "icon": "$(add)" },
+      { "command": "xenon.stop", "title": "Stop Generating", "category": "Xenon", "icon": "$(debug-stop)" },
+      { "command": "xenon.reconnect", "title": "Reconnect to the Xenon2 App", "category": "Xenon" }
+    ],
+    "submenus": [
+      { "id": "xenon.editor", "label": "Xenon" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "submenu": "xenon.editor", "group": "1_xenon" }
+      ],
+      "xenon.editor": [
+        { "command": "xenon.ask", "group": "1@1" },
+        { "command": "xenon.explain", "group": "1@2" },
+        { "command": "xenon.fix", "group": "1@3" },
+        { "command": "xenon.tests", "group": "1@4" },
+        { "command": "xenon.docs", "group": "1@5" }
+      ],
+      "view/title": [
+        { "command": "xenon.newChat", "when": "view == xenon.chat", "group": "navigation@1" },
+        { "command": "xenon.stop", "when": "view == xenon.chat && xenon.generating", "group": "navigation@2" }
+      ]
+    },
+    "keybindings": [
+      { "command": "xenon.ask", "key": "ctrl+alt+x", "mac": "cmd+alt+x" }
+    ],
+    "configuration": {
+      "title": "Xenon",
+      "properties": {
+        "xenon.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Coding API address, e.g. http://127.0.0.1:47811. Leave empty to find the running Xenon2 app automatically."
+        },
+        "xenon.token": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for the coding API. Leave empty to read it from the Xenon2 app's code-api.json."
+        },
+        "xenon.maxContextChars": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 200,
+          "description": "Most characters of your code sent with a question. The model reads about 35 tokens a second on an RTX 2060, so 3000 characters takes around 25 seconds the first time; follow-ups reuse what it already read."
+        },
+        "xenon.maxTokens": {
+          "type": "number",
+          "default": 800,
+          "minimum": 16,
+          "maximum": 2048,
+          "description": "Longest reply, in tokens."
+        },
+        "xenon.temperature": {
+          "type": "number",
+          "default": 0.3,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Higher is more varied, lower is more predictable. Low values suit code."
+        }
+      }
+    },
+    "chatParticipants": [
+      {
+        "id": "xenon.participant",
+        "name": "xenon",
+        "fullName": "Xenon",
+        "description": "Offline help from your local Xenon2 model",
+        "isSticky": true
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node --test out/test/client.test.js",
+    "package": "npm run compile && vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.2.0",
+    "typescript": "^5.6.0"
+  }
+}
