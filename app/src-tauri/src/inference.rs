@@ -278,7 +278,9 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     // build-cuda-app ahead of build-cpu-app). An RTX 2060 has 6GB; this Q5_1 file is ~2.75GB
     // and the RWKV state is ~21MB, so every layer fits. If CUDA init fails, load retries on CPU
     // so a CUDA build still starts on a machine with no NVIDIA GPU.
-    let model_path = repo_root.join("models").join("rwkv-7-world-2.9B-Q5_1.bin");
+    // XENON_MODEL names another file in models/ (e.g. rwkv-7-g1l-2.9B-Q5_1.bin) to compare models.
+    let model_file = std::env::var("XENON_MODEL").unwrap_or_else(|_| "rwkv-7-world-2.9B-Q5_1.bin".to_string());
+    let model_path = repo_root.join("models").join(model_file);
     let vocab_path = repo_root
         .join("inference-engine")
         .join("data")

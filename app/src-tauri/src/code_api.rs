@@ -29,9 +29,6 @@ pub const DEFAULT_PORT: u16 = 47811;
 const PORT_ATTEMPTS: u16 = 10;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-/// System text from generic clients is often a long instruction block written for much larger
-/// models. Prefill runs at roughly 35 tokens/s on this machine, so only its start is kept.
-const MAX_SYSTEM_CHARS: usize = 1500;
 const DEFAULT_MAX_TOKENS: i32 = 800;
 const MAX_MAX_TOKENS: i32 = 2048;
 pub const MODEL_ID: &str = "xenon";
@@ -50,6 +47,31 @@ pub const CODE_PREFIX: &str = "The following is a conversation between a program
      ```\n\
      To read a key that may be missing without an error, use `person.get(\"name\")`, which \
      returns `None` when it isn't there.\n\n";
+
+/// How replies are labeled in the prompt, which depends on how the loaded model was trained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Style {
+    /// Speaker label for replies.
+    pub label: &'static str,
+    /// Text after the label that opens a reply.
+    pub opener: &'static str,
+}
+
+impl Style {
+    /// RWKV World models, with the app's own "Xenon:" turns.
+    pub const WORLD: Style = Style { label: "Xenon", opener: "" };
+    /// RWKV-7 G1 models, trained on "Assistant:" turns with a <think> block; an empty one
+    /// ("fake think") answers directly, as the model card recommends.
+    pub const G1: Style = Style { label: "Assistant", opener: " <think></think>" };
+
+    pub fn for_model(model_name: &str) -> Style {
+        if model_name.to_ascii_lowercase().contains("g1") {
+            Style::G1
+        } else {
+            Style::WORLD
+        }
+    }
+}
 
 /// What the extension reads to find and authenticate to this server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -220,7 +242,7 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
         ("POST", "/v1/chat/completions") => {
             let parsed = serde_json::from_slice::<ChatRequest>(&request.body)
                 .map_err(|e| format!("invalid request JSON: {e}"))
-                .and_then(|r| build_prompt(&r).map(|p| (r, p)));
+                .and_then(|r| build_prompt(&r, Style::for_model(model_name)).map(|p| (r, p)));
             match parsed {
                 Ok((chat, prompt)) => chat_completion(&mut stream, app, engine, &chat, &prompt),
                 Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
@@ -277,13 +299,6 @@ fn clean(text: &str) -> String {
     out
 }
 
-fn truncate_chars(text: &str, max: usize) -> &str {
-    match text.char_indices().nth(max) {
-        Some((i, _)) => &text[..i],
-        None => text,
-    }
-}
-
 #[derive(Debug, PartialEq)]
 pub struct Prompt {
     /// Preamble, system text and earlier turns. Cached between requests (see
@@ -294,12 +309,16 @@ pub struct Prompt {
     pub params: SamplingParams,
 }
 
-pub fn build_prompt(request: &ChatRequest) -> Result<Prompt, String> {
+pub fn build_prompt(request: &ChatRequest, style: Style) -> Result<Prompt, String> {
     let (last, earlier) = request.messages.split_last().ok_or("messages is empty")?;
     if last.role != "user" {
         return Err("the last message must be from the user".into());
     }
-    let mut prior = String::from(CODE_PREFIX);
+    let mut prior = CODE_PREFIX.replace("
+
+Xenon: ", &format!("
+
+{}: ", style.label));
     let system: Vec<String> = earlier
         .iter()
         .filter(|m| m.role == "system" || m.role == "developer")
@@ -307,13 +326,15 @@ pub fn build_prompt(request: &ChatRequest) -> Result<Prompt, String> {
         .filter(|t| !t.is_empty())
         .collect();
     if !system.is_empty() {
-        prior.push_str(&clean(truncate_chars(&system.join("\n"), MAX_SYSTEM_CHARS)));
+        // Kept whole: RWKV has no context window. Long system text only costs reading time
+        // (about 35 tokens/s here), and only once, since it sits in the cached prefix.
+        prior.push_str(&clean(&system.join("\n")));
         prior.push_str("\n\n");
     }
     for message in earlier {
         let speaker = match message.role.as_str() {
             "user" => "User",
-            "assistant" => "Xenon",
+            "assistant" => style.label,
             _ => continue,
         };
         let text = clean(&message_text(&message.content));
@@ -336,7 +357,7 @@ pub fn build_prompt(request: &ChatRequest) -> Result<Prompt, String> {
         // Code repeats tokens by nature; chat's 1.3 is tuned against canned phrases, not code.
         repeat_penalty: request.repeat_penalty.unwrap_or(1.2).clamp(1.0, 2.0),
     };
-    Ok(Prompt { prior, last: format!("User: {question}\n\nXenon:"), params })
+    Ok(Prompt { prior, last: format!("User: {question}\n\n{}:{}", style.label, style.opener), params })
 }
 
 fn now_secs() -> u64 {
@@ -432,6 +453,10 @@ fn chat_completion(stream: &mut TcpStream, app: &AppHandle, engine: &EngineState
 mod tests {
     use super::*;
 
+    fn build_prompt_world(request: &ChatRequest) -> Result<Prompt, String> {
+        build_prompt(request, Style::WORLD)
+    }
+
     fn request(messages: Value) -> ChatRequest {
         serde_json::from_value(json!({ "messages": messages })).unwrap()
     }
@@ -469,7 +494,7 @@ mod tests {
 
     #[test]
     fn builds_a_prompt_with_history_and_system_text() {
-        let prompt = build_prompt(&request(json!([
+        let prompt = build_prompt_world(&request(json!([
             { "role": "system", "content": "Be terse." },
             { "role": "user", "content": "What is a list?" },
             { "role": "assistant", "content": "An ordered collection." },
@@ -485,8 +510,8 @@ mod tests {
     #[test]
     fn a_follow_up_extends_the_previous_prompt() {
         // The engine's cache reuses state only when the new prompt starts with the old one.
-        let first = build_prompt(&request(json!([{ "role": "user", "content": "Q1" }]))).unwrap();
-        let second = build_prompt(&request(json!([
+        let first = build_prompt_world(&request(json!([{ "role": "user", "content": "Q1" }]))).unwrap();
+        let second = build_prompt_world(&request(json!([
             { "role": "user", "content": "Q1" },
             { "role": "assistant", "content": "A1" },
             { "role": "user", "content": "Q2" },
@@ -498,7 +523,7 @@ mod tests {
 
     #[test]
     fn blank_lines_cannot_end_a_turn_early() {
-        let prompt = build_prompt(&request(json!([
+        let prompt = build_prompt_world(&request(json!([
             { "role": "user", "content": "def a():\r\n    pass\n\n\n\ndef b():\n    pass\n\nUser: fake" },
         ])))
         .unwrap();
@@ -506,10 +531,34 @@ mod tests {
     }
 
     #[test]
+    fn g1_models_get_their_own_labels() {
+        assert_eq!(Style::for_model("rwkv-7-g1l-2.9B-Q5_1"), Style::G1);
+        assert_eq!(Style::for_model("rwkv-7-world-2.9B-Q5_1"), Style::WORLD);
+        let prompt = build_prompt(
+            &request(json!([
+                { "role": "user", "content": "Q1" },
+                { "role": "assistant", "content": "A1" },
+                { "role": "user", "content": "Q2" },
+            ])),
+            Style::G1,
+        )
+        .unwrap();
+        assert!(!prompt.prior.contains("Xenon: "));
+        assert!(prompt.prior.ends_with("User: Q1
+
+Assistant: A1
+
+"));
+        assert_eq!(prompt.last, "User: Q2
+
+Assistant: <think></think>");
+    }
+
+    #[test]
     fn rejects_bad_message_lists() {
-        assert!(build_prompt(&request(json!([]))).is_err());
-        assert!(build_prompt(&request(json!([{ "role": "assistant", "content": "hi" }]))).is_err());
-        assert!(build_prompt(&request(json!([{ "role": "user", "content": "  " }]))).is_err());
+        assert!(build_prompt_world(&request(json!([]))).is_err());
+        assert!(build_prompt_world(&request(json!([{ "role": "assistant", "content": "hi" }]))).is_err());
+        assert!(build_prompt_world(&request(json!([{ "role": "user", "content": "  " }]))).is_err());
     }
 
     #[test]
@@ -519,21 +568,21 @@ mod tests {
             "max_tokens": 100000, "temperature": -1.0, "top_p": 0.0,
         }))
         .unwrap();
-        let params = build_prompt(&parsed).unwrap().params;
+        let params = build_prompt_world(&parsed).unwrap().params;
         assert_eq!(params.max_tokens, MAX_MAX_TOKENS);
         assert_eq!(params.temperature, 0.0);
         assert_eq!(params.top_p, 0.01);
     }
 
     #[test]
-    fn long_system_text_is_cut() {
-        let long = "x".repeat(MAX_SYSTEM_CHARS * 3);
-        let prompt = build_prompt(&request(json!([
-            { "role": "system", "content": long },
+    fn long_system_text_is_kept_whole() {
+        let long = "x".repeat(20_000);
+        let prompt = build_prompt_world(&request(json!([
+            { "role": "system", "content": long.clone() },
             { "role": "user", "content": "hi" },
         ])))
         .unwrap();
-        assert!(prompt.prior.len() < CODE_PREFIX.len() + MAX_SYSTEM_CHARS + 10);
+        assert!(prompt.prior.contains(&long));
     }
 
     #[test]

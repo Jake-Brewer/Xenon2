@@ -47,6 +47,13 @@ test("without a selection, whole lines around the cursor fit the limit", () => {
   assert.ok(top.code.startsWith("line 0\nline 1"));
 });
 
+test("a limit of 0 sends everything", () => {
+  const lines = Array.from({ length: 5000 }, (_, i) => `line ${i}`);
+  const picked = pickCode(lines, undefined, 2500, 0);
+  assert.equal(picked.code, lines.join("\n"));
+  assert.equal(picked.startLine, 1);
+});
+
 test("questions carry their code in a fenced block", () => {
   const text = withContext("Why?", { file: "a.py", language: "python", code: "x = 1\n\n", isSelection: true, startLine: 3 });
   assert.equal(text, "Selected code from `a.py` (line 3):\n```python\nx = 1\n```\nWhy?");

@@ -13,7 +13,8 @@ export interface CodeContext {
 
 /**
  * Picks the lines to send: the selection (cut to `maxChars`), or else as many whole lines around
- * the cursor as fit. `lines` is the whole document; positions are 0-based.
+ * the cursor as fit. `maxChars` 0 means no cap. `lines` is the whole document; positions are
+ * 0-based.
  */
 export function pickCode(
   lines: string[],
@@ -21,6 +22,7 @@ export function pickCode(
   cursorLine: number,
   maxChars: number,
 ): { code: string; startLine: number; isSelection: boolean } {
+  if (maxChars <= 0) maxChars = Infinity;
   if (selection && selection.text.trim()) {
     const code = selection.text.length > maxChars ? selection.text.slice(0, maxChars) : selection.text;
     return { code, startLine: selection.startLine + 1, isSelection: true };
