@@ -197,6 +197,17 @@ void push_recent_tokens(xenon_state * state, const uint32_t * tokens, size_t cou
     }
 }
 
+// Tokens per rwkv_eval_sequence call during prefill. XENON_PREFILL_CHUNK overrides it for
+// measurement.
+size_t prefill_chunk_size() {
+    static const size_t size = [] {
+        const char * env = std::getenv("XENON_PREFILL_CHUNK");
+        long v = env ? std::strtol(env, nullptr, 10) : 0;
+        return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(16);
+    }();
+    return size;
+}
+
 // Shared by xenon_prefill and xenon_generate_with_state's initial-prompt step: encode `text` and
 // evaluate it into `state` (state_in == state_out == state->state.data()), updating cached
 // logits and the repeat-penalty window. Returns the encoded token count via `out_token_count`
@@ -228,7 +239,7 @@ bool eval_text_into_state(
         engine->ctx,
         tokens.data(),
         tokens.size(),
-        /* chunk_size */ 16,
+        /* chunk_size */ prefill_chunk_size(),
         /* state_in */ state->state.data(),
         /* state_out */ state->state.data(),
         /* logits_out */ state->logits.data()

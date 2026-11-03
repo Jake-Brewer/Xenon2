@@ -26,4 +26,6 @@ rfd = "0.17.2"
 chrono = "0.4"
 # Sloth's memory store. Bundled, so no system SQLite is needed.
 rusqlite = { version = "0.41", features = ["bundled"] }
+# The coding API's bearer token (code_api.rs). Already in the tree through other crates.
+getrandom = "0.3"
 

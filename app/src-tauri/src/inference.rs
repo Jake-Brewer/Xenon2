@@ -103,6 +103,33 @@ pub(crate) struct EngineInner {
     /// `MAX_CACHED_CONVERSATIONS` entries -- a linear scan over a handful of entries is simpler
     /// and just as fast as a HashMap + separate LRU list here.
     conversation_cache: Vec<(String, CachedConversation)>,
+    /// States for the coding API (see code_api.rs), keyed by the exact prompt text each one has
+    /// consumed. A request reuses the longest entry whose text starts its own prompt, so a
+    /// follow-up question only prefills the new turns. Most-recently-used last.
+    code_cache: Vec<(String, XenonStatePtr)>,
+}
+
+/// Bound on `EngineInner::code_cache`. Each entry costs one ~20.6 MB state, as for chats.
+const MAX_CACHED_CODE_PROMPTS: usize = 4;
+
+/// Sampling for one coding-API request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SamplingParams {
+    pub max_tokens: i32,
+    pub temperature: f32,
+    pub top_p: f32,
+    pub repeat_penalty: f32,
+}
+
+/// Why a coding-API generation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Finish {
+    /// The model ended its turn.
+    Stop,
+    /// `max_tokens` ran out first.
+    Length,
+    /// The sink asked to stop, usually because the client hung up.
+    Cancelled,
 }
 
 /// `Arc` (not a bare `Mutex`) because the IPC command below needs to clone a handle to it into a
@@ -371,6 +398,7 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
             static_prefix,
             extraction_prefix,
             conversation_cache: Vec::new(),
+            code_cache: Vec::new(),
         }))),
         ModelInfo(model_name),
         DeviceInfo(device_label),
@@ -1023,6 +1051,153 @@ fn generate_blocking(
             },
         );
     }
+}
+
+/// Callback context for `generate_code`: the same stop-sequence holding as chat replies, but
+/// visible text goes to a caller's sink instead of a Tauri event.
+struct SinkCtx<'a> {
+    pending: RefCell<String>,
+    sink: RefCell<&'a mut dyn FnMut(&str) -> bool>,
+    tokens: std::cell::Cell<i32>,
+    ended_turn: std::cell::Cell<bool>,
+    cancelled: std::cell::Cell<bool>,
+}
+
+impl SinkCtx<'_> {
+    fn send(&self, text: &str) {
+        if text.is_empty() || self.cancelled.get() {
+            return;
+        }
+        if !(self.sink.borrow_mut())(text) {
+            self.cancelled.set(true);
+        }
+    }
+}
+
+extern "C" fn on_sink_token(text: *const std::os::raw::c_char, _token_id: u32, user_data: *mut c_void) -> bool {
+    if user_data.is_null() {
+        return true;
+    }
+    let ctx = unsafe { &*(user_data as *const SinkCtx) };
+    ctx.tokens.set(ctx.tokens.get() + 1);
+    let text = if text.is_null() { "" } else { unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("") };
+    let mut pending = ctx.pending.borrow_mut();
+    pending.push_str(text);
+    for stop in STOP_SEQUENCES {
+        if pending.ends_with(stop) {
+            let emit = pending[..pending.len() - stop.len()].to_string();
+            pending.clear();
+            drop(pending);
+            ctx.send(&emit);
+            ctx.ended_turn.set(true);
+            return false;
+        }
+    }
+    let emit_end = pending.len() - stop_hold_len(&pending);
+    let emit: String = pending.drain(..emit_end).collect();
+    drop(pending);
+    ctx.send(&emit);
+    !ctx.cancelled.get()
+}
+
+/// Returns a state that has consumed exactly `prior_text`, reusing the longest cached coding
+/// prompt that `prior_text` starts with. Callers keep cache keys on turn boundaries ("\n\n"), as
+/// the chat cache does, so prefilling the rest separately tokenizes the same as one pass would.
+fn code_state_for(inner: &mut EngineInner, prior_text: &str) -> Result<*mut ffi::XenonState, String> {
+    let engine = inner.engine.0;
+    let best = inner
+        .code_cache
+        .iter()
+        .enumerate()
+        .filter(|(_, (text, _))| prior_text.starts_with(text.as_str()))
+        .max_by_key(|(_, (text, _))| text.len())
+        .map(|(i, _)| i);
+
+    let state = unsafe { ffi::xenon_state_new(engine) };
+    let done = match best {
+        Some(i) => {
+            unsafe { ffi::xenon_state_copy(state, inner.code_cache[i].1 .0) };
+            let entry = inner.code_cache.remove(i);
+            let len = entry.0.len();
+            inner.code_cache.push(entry);
+            len
+        }
+        None => {
+            unsafe { ffi::xenon_state_reset(engine, state) };
+            0
+        }
+    };
+    if let Err(e) = prefill_text(engine, state, &prior_text[done..]) {
+        unsafe { ffi::xenon_state_free(state) };
+        return Err(e);
+    }
+    if done == prior_text.len() {
+        // Already cached exactly; the copy above is only needed as a scratch state.
+        return Ok(state);
+    }
+    let keep = unsafe { ffi::xenon_state_new(engine) };
+    unsafe { ffi::xenon_state_copy(keep, state) };
+    if inner.code_cache.len() >= MAX_CACHED_CODE_PROMPTS {
+        inner.code_cache.remove(0);
+    }
+    inner.code_cache.push((prior_text.to_string(), XenonStatePtr(keep)));
+    Ok(state)
+}
+
+/// Generates a coding-API reply: `prior_text` (cached, see `code_state_for`) then `final_text`
+/// (the new user turn ending in "Xenon:"), streaming visible text to `sink` until the model ends
+/// its turn, `max_tokens` runs out, or `sink` returns false. Holds the engine lock throughout, so
+/// it waits for any chat reply in progress, and chat waits for it.
+pub(crate) fn generate_code(
+    engine: &EngineState,
+    prior_text: &str,
+    final_text: &str,
+    params: SamplingParams,
+    sink: &mut dyn FnMut(&str) -> bool,
+) -> Result<Finish, String> {
+    let mut guard = match engine.0.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let inner: &mut EngineInner = &mut guard;
+    let engine_ptr = inner.engine.0;
+    let state = XenonStatePtr(code_state_for(inner, prior_text)?);
+    let final_c = CString::new(final_text).map_err(|e| format!("prompt contained an embedded NUL byte: {e}"))?;
+
+    let ctx = SinkCtx {
+        pending: RefCell::new(String::new()),
+        sink: RefCell::new(sink),
+        tokens: std::cell::Cell::new(0),
+        ended_turn: std::cell::Cell::new(false),
+        cancelled: std::cell::Cell::new(false),
+    };
+    let status = unsafe {
+        ffi::xenon_generate_with_state(
+            engine_ptr,
+            state.0,
+            final_c.as_ptr(),
+            params.max_tokens,
+            params.temperature,
+            params.top_p,
+            params.repeat_penalty,
+            on_sink_token,
+            &ctx as *const SinkCtx as *mut c_void,
+        )
+    };
+    if status != ffi::XenonStatus::OK {
+        return Err(last_error());
+    }
+    if !ctx.ended_turn.get() {
+        let rest = std::mem::take(&mut *ctx.pending.borrow_mut());
+        ctx.send(&rest[..rest.len() - stop_hold_len(&rest)]);
+    }
+    Ok(if ctx.cancelled.get() {
+        Finish::Cancelled
+    } else if ctx.ended_turn.get() {
+        Finish::Stop
+    } else {
+        Finish::Length
+    })
 }
 
 /// Tauri IPC command: frontend sends the full turn history (ending with the new user message)

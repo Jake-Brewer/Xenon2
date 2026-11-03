@@ -1,3 +1,4 @@
+mod code_api;
 mod example_bank;
 mod feedback;
 mod ffi;
@@ -75,6 +76,8 @@ pub fn run() {
             fit_window_to_screen(app);
 
             let (engine_state, model_info, device_info) = inference::load_engine(&repo_root);
+            // Local coding API for the VS Code extension (vscode-xenon/). See code_api.rs.
+            code_api::start(app.handle().clone(), engine_state.clone(), model_info.0.clone());
             app.manage(engine_state);
             app.manage(model_info);
             app.manage(device_info);
