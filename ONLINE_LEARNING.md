@@ -114,8 +114,27 @@ All three speeds need the same data, so capture comes first.
    - an unrelated question ("How many legs does a spider have?") got no example and a normal
      answer.
    One rating nudges and two change the answer, the gradual behaviour this plan aims for.
-4. **Training spike:** on WSL, state-tune the 1.5B model on a few dozen examples, and measure the
-   time, the quality change, and whether `rwkv.cpp` can load the result.
+4. **Training spike** [in progress]: on WSL, state-tune on a few dozen examples, and measure the
+   time, the quality change, and whether `rwkv.cpp` can load the result. Findings so far:
+   - **The kernels run on the RTX 2060, but not in bf16.** RWKV-PEFT (`Joluck/RWKV-PEFT`, cloned
+     to `~/xenon2-train` in WSL Ubuntu 22.04) defaults to bf16, which this Turing card (compute
+     capability 7.5) lacks: PyTorch skips compiling bf16 kernels for it. The RWKV-7 Triton kernel
+     (`rwkv-fla`) ran forward and backward with real state gradients in fp32 and fp16. The first
+     run takes about 2.5 minutes to compile, then it is cached. The bundled CUDA kernel accepts
+     only bf16 or fp32 and also needs `nvcc`, which WSL lacks, so the Triton kernel is the route.
+   - **Settings for this card:** `--peft state --op fla --precision fp16`, with the base model
+     loaded 4-bit (nf4). At 16-bit the 2.9B weights alone fill the 6 GB card.
+   - **Memory for loading:** WSL had 7 GB of RAM, too little to load the 5.9 GB `.pth`.
+     `memory=12GB` was added to `%USERPROFILE%\.wslconfig` on 2026-11-02. It applies after WSL
+     restarts.
+   - **Environment:** no sudo needed. `uv` 0.9.5 in `~/.local/bin`, Python 3.11, PyTorch 2.14.1
+     with CUDA 12.6, `rwkv-fla` and Triton. Still to install: lightning, deepspeed, bitsandbytes,
+     peft, transformers.
+   - **Loading a tuned state into `rwkv.cpp` looks direct.** For RWKV-7, its state is `2 +
+     head_size` vectors per layer, and the attention-head block at offset 2 is exactly what state
+     tuning trains (one `[heads, 64, 64]` matrix per layer). A tuned state can be written there
+     before the static prompt is primed, through a small new `xenon_state` load function, with no
+     model change. Still to check: the matrix orientation, by comparing one output.
 
 ## Model choice
 
