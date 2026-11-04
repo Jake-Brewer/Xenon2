@@ -138,11 +138,16 @@ fn validate(mut entry: FeedbackEntry) -> Result<FeedbackEntry, String> {
     Ok(entry)
 }
 
+/// Validates and appends one entry, returning the updated summary. Shared by the chat window's
+/// `record_feedback` Tauri command and the coding API's `/v1/feedback` route.
+pub fn record_entry(path: &Path, entry: FeedbackEntry) -> Result<FeedbackSummary, String> {
+    append(path, &validate(entry)?)?;
+    Ok(summarize(&read_entries(path)))
+}
+
 #[tauri::command]
 pub fn record_feedback(app: AppHandle, entry: FeedbackEntry) -> Result<FeedbackSummary, String> {
-    let path = feedback_path(&app)?;
-    append(&path, &validate(entry)?)?;
-    Ok(summarize(&read_entries(&path)))
+    record_entry(&feedback_path(&app)?, entry)
 }
 
 #[tauri::command]

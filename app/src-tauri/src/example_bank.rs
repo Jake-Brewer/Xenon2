@@ -47,11 +47,13 @@ fn cut(text: &str, max: usize) -> String {
     out
 }
 
-/// The current examples: each reply rated good, and each bad reply with a correction, using the
-/// latest rating for each reply.
-pub fn examples_from(entries: &[FeedbackEntry]) -> Vec<Example> {
+/// The current examples for one agent: each reply rated good, and each bad reply with a
+/// correction, using the latest rating for each reply. Scoped by agent so, e.g., code examples
+/// never leak into chat prompts or vice versa.
+pub fn examples_from(entries: &[FeedbackEntry], agent: &str) -> Vec<Example> {
     feedback::latest_by_message(entries)
         .into_iter()
+        .filter(|entry| entry.agent == agent)
         .filter_map(|entry| {
             let question = entry.history.iter().rev().find(|t| t.role == "user")?.content.clone();
             let answer = match (entry.rating.as_str(), &entry.correction) {
@@ -97,11 +99,11 @@ pub fn choose(
 }
 
 /// Examples for one turn, or none when there are no ratings or the voice sidecar cannot embed.
-pub fn examples_for(app: &AppHandle, message: &str) -> Vec<Example> {
+pub fn examples_for(app: &AppHandle, message: &str, agent: &str) -> Vec<Example> {
     let Ok(path) = feedback::feedback_path(app) else {
         return Vec::new();
     };
-    let examples = examples_from(&feedback::read_entries(&path));
+    let examples = examples_from(&feedback::read_entries(&path), agent);
     if examples.is_empty() {
         return Vec::new();
     }
@@ -149,22 +151,28 @@ mod tests {
 
     #[test]
     fn good_replies_and_corrections_become_examples() {
-        let examples = examples_from(&[
-            rated("1", "Capital of France?", "Paris.", "good", None),
-            rated("2", "Capital of Spain?", "Lisbon.", "bad", Some("Madrid.")),
-            rated("3", "Capital of Peru?", "Quito.", "bad", None),
-        ]);
+        let examples = examples_from(
+            &[
+                rated("1", "Capital of France?", "Paris.", "good", None),
+                rated("2", "Capital of Spain?", "Lisbon.", "bad", Some("Madrid.")),
+                rated("3", "Capital of Peru?", "Quito.", "bad", None),
+            ],
+            "dementia",
+        );
         let pairs: Vec<(&str, &str)> = examples.iter().map(|e| (e.question.as_str(), e.answer.as_str())).collect();
         assert_eq!(pairs, vec![("Capital of France?", "Paris."), ("Capital of Spain?", "Madrid.")]);
     }
 
     #[test]
     fn only_close_examples_are_used_strongest_last() {
-        let examples = examples_from(&[
-            rated("1", "a", "close", "good", None),
-            rated("2", "b", "closest", "good", None),
-            rated("3", "c", "far", "good", None),
-        ]);
+        let examples = examples_from(
+            &[
+                rated("1", "a", "close", "good", None),
+                rated("2", "b", "closest", "good", None),
+                rated("3", "c", "far", "good", None),
+            ],
+            "dementia",
+        );
         let mut embeddings = HashMap::new();
         embeddings.insert(examples[0].key.clone(), vec![0.8, 0.6]);
         embeddings.insert(examples[1].key.clone(), vec![1.0, 0.0]);
@@ -172,6 +180,23 @@ mod tests {
         let chosen = choose(&examples, &embeddings, &[1.0, 0.0], MAX_EXAMPLES);
         let answers: Vec<&str> = chosen.iter().map(|e| e.answer.as_str()).collect();
         assert_eq!(answers, vec!["close", "closest"]);
+    }
+
+    #[test]
+    fn examples_are_scoped_to_their_agent() {
+        let mut chat = rated("1", "What is a tuple?", "An immutable sequence.", "good", None);
+        chat.agent = "dementia".to_string();
+        let mut code = rated("2", "What is a tuple?", "tuple = (1, 2)", "good", None);
+        code.agent = "code".to_string();
+        let entries = [chat, code];
+
+        let chat_examples = examples_from(&entries, "dementia");
+        assert_eq!(chat_examples.len(), 1);
+        assert_eq!(chat_examples[0].answer, "An immutable sequence.");
+
+        let code_examples = examples_from(&entries, "code");
+        assert_eq!(code_examples.len(), 1);
+        assert_eq!(code_examples[0].answer, "tuple = (1, 2)");
     }
 
     #[test]

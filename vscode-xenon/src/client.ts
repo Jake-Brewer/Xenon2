@@ -79,6 +79,29 @@ export class SseParser {
   }
 }
 
+/** Rates a reply, or sends the fix when it was wrong. Learning is instant: the next request that
+ * resembles this one pulls the rated example into its prompt (see `example_bank.rs`). */
+export async function sendFeedback(
+  connection: Connection,
+  feedback: { messageId: string; rating: "good" | "bad" | "none"; correction?: string; history: ChatMessage[]; reply: string },
+): Promise<void> {
+  const response = await fetch(`${connection.url}/v1/feedback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${connection.token}` },
+    body: JSON.stringify({
+      message_id: feedback.messageId,
+      rating: feedback.rating,
+      correction: feedback.correction,
+      history: feedback.history,
+      reply: feedback.reply,
+    }),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Xenon2 answered ${response.status}: ${detail}`);
+  }
+}
+
 export async function health(connection: Connection, signal?: AbortSignal): Promise<{ model: string }> {
   const response = await fetch(`${connection.url}/health`, { signal });
   if (!response.ok) throw new Error(`Xenon2 answered ${response.status}`);

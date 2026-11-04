@@ -147,3 +147,38 @@ button:disabled {
   color: var(--vscode-button-secondaryForeground);
   background: var(--vscode-button-secondaryBackground);
 }
+
+.rate-bar {
+  margin-top: 6px;
+  display: flex;
+  gap: 4px;
+}
+
+.rate-bar button {
+  padding: 1px 8px;
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border, #8884);
+}
+
+.rate-bar.done,
+.rate-bar.correcting {
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.rate-bar.correcting {
+  display: block;
+}
+
+.correction {
+  box-sizing: border-box;
+  width: 100%;
+  resize: vertical;
+  padding: 4px 6px;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: inherit;
+}

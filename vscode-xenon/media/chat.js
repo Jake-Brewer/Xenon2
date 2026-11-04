@@ -75,8 +75,30 @@
   log.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-act]");
     if (!button) return;
+    const act = button.dataset.act;
+    if (act === "good" || act === "bad") {
+      const messageId = button.closest(".msg").dataset.messageId;
+      if (act === "bad") {
+        const bar = button.closest(".rate-bar");
+        bar.outerHTML = `<div class="rate-bar correcting">
+          <textarea class="correction" rows="2" placeholder="What should Xenon have said? (Enter to save)"></textarea>
+        </div>`;
+        return;
+      }
+      vscode.postMessage({ type: "rate", messageId, rating: act });
+      return;
+    }
     const code = button.closest(".code").querySelector("code").textContent;
-    vscode.postMessage({ type: button.dataset.act, code });
+    vscode.postMessage({ type: act, code });
+  });
+
+  log.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey || !event.target.classList.contains("correction")) return;
+    event.preventDefault();
+    const correction = event.target.value.trim();
+    if (!correction) return;
+    const messageId = event.target.closest(".msg").dataset.messageId;
+    vscode.postMessage({ type: "correct", messageId, correction });
   });
 
   form.addEventListener("submit", (event) => {
@@ -143,11 +165,27 @@
           current.el.innerHTML = render(current.text, false) || `<div class="note">(no reply)</div>`;
           if (message.finish === "length") current.el.insertAdjacentHTML("beforeend", `<div class="note">Stopped at the reply length limit.</div>`);
           if (message.finish === "cancelled") current.el.insertAdjacentHTML("beforeend", `<div class="note">Stopped.</div>`);
+          if (message.messageId) {
+            current.el.dataset.messageId = message.messageId;
+            current.el.insertAdjacentHTML(
+              "beforeend",
+              `<div class="rate-bar">
+                <button data-act="good" title="Good reply">👍</button>
+                <button data-act="bad" title="Wrong — tell Xenon the fix">👎</button>
+              </div>`,
+            );
+          }
         }
         current = null;
         setBusy(false);
         scrollDown();
         break;
+      case "rated": {
+        const el = log.querySelector(`.msg[data-message-id="${message.messageId}"]`);
+        const bar = el && el.querySelector(".rate-bar");
+        if (bar) bar.outerHTML = `<div class="rate-bar done">${message.rating === "good" ? "Thanks — noted." : "Got it — Xenon will use that fix."}</div>`;
+        break;
+      }
       case "error":
         if (current) current.el.remove();
         current = null;

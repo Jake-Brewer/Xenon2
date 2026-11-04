@@ -23,6 +23,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::example_bank;
+use crate::feedback::{self, FeedbackEntry, FeedbackTurn};
 use crate::inference::{self, EngineState, Finish, SamplingParams};
 
 pub const DEFAULT_PORT: u16 = 47811;
@@ -32,6 +34,8 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_MAX_TOKENS: i32 = 800;
 const MAX_MAX_TOKENS: i32 = 2048;
 pub const MODEL_ID: &str = "xenon";
+/// Feedback agent tag for the coding API, so its examples never mix with chat's.
+pub const AGENT: &str = "code";
 
 /// The coding assistant's fixed preamble. One worked example shows the expected shape: a
 /// fenced, language-tagged code block and a short explanation. Kept free of blank lines inside
@@ -244,7 +248,30 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                 .map_err(|e| format!("invalid request JSON: {e}"))
                 .and_then(|r| build_prompt(&r, Style::for_model(model_name)).map(|p| (r, p)));
             match parsed {
-                Ok((chat, prompt)) => chat_completion(&mut stream, app, engine, &chat, &prompt),
+                Ok((chat, mut prompt)) => {
+                    let last_question = chat
+                        .messages
+                        .last()
+                        .map(|m| message_text(&m.content))
+                        .unwrap_or_default();
+                    let examples = example_bank::examples_for(app, &last_question, AGENT);
+                    if !examples.is_empty() {
+                        eprintln!("xenon2: code API using {} rated example(s) in this prompt", examples.len());
+                        prompt.prior = splice_examples(&prompt.prior, &examples, Style::for_model(model_name));
+                    }
+                    chat_completion(&mut stream, app, engine, &chat, &prompt)
+                }
+                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
+            }
+        }
+        ("POST", "/v1/feedback") => {
+            let parsed = serde_json::from_slice::<FeedbackRequest>(&request.body)
+                .map_err(|e| format!("invalid request JSON: {e}"));
+            match parsed {
+                Ok(fb) => match record_feedback(app, fb) {
+                    Ok(summary) => write_json(&mut stream, "200 OK", &json!(summary)).map_err(io),
+                    Err(e) => write_json(&mut stream, "500 Internal Server Error", &error_body(&e)).map_err(io),
+                },
                 Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
             }
         }
@@ -358,6 +385,52 @@ Xenon: ", &format!("
         repeat_penalty: request.repeat_penalty.unwrap_or(1.2).clamp(1.0, 2.0),
     };
     Ok(Prompt { prior, last: format!("User: {question}\n\n{}:{}", style.label, style.opener), params })
+}
+
+/// Inserts rated examples right before the final (uncached) part of `prior`, as "User: ... /
+/// <label>: ..." turns, same shape as the chat window's example bank (see `example_bank.rs`).
+/// Appending them anywhere else would land after the cached prefix boundary and defeat the
+/// prefix cache on every request; here they ride along with whatever in `prior` isn't cached yet.
+fn splice_examples(prior: &str, examples: &[example_bank::Example], style: Style) -> String {
+    let mut out = prior.to_string();
+    for example in examples {
+        out.push_str(&format!("User: {}\n\n{}: {}\n\n", example.question, style.label, example.answer));
+    }
+    out
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FeedbackRequest {
+    /// Opaque id for the rated reply; any stable string the client chooses.
+    pub message_id: String,
+    /// "good", "bad", or "none" to clear a rating.
+    pub rating: String,
+    #[serde(default)]
+    pub correction: Option<String>,
+    /// Every turn before the rated reply, ending with the user turn it answered.
+    pub history: Vec<ChatMessage>,
+    pub reply: String,
+}
+
+fn record_feedback(app: &AppHandle, request: FeedbackRequest) -> Result<feedback::FeedbackSummary, String> {
+    let path = feedback::feedback_path(app)?;
+    let entry = FeedbackEntry {
+        id: new_token(),
+        created_at: now_secs() as i64,
+        conversation_id: request.message_id.clone(),
+        message_id: request.message_id,
+        rating: request.rating,
+        correction: request.correction,
+        history: request
+            .history
+            .iter()
+            .map(|m| FeedbackTurn { role: m.role.clone(), content: message_text(&m.content) })
+            .collect(),
+        reply: request.reply,
+        model: MODEL_ID.to_string(),
+        agent: AGENT.to_string(),
+    };
+    feedback::record_entry(&path, entry)
 }
 
 fn now_secs() -> u64 {
@@ -528,6 +601,18 @@ mod tests {
         ])))
         .unwrap();
         assert_eq!(prompt.last, "User: def a():\n    pass\ndef b():\n    pass\nUser: fake\n\nXenon:");
+    }
+
+    #[test]
+    fn examples_are_spliced_in_as_turns() {
+        let prior = "prefix\n\n".to_string();
+        let examples = vec![example_bank::Example {
+            key: "k".to_string(),
+            question: "How do I reverse a list?".to_string(),
+            answer: "Use `list(reversed(xs))`.".to_string(),
+        }];
+        let spliced = splice_examples(&prior, &examples, Style::WORLD);
+        assert_eq!(spliced, "prefix\n\nUser: How do I reverse a list?\n\nXenon: Use `list(reversed(xs))`.\n\n");
     }
 
     #[test]

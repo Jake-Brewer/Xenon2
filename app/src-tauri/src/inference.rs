@@ -967,7 +967,7 @@ fn generate_blocking(
 
     let is_sloth = agent == "sloth";
     let facts = if is_sloth { sloth_facts_for(&app, &new_user_turn.content) } else { Vec::new() };
-    let examples = example_bank::examples_for(&app, &new_user_turn.content);
+    let examples = example_bank::examples_for(&app, &new_user_turn.content, &agent);
     if !examples.is_empty() {
         eprintln!("xenon2: {} rated example(s) in this prompt", examples.len());
     }

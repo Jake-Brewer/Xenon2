@@ -3,7 +3,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SseParser, discoveryPath, resolveConnection } from "../client";
+import { SseParser, discoveryPath, resolveConnection, sendFeedback } from "../client";
 import { firstCodeBlock, pickCode, withContext } from "../context";
 
 test("SSE events split across chunks are joined", () => {
@@ -63,4 +63,27 @@ test("questions carry their code in a fenced block", () => {
 test("the first code block of a reply is found", () => {
   assert.equal(firstCodeBlock("Fixed:\n```python\nx = 2\n```\nDone."), "x = 2");
   assert.equal(firstCodeBlock("no code"), undefined);
+});
+
+test("feedback posts the rating and correction as JSON", async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return { ok: true, text: async () => "" } as Response;
+  }) as typeof fetch;
+  try {
+    await sendFeedback(
+      { url: "http://127.0.0.1:47811", token: "t1" },
+      { messageId: "5", rating: "bad", correction: "use list(reversed(xs))", history: [{ role: "user", content: "reverse a list" }], reply: "xs[::-1]" },
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:47811/v1/feedback");
+  const body = JSON.parse(calls[0].init.body as string);
+  assert.equal(body.message_id, "5");
+  assert.equal(body.rating, "bad");
+  assert.equal(body.correction, "use list(reversed(xs))");
 });

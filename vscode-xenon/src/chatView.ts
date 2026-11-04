@@ -1,7 +1,7 @@
 // The Xenon sidebar: a chat that streams replies and can put code from them into the editor.
 
 import * as vscode from "vscode";
-import { ChatMessage, Finish, resolveConnection, streamChat } from "./client";
+import { ChatMessage, Finish, resolveConnection, sendFeedback, streamChat } from "./client";
 import { CodeContext, firstCodeBlock, withContext } from "./context";
 
 export interface Host {
@@ -18,7 +18,9 @@ type FromWebview =
   | { type: "send"; text: string; includeContext: boolean }
   | { type: "stop" }
   | { type: "newChat" }
-  | { type: "insert" | "replace" | "copy"; code: string };
+  | { type: "insert" | "replace" | "copy"; code: string }
+  | { type: "rate"; messageId: string; rating: "good" | "bad" }
+  | { type: "correct"; messageId: string; correction: string };
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   static readonly viewId = "xenon.chat";
@@ -29,6 +31,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   private lastSentCode?: string;
   private abort?: AbortController;
   private queued?: { text: string; context?: CodeContext };
+  /** History and reply text for each rateable assistant message, by the id given to the webview. */
+  private rateable = new Map<string, { history: ChatMessage[]; reply: string }>();
+  private nextMessageId = 0;
 
   constructor(private readonly extensionUri: vscode.Uri, private readonly host: Host) {}
 
@@ -57,6 +62,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   newChat(): void {
     this.stop();
     this.messages = [];
+    this.rateable.clear();
     this.lastSentCode = undefined;
     this.post({ type: "reset" });
   }
@@ -96,6 +102,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       case "replace":
         await this.applyCode(message.type, message.code);
         break;
+      case "rate":
+        await this.rate(message.messageId, message.rating);
+        break;
+      case "correct":
+        await this.rate(message.messageId, "bad", message.correction);
+        break;
+    }
+  }
+
+  private async rate(messageId: string, rating: "good" | "bad", correction?: string): Promise<void> {
+    const entry = this.rateable.get(messageId);
+    if (!entry) return;
+    try {
+      const connection = resolveConnection(this.host.settings());
+      await sendFeedback(connection, { messageId, rating, correction, history: entry.history, reply: entry.reply });
+      this.post({ type: "rated", messageId, rating });
+    } catch (err) {
+      vscode.window.showWarningMessage(`Couldn't save feedback: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -152,7 +176,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         },
         abort.signal,
       );
-      this.post({ type: "done", finish, hasCode: firstCodeBlock(reply) !== undefined });
+      const messageId = reply.trim() ? String(this.nextMessageId++) : undefined;
+      if (messageId) this.rateable.set(messageId, { history: [...this.messages], reply: reply.trim() });
+      this.post({ type: "done", finish, hasCode: firstCodeBlock(reply) !== undefined, messageId });
     } catch (err) {
       this.post({ type: "error", message: err instanceof Error ? err.message : String(err) });
     } finally {
