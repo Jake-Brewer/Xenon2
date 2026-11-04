@@ -419,14 +419,45 @@ rather than truncating it, and the extension's `xenon.maxContextChars` setting a
 cap" (still capped in practice by read speed — prefill runs ~35 tok/s on the RTX 2060, since the
 vendored ggml has no GPU kernel for RWKV-7's WKV op, only a CPU one; see `rwkv_operators_wkv_v7.inc`).
 
-**Model comparison, in progress**: downloaded and converted `RWKV-7 G1l 2.9B` (2026-10-31,
-`BlinkDL/rwkv7-g1`) to the same Q5_1 quantization as the current `RWKV-7 World v3 2.9B`, to see
-whether G1 (trained with "thinking" and tool-use data) codes better. `training/make_python_sft.py`
-builds a 4000-pair training set from bigcode's execution-tested `self-oss-instruct-sc2-exec-filter-50k`
-(ODC-By), with MBPP/HumanEval held out, for an infctx LoRA tune. `training/eval_code.py` scores
-pass@1 against the running app. World v3's baseline pass@1 on MBPP is being measured now; G1l's
-baseline and both models' post-training scores are next, then the better model becomes the app's
-default (`XENON_MODEL` goes away or becomes dev-only).
+**Model comparison, baseline done (2026-11-03)**: downloaded and converted `RWKV-7 G1l 2.9B`
+(2026-10-31, `BlinkDL/rwkv7-g1`) to the same Q5_1 quantization as the current `RWKV-7 World v3
+2.9B`, to see whether G1 (trained with "thinking" and tool-use data) codes better.
+`training/make_python_sft.py` builds a 4000-pair training set from bigcode's execution-tested
+`self-oss-instruct-sc2-exec-filter-50k` (ODC-By), with MBPP/HumanEval held out, for an infctx
+LoRA tune. `training/eval_code.py` scores pass@1 against the running app (first code block of the
+reply, run against the problem's unit tests, 10s timeout, no network/extra privileges).
+
+Baseline pass@1 on the same 40 MBPP problems, zero-shot, no fine-tuning, `--temperature 0`:
+
+| Model | pass@1 | Time (40 problems) |
+|---|---|---|
+| RWKV-7 World v3 2.9B (current default) | 35.0% (14/40) | 352s |
+| RWKV-7 G1l 2.9B | **67.5% (27/40)** | 1113s |
+
+**G1l is the clear win even untuned — almost double World v3's accuracy** (G1 was trained with
+code/reasoning-heavy data that World v3 lacks). G1l is also noticeably slower per problem here
+(longer replies, since it emits an (empty) `<think></think>` block and tends toward more verbose
+explanations before code) — worth watching once an infctx LoRA tune is layered on, but the
+accuracy gap is large enough that this is the new default regardless. `rwkv-7-g1l-2.9B-Q5_1.bin`
+is already in `models/`.
+
+**Not yet done, needs a decision**: switching the *app-wide* default model (`load_engine`'s
+hardcoded `rwkv-7-world-2.9B-Q5_1.bin`) to G1l is more than a one-line change. `STATIC_PREFIX` and
+`EXTRACTION_STATIC_PREFIX` in `inference.rs` are hand-written for World's `Xenon:`-label format;
+G1 expects `Assistant:` turns and a `<think></think>` (or real `<think>`) block (see
+`code_api.rs`'s `Style`, which already does this correctly for the coding API only). Swapping the
+model without updating those two prefixes would run every voice/chat reply and fact-extraction
+call against a prompt shape the model wasn't trained on. There's also no chat-quality benchmark
+here yet, only a coding one (MBPP) -- G1l winning at code doesn't by itself say it's as good or
+better as "Xenon" the general voice assistant. Left for a deliberate follow-up: update the two
+chat prefixes to G1's format, spot-check general conversation quality, *then* flip the default.
+In the meantime, G1l is fully usable for coding today via `XENON_MODEL=rwkv-7-g1l-2.9B-Q5_1.bin`
+(which `code_api.rs` already formats correctly) -- the VS Code extension and coding API benefit
+from the pass@1 win right now without touching the voice/chat path at all.
+
+Also still open: run the infctx LoRA tune on `training/python_sft_train.jsonl` to see how much
+further G1l's pass@1 improves, and re-score both HumanEval and the full MBPP set, not just 40
+problems.
 
 ## Future work (not yet scheduled)
 
