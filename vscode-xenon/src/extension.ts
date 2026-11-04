@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import { ChatViewProvider, Host } from "./chatView";
 import { ChatMessage, health, resolveConnection, streamChat } from "./client";
 import { CodeContext, pickCode, withContext } from "./context";
+import { acceptPendingEdit, discardPendingEdit, hasPendingEdit, proposeFileEdit } from "./edit";
 
 const PROMPTS = {
   explain: "Explain what this code does, step by step, and point out anything surprising.",
@@ -132,6 +133,50 @@ export function activate(extension: vscode.ExtensionContext): void {
       await checkHealth();
       vscode.window.showInformationMessage(online ? `Connected to Xenon (${online}).` : "The Xenon2 app isn't running.");
     }),
+    vscode.commands.registerCommand("xenon.editFile", async () => {
+      const editor = vscode.window.activeTextEditor ?? lastEditor;
+      if (!editor) {
+        vscode.window.showWarningMessage("Open a file first, then ask Xenon to edit it.");
+        return;
+      }
+      if (hasPendingEdit()) {
+        vscode.window.showWarningMessage("Review the pending Xenon edit first (Apply or Discard), then try again.");
+        return;
+      }
+      const instruction = await vscode.window.showInputBox({
+        prompt: `Tell Xenon how to improve ${vscode.workspace.asRelativePath(editor.document.uri)}`,
+        placeHolder: "e.g. Make this use type hints and fix the off-by-one in the loop.",
+      });
+      if (!instruction) return;
+
+      const document = editor.document;
+      const abort = new AbortController();
+      host.setBusy(true);
+      void vscode.commands.executeCommand("setContext", "xenon.editPending", true);
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: "Xenon is rewriting the file…", cancellable: true },
+        async (_progress, token) => {
+          token.onCancellationRequested(() => abort.abort());
+          try {
+            const connection = resolveConnection(settings());
+            await proposeFileEdit(connection, settings(), document, instruction, () => {}, abort.signal);
+            const action = await vscode.window.showInformationMessage(
+              "Xenon's suggestion is open as a diff. Review it, then Apply or Discard.",
+              "Apply",
+              "Discard",
+            );
+            if (action === "Apply") await acceptPendingEdit();
+            else if (action === "Discard") discardPendingEdit();
+          } catch (err) {
+            vscode.window.showErrorMessage(err instanceof Error ? err.message : String(err));
+          }
+        },
+      );
+      void vscode.commands.executeCommand("setContext", "xenon.editPending", false);
+      host.setBusy(false);
+    }),
+    vscode.commands.registerCommand("xenon.applyEdit", () => acceptPendingEdit()),
+    vscode.commands.registerCommand("xenon.discardEdit", () => discardPendingEdit()),
   );
 
   registerParticipant(extension);

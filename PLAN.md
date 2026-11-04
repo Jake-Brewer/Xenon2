@@ -459,6 +459,61 @@ Also still open: run the infctx LoRA tune on `training/python_sft_train.jsonl` t
 further G1l's pass@1 improves, and re-score both HumanEval and the full MBPP set, not just 40
 problems.
 
+**Instant feedback loop for code (2026-11-04) [x]**: the chat window's example bank
+(`example_bank.rs`) now works for the coding API too, reusing the same mechanism rather than a
+new one. `FeedbackEntry.agent` tags which agent a rating belongs to (`"dementia"` for chat,
+`"code"` for the coding API — `AGENT` in `code_api.rs`), and `examples_from`/`examples_for` take
+an `agent` filter so chat and code ratings never mix. `code_api.rs` adds `POST /v1/feedback`
+(records a rating/correction, shared `feedback::record_entry` with the chat window's Tauri
+command) and splices the closest-matching rated examples into the prompt (`splice_examples`,
+after the cached prefix so the prefix cache still hits) before every `/v1/chat/completions` call.
+No training involved — a correction changes the very next similar answer, by embedding-similarity
+retrieval into context, the same way chat ratings always have. Verified live: rated a wrong
+"reverse a list" answer with a correction, then asked a similarly-worded question — the log line
+`code API using 1 rated example(s) in this prompt` confirmed the retrieval fired, and the answer
+changed from the wrong pattern to the corrected one.
+
+The VS Code sidebar shows 👍/👎 under each reply; 👎 opens a one-line box for the fix, which is
+what gets stored and reused (an uncorrected 👎 is recorded but can't be used as a future example,
+same as chat). `vscode-xenon/src/client.ts` adds `sendFeedback`; `chatView.ts` tracks each
+rateable reply's id, history, and text so a rating can be sent with the full context the model
+saw. 9 Node tests (was 8), 30 Rust tests (was 29).
+
+**Whole-file edits with diff preview (2026-11-04) [x]**: `xenon.editFile` command (editor context
+menu and command palette) asks for an instruction, sends Xenon the whole current file plus the
+instruction, and asks for the complete updated file back in one fenced block (not a patch — RWKV
+has no context limit, so resending the whole file costs only read time, and "the whole file back"
+is far more reliable than getting a model to emit a correct unified diff). The result opens as a
+real VS Code diff (`vscode.diff`) against the original, never touching disk until the user picks
+Apply or Discard from a notification (or the diff tab's title-bar buttons, `xenon.applyEdit` /
+`xenon.discardEdit`, shown only while a diff is pending via the `xenon.editPending` context key).
+New `vscode-xenon/src/edit.ts`; nothing here touches the chat sidebar's own insert/replace actions
+on code blocks, which still work as before for smaller snippets.
+
+**Project-folder agent mode — scoped, not started.** Asked for: point Xenon at a folder and let
+it read, run, and improve the Python in it on its own (edit → run tests/script → fix → repeat),
+reporting back when done rather than confirming each step. This is a materially different thing
+from the chat/file-edit pieces above — a stateful loop that both writes files *and* executes
+code it chose to run, unattended, for potentially many iterations. Decided before building it:
+
+- *Needs a real sandbox boundary, not an honor system.* The executed Python must not be able to
+  touch anything outside the folder the user pointed at. A plain `Command::new("python")` from
+  Rust has no such boundary on its own.
+- *Needs an automatic rollback point.* Before the loop touches anything, snapshot the folder
+  (a git stash or a throwaway branch) so "the autonomous batch went wrong" is a one-command
+  revert, not a manual diff-by-diff cleanup.
+- *Needs a hard budget.* Max edits, max test/script runs, max wall-clock time per folder-agent
+  run, so a bad fix-retry cycle can't run unbounded or touch many files before anyone sees it.
+- *Needs a real report, not a log dump.* Per-file diffs, the test output before and after each
+  change, and a short why-per-change, surfaced in VS Code when the run ends (or stops early on
+  budget).
+
+None of this is in `code_api.rs` or `vscode-xenon/` yet. It is a new module, not an extension of
+the single-question coding API — the API answers one prompt and returns; this is a loop that
+owns a working directory for a while. Left unbuilt deliberately rather than shipped half-sandboxed
+during unattended work; the four points above are the actual design, to build next with review
+rather than rushed.
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.

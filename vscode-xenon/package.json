@@ -47,6 +47,9 @@
       { "command": "xenon.fix", "title": "Find and Fix Bugs", "category": "Xenon" },
       { "command": "xenon.tests", "title": "Write Tests", "category": "Xenon" },
       { "command": "xenon.docs", "title": "Add Documentation", "category": "Xenon" },
+      { "command": "xenon.editFile", "title": "Edit This File…", "category": "Xenon" },
+      { "command": "xenon.applyEdit", "title": "Apply Xenon's Edit", "category": "Xenon", "icon": "$(check)" },
+      { "command": "xenon.discardEdit", "title": "Discard Xenon's Edit", "category": "Xenon", "icon": "$(discard)" },
       { "command": "xenon.newChat", "title": "New Chat", "category": "Xenon", "icon": "$(add)" },
       { "command": "xenon.stop", "title": "Stop Generating", "category": "Xenon", "icon": "$(debug-stop)" },
       { "command": "xenon.reconnect", "title": "Reconnect to the Xenon2 App", "category": "Xenon" }
@@ -63,11 +66,16 @@
         { "command": "xenon.explain", "group": "1@2" },
         { "command": "xenon.fix", "group": "1@3" },
         { "command": "xenon.tests", "group": "1@4" },
-        { "command": "xenon.docs", "group": "1@5" }
+        { "command": "xenon.docs", "group": "1@5" },
+        { "command": "xenon.editFile", "group": "1@6" }
       ],
       "view/title": [
         { "command": "xenon.newChat", "when": "view == xenon.chat", "group": "navigation@1" },
         { "command": "xenon.stop", "when": "view == xenon.chat && xenon.generating", "group": "navigation@2" }
+      ],
+      "editor/title": [
+        { "command": "xenon.applyEdit", "when": "xenon.editPending", "group": "navigation@1" },
+        { "command": "xenon.discardEdit", "when": "xenon.editPending", "group": "navigation@2" }
       ]
     },
     "keybindings": [
