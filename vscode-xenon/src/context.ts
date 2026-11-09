@@ -63,7 +63,7 @@ export function firstCodeBlock(reply: string): string | undefined {
 }
 
 /** Directories that never help describe a project. */
-export const SKIP_DIRS = new Set(["node_modules", ".git", "target", "out", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".claude"]);
+export const SKIP_DIRS = new Set(["node_modules", ".git", "target", "out", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".claude", "models"]);
 
 /**
  * A short description of the open workspace, sent once at the start of each chat (and cached by
