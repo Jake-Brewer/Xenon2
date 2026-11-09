@@ -218,7 +218,11 @@ impl Budget {
 
 /// Asks the model a plain coding-API question and returns its reply as plain text (no
 /// streaming, no example-bank splicing — this loop's own prompts carry their own context).
-fn ask(engine: &EngineState, model_name: &str, question: &str, deadline: Instant, cancel: &AtomicBool) -> Result<String, String> {
+///
+/// `start` is written into the reply before the model begins, and comes back at the front of the
+/// returned text. Starting the reply with `FILE:` keeps G1, which was trained on tool use, from
+/// answering a long code prompt with a `<tool_call>` instead of an edit.
+fn ask(engine: &EngineState, model_name: &str, question: &str, start: &str, deadline: Instant, cancel: &AtomicBool) -> Result<String, String> {
     let style = Style::for_model(model_name);
     let request = ChatRequest {
         messages: vec![ChatMessage { role: "user".to_string(), content: serde_json::Value::String(question.to_string()) }],
@@ -230,8 +234,9 @@ fn ask(engine: &EngineState, model_name: &str, question: &str, deadline: Instant
         repeat_penalty: None,
         workspace: None,
     };
-    let prompt = code_api::build_prompt(&request, style)?;
-    let mut text = String::new();
+    let mut prompt = code_api::build_prompt(&request, style)?;
+    prompt.last.push_str(start);
+    let mut text = start.to_string();
     let mut sink = |piece: &str| {
         text.push_str(piece);
         !reply_complete(&text) && Instant::now() < deadline && !cancel.load(Ordering::Relaxed)
@@ -240,11 +245,6 @@ fn ask(engine: &EngineState, model_name: &str, question: &str, deadline: Instant
     Ok(text.trim().to_string())
 }
 
-/// Runs `python -m pytest <file>` for a test file (by the `test_*.py`/`*_test.py` convention
-/// pytest itself uses, or when `file` is a directory) and plain `python <file>` otherwise, with
-/// the working directory pinned to `root`, so relative imports and relative file access the
-/// script makes stay inside the sandboxed folder by construction, not by special-casing its own
-/// I/O.
 /// A command that checks an edit: tests where the project has them, else a typecheck or a run.
 #[derive(Debug, PartialEq)]
 struct Check {
@@ -585,9 +585,10 @@ pub fn run(
              met and nothing needs to change, reply with exactly `DONE: <one-sentence reason>` instead."
         );
         let deadline = budget.started + Duration::from_secs(MAX_SECONDS);
-        let reply = ask(engine, model_name, &question, deadline, cancel)?;
+        let reply = ask(engine, model_name, &question, "FILE:", deadline, cancel)?;
 
-        if !reply.contains("FILE:") {
+        // With the reply started as `FILE:`, "nothing to do" shows up as a DONE: line and no edit.
+        if edit_blocks::parse(&reply).is_empty() && extract_code_block(&reply).is_none() {
             if let Some(reason) = reason_after(&reply, "DONE:") {
                 report.narration.push(format!("Stopped: {reason}"));
                 report.stopped_reason = "finished".to_string();
