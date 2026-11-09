@@ -3,6 +3,7 @@ mod example_bank;
 mod feedback;
 mod ffi;
 mod folder_agent;
+mod gpu_temp;
 mod inference;
 mod memory;
 mod model_parts;

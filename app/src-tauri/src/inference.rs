@@ -305,6 +305,9 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     // plus the output head. A CPU-only library ignores the layer count.
     let threads = inference_threads();
     let gpu_compiled = unsafe { ffi::xenon_has_gpu_support() } != 0;
+    if gpu_compiled {
+        crate::gpu_temp::start_monitor();
+    }
     let free_mib = gpu_memory_free_mib();
     let mut layer_plan = Vec::new();
     if gpu_compiled {
@@ -585,6 +588,7 @@ fn absorb_token(ctx: &CallbackCtx, text: &str) -> bool {
     if text.is_empty() {
         return true;
     }
+    crate::gpu_temp::throttle();
     let mut pending = ctx.pending.borrow_mut();
     pending.push_str(text);
     for stop in STOP_SEQUENCES {
@@ -1113,6 +1117,7 @@ extern "C" fn on_sink_token(text: *const std::os::raw::c_char, _token_id: u32, u
     }
     let ctx = unsafe { &*(user_data as *const SinkCtx) };
     ctx.tokens.set(ctx.tokens.get() + 1);
+    crate::gpu_temp::throttle();
     let text = if text.is_null() { "" } else { unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("") };
     ctx.raw.borrow_mut().push_str(text);
     let mut pending = ctx.pending.borrow_mut();

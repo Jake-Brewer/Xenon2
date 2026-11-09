@@ -36,18 +36,13 @@ pub const MAX_SECONDS: u64 = 10 * 60;
 
 const SNAPSHOT_MESSAGE: &str = "xenon-agent: snapshot before run";
 
-/// The RTX 2060 here is in a laptop. At or above `HOT_C` the agent waits, before its next model
-/// turn, until the GPU is back down to `COOL_C`.
-const HOT_C: u32 = 80;
-const COOL_C: u32 = 72;
+/// The RTX 2060 here is in a laptop: before each model turn, wait for a hot GPU to cool (see
+/// `gpu_temp.rs`, which also throttles between tokens).
+use crate::gpu_temp::{COOL_C, HOT_C};
 const MAX_COOL_WAIT: Duration = Duration::from_secs(5 * 60);
 
 fn gpu_temp() -> Option<u32> {
-    let out = Command::new("nvidia-smi")
-        .args(["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()
+    crate::gpu_temp::read()
 }
 
 /// Waits out a hot GPU. Returns a narration line when it had to wait.
