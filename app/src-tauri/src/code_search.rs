@@ -286,7 +286,8 @@ mod tests {
         }
     }
 
-    fn project() -> Project {
+    /// A throwaway folder holding `files` (path, contents), removed when dropped.
+    fn project_with(files: &[(&str, String)]) -> Project {
         use std::sync::atomic::{AtomicU32, Ordering};
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = Project(std::env::temp_dir().join(format!(
@@ -294,18 +295,103 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )));
-        let write = |rel: &str, text: &str| {
+        for (rel, text) in files {
             let path = dir.path().join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
-        };
-        write("src/engine.rs", "fn threads_for(layers: u32) -> u32 {\n    1\n}\n");
-        write("src/caller.rs", "fn load() {\n    let t = threads_for(3);\n}\n");
-        write("ui/App.vue", "<button class=\"stop-btn\" @click=\"stopReply\">Stop</button>\n");
-        write("node_modules/x/index.js", "function threads_for() {}\n");
-        write("vendor/.git", "gitdir: elsewhere\n");
-        write("vendor/lib.rs", "fn threads_for() {}\n");
+        }
         dir
+    }
+
+    fn project() -> Project {
+        project_with(&[
+            ("src/engine.rs", "fn threads_for(layers: u32) -> u32 {\n    1\n}\n".into()),
+            ("src/caller.rs", "fn load() {\n    let t = threads_for(3);\n}\n".into()),
+            ("ui/App.vue", "<button class=\"stop-btn\" @click=\"stopReply\">Stop</button>\n".into()),
+            ("node_modules/x/index.js", "function threads_for() {}\n".into()),
+            ("vendor/.git", "gitdir: elsewhere\n".into()),
+            ("vendor/lib.rs", "fn threads_for() {}\n".into()),
+        ])
+    }
+
+    // The tests below were written against cargo-mutants' misses: each fails if the code it
+    // covers is broken in the way named, which the earlier tests didn't notice.
+
+    #[test]
+    fn keywords_skip_short_and_common_words_and_mark_identifiers() {
+        // "api" (3 letters) stays; two-letter words and stopwords go; a quoted word, a
+        // snake_case name and a camelCase name are identifiers, a plain word is not.
+        let found: Vec<(String, bool)> = keywords("Is the api of `Stop` in threads_for or loadModel?")
+            .into_iter()
+            .map(|k| (k.text, k.strong))
+            .collect();
+        let expected = [("api", false), ("stop", true), ("threads_for", true), ("loadmodel", true)];
+        assert_eq!(found, expected.map(|(t, s)| (t.to_string(), s)));
+    }
+
+    #[test]
+    fn big_files_lockfiles_and_unknown_types_are_not_searched() {
+        let dir = project_with(&[
+            ("real.rs", "let zebra_marker = 1;\n".into()),
+            ("big.rs", format!("// zebra_marker\n{}", "x".repeat(MAX_FILE_BYTES as usize + 1))),
+            ("Cargo.lock", "zebra_marker\n".into()),
+            ("package-lock.json", "{\"zebra_marker\": 1}\n".into()),
+            ("weights.bin", "zebra_marker\n".into()),
+        ]);
+        let names: Vec<String> = source_files(dir.path()).into_iter().map(|(rel, _)| rel).collect();
+        assert_eq!(names, vec!["real.rs"]);
+    }
+
+    #[test]
+    fn a_definition_is_matched_as_a_whole_word() {
+        assert!(!defines("fn threads_for_all() {}", "threads_for"), "a longer name");
+        assert!(!defines("fn xthreads_for() {}", "threads_for"), "a name ending the same way");
+        assert!(defines("fn threads_for() {}", "threads_for"));
+    }
+
+    #[test]
+    fn a_rare_word_outranks_a_common_one() {
+        // "alpha" is on five lines, "zeta" on one: the zeta line says more.
+        let text = "alpha 1\nalpha 2\nalpha 3\nalpha 4\nalpha 5\nzeta here\n\n";
+        assert_eq!(ranked_lines(text, "alpha zeta").first(), Some(&5));
+
+        // The same across files: the one file with "zeta" beats five with "alpha".
+        let mut files: Vec<(&str, String)> = ["a1.rs", "a2.rs", "a3.rs", "a4.rs", "a5.rs"]
+            .iter()
+            .map(|n| (*n, "alpha\nalpha\nalpha\n".to_string()))
+            .collect();
+        files.push(("z.rs", "zeta\n".into()));
+        let dir = project_with(&files);
+        assert_eq!(best_files(dir.path(), "alpha zeta", 3)[0].path, "z.rs");
+    }
+
+    #[test]
+    fn the_definition_line_outranks_the_lines_that_only_use_it() {
+        let text = "run_job(1);\nrun_job(2);\nrun_job(3);\nfn run_job(n: u32) {}\n";
+        assert_eq!(ranked_lines(text, "`run_job`").first(), Some(&3));
+    }
+
+    #[test]
+    fn a_file_matching_more_of_the_question_comes_first() {
+        // Both files' best line matches one word; p.rs also has the other word on another line.
+        let dir = project_with(&[("p.rs", "alpha\nzeta\n".into()), ("q.rs", "zeta\n".into())]);
+        assert_eq!(best_files(dir.path(), "alpha zeta", 2)[0].path, "p.rs");
+    }
+
+    #[test]
+    fn a_file_named_for_the_question_comes_first() {
+        let dir = project_with(&[
+            ("walker.py", "def walk(): pass  # the walker\n".into()),
+            ("other.py", "# uses the walker\nimport os\n".into()),
+        ]);
+        assert_eq!(best_files(dir.path(), "walker", 2)[0].path, "walker.py");
+    }
+
+    #[test]
+    fn only_matching_lines_are_returned() {
+        let dir = project_with(&[("a.rs", "one\nzeta two\nthree\nfour\n".into())]);
+        let hits = best_files(dir.path(), "zeta", 1);
+        assert_eq!(hits[0].lines, vec![(2, "zeta two".to_string())]);
     }
 
     #[test]
