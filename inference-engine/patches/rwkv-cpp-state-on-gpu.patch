@@ -1,0 +1,34 @@
+diff --git a/rwkv_eval.inc b/rwkv_eval.inc
+index be2e445..f017920 100644
+--- a/rwkv_eval.inc
++++ b/rwkv_eval.inc
+@@ -43,6 +43,8 @@ bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * st
+     RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, token < n_vocab, "Token (%" PRId32 ") is out of range (0 .. %zu)", token, n_vocab - 1);
+ 
+     if (!ctx->serial_graph.sched) {
++        // Xenon2: state, its per-layer slices and the token live on the first backend (the GPU when
++        // there is one). On the CPU backend they split each token's graph 66 ways on an RTX 2060.
+         ctx->serial_graph.sched = ggml_backend_sched_new(ctx->model->backends.data(), NULL, ctx->model->backends.size(), RWKV_MAX_NODES, false);
+ 
+         auto graph = ctx->serial_graph.cgraph;
+@@ -50,17 +52,17 @@ bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * st
+             auto node = graph->nodes[i];
+             if (std::string(node->name).find(".in.") != std::string::npos ||
+                 std::string(node->name).find(".out.") != std::string::npos) {
+-                ggml_backend_sched_set_tensor_backend(ctx->serial_graph.sched, node, ctx->model->backends.back());
++                ggml_backend_sched_set_tensor_backend(ctx->serial_graph.sched, node, ctx->model->backends.front());
+             }
+         }
+         for (int i = 0; i < graph->n_leafs; i++) {
+             auto leaf = graph->leafs[i];
+             if (std::string(leaf->name).find("state.in") != std::string::npos ||
+                 std::string(leaf->name).find("state.out") != std::string::npos) {
+-                ggml_backend_sched_set_tensor_backend(ctx->serial_graph.sched, leaf, ctx->model->backends.back());
++                ggml_backend_sched_set_tensor_backend(ctx->serial_graph.sched, leaf, ctx->model->backends.front());
+             }
+         }
+-        ggml_backend_sched_set_tensor_backend(ctx->serial_graph.sched, ctx->serial_graph.tokens, ctx->model->backends.back());
++        ggml_backend_sched_set_tensor_backend(ctx->serial_graph.sched, ctx->serial_graph.tokens, ctx->model->backends.front());
+ 
+         ggml_backend_sched_alloc_graph(ctx->serial_graph.sched, ctx->serial_graph.cgraph);
+     }

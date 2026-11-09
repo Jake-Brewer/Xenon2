@@ -3,6 +3,7 @@
 # is already in place is skipped. build_cpu.sh and build_cuda.sh run this first.
 #   ggml-rwkv-wkv7.patch       adds GGML_OP_RWKV_WKV7 (CPU + CUDA), ported from upstream ggml
 #   rwkv-cpp-native-wkv7.patch makes rwkv.cpp's RWKV-7 graph use it instead of a CPU-only custom op
+#   rwkv-cpp-state-on-gpu.patch keeps each token's state on the GPU (66 graph splits a token -> 2)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -18,3 +19,4 @@ apply() {
 
 apply rwkv.cpp/ggml ggml-rwkv-wkv7.patch
 apply rwkv.cpp rwkv-cpp-native-wkv7.patch
+apply rwkv.cpp rwkv-cpp-state-on-gpu.patch
