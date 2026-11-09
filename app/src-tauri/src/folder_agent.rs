@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::code_api::{self, ChatMessage, ChatRequest, Style};
+use crate::edit_blocks;
 use crate::inference::{self, EngineState};
 
 pub const MAX_EDITS: u32 = 5;
@@ -551,12 +552,16 @@ pub fn run(
             report.narration.push(line);
         }
 
+        // The goal comes before the files and again after them: a recurrent model reads once, so
+        // it should know what it's looking for while it reads (see CODING_STRATEGIES.md).
         let question = format!(
-            "{listing}{last_failure}Goal: {goal}\n\
-             Reply in this exact shape: a line `FILE: <path>` naming one file above to rewrite, \
-             then its complete new contents in one fenced code block, then a line starting with \
-             `WHY:` giving a one-sentence reason. If the goal is already met and nothing needs to \
-             change, reply with exactly `DONE: <one-sentence reason>` instead."
+            "Goal: {goal}\n\n{listing}{last_failure}Goal: {goal}\n\
+             Reply in this exact shape: a line `FILE: <path>` naming one file above, then one or \
+             more edit blocks, each copying a few lines exactly from that file and giving their \
+             replacement:\n\
+             <<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 2;\n>>>>>>> REPLACE\n\
+             then a line starting with `WHY:` giving a one-sentence reason. If the goal is already \
+             met and nothing needs to change, reply with exactly `DONE: <one-sentence reason>` instead."
         );
         let deadline = budget.started + Duration::from_secs(MAX_SECONDS);
         let reply = ask(engine, model_name, &question, deadline, cancel)?;
@@ -578,12 +583,38 @@ pub fn run(
             report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
             break;
         };
-        let Some(code) = extract_code_block(&reply) else {
-            report.stopped_reason = "the model's reply had no code block".to_string();
+        let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
+        // Edit blocks, or failing those a whole new file in a code block.
+        let blocks = edit_blocks::parse(&reply);
+        if !blocks.is_empty() && blocks.iter().all(|b| b.search.trim() == b.replace.trim()) {
+            // Small models often copy SEARCH into REPLACE while saying they changed it.
+            budget.edits += 1;
+            report.narration.push(format!("Xenon's edit to {relative_path} changed nothing; asking again"));
+            last_failure = format!(
+                "In your last reply the lines after `=======` were the same as the SEARCH lines, so nothing \
+                 changed. This time, after `=======`, write the lines as they should be after the fix.\n\n"
+            );
+            continue;
+        }
+        let code = if !blocks.is_empty() {
+            match edit_blocks::apply_all(&current, &blocks) {
+                Ok(code) => code,
+                Err(e) => {
+                    // A failed edit still costs one from the budget, so a model that keeps
+                    // missing can't loop forever; the reason goes back to it.
+                    budget.edits += 1;
+                    report.narration.push(format!("An edit to {relative_path} didn't apply: {e}"));
+                    last_failure = format!("Your last edit to `{relative_path}` didn't apply: {e}\n\n");
+                    continue;
+                }
+            }
+        } else if let Some(code) = extract_code_block(&reply) {
+            code
+        } else {
+            report.stopped_reason = "the model's reply had no edit blocks or code block".to_string();
             break;
         };
         let why = reason_after(&reply, "WHY:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
-        let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
         if code.trim() == current.trim() {
             report.narration.push(format!("Stopped: Xenon proposed {relative_path} unchanged ({why})"));
             report.stopped_reason = "finished".to_string();
