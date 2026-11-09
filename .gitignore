@@ -20,3 +20,6 @@ __pycache__/
 voice-pipeline/.venv/
 voice-pipeline/models/*.onnx
 voice-pipeline/models/*.onnx.json
+
+# Eval outputs
+training/out/

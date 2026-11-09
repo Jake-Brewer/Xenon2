@@ -571,6 +571,24 @@ Accuracy, by comparing the two builds' logits on `app/README.md` (rwkv.cpp's Pyt
 differ between builds or chunk sizes, since summation order changes floating-point rounding.
 The prior "35 tok/s" reading cap and the advice to keep sent context small are now out of date.
 
+**End-of-text and GPU heat (2026-11-08) [x]** — the engine never checked for token 0 (RWKV World's
+end-of-text). It decodes to nothing, so sampling ran past the model's own ending into a new
+"document": nearly every coding reply continued with an invented `User: ...` turn, often in
+Chinese, which without a reply cap would run until Stop. The engine now ends there and sends an
+empty token-0 end marker; both Rust callbacks treat it as the end of the turn. Separately,
+`gpu_temp.rs` reads `nvidia-smi` every 3 s and, between tokens, pauses generation at 80°C until
+72°C: two long answers in a row had reached 84°C, and now peak at 81°C with two 6 s pauses.
+Nothing happens on machines without `nvidia-smi`.
+
+**Repo-map check (2026-11-08) [x]** — `training/eval_repo_map.py` asks Xenon to describe each
+file in `.xenon/repo-map.md` from the file's contents and puts its answer beside the map's; with
+`--correct PATH "..."` it sends a correction to the example bank. First run (G1l): about 25 of
+29 right in substance. Misses: PLAN.md (it only sees the first 8,000 characters and described one
+section), SCHEMA.md (called it the conversation history itself), EXPORT_FORMAT.md (attributed
+it to `memory.rs`). One correction each fixed all three on the next ask. "Tell me about this
+repo" through the VS Code overview now takes ~25 s (was 246 s), nearly all of it writing the
+answer; precise lookups like "which file has the Stop button" still come back wrong.
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
