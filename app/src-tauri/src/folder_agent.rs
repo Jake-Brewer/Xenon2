@@ -36,6 +36,8 @@ pub const MAX_RUNS: u32 = 3;
 pub const MAX_SECONDS: u64 = 10 * 60;
 /// Lines shown on each side of the lines Xenon rewrites, as context it can't change.
 const CONTEXT_LINES: usize = 3;
+/// The most steps a goal is broken into.
+const MAX_STEPS: usize = 5;
 /// Tries at one place in a file before moving on to the next-best place.
 const TRIES_PER_PLACE: usize = 2;
 /// Lines Xenon rewrites from a definition down (its signature and the start of its body).
@@ -713,6 +715,203 @@ pub fn cancel_job(id: &str) -> bool {
 
 /// The whole folder-agent loop: edit, run, read the result, decide whether to continue, stopping
 /// on success, a budget limit, cancellation, or the model declining to propose further changes.
+/// What stays the same for every attempt in a run.
+struct RunContext<'a> {
+    engine: &'a EngineState,
+    model_name: &'a str,
+    root: &'a Path,
+    files: &'a [String],
+    /// The files came from search, so Xenon may name another real file in the folder.
+    searched: bool,
+    listing: &'a str,
+    deadline: Instant,
+    cancel: &'a AtomicBool,
+}
+
+/// What one attempt at an edit came to.
+enum Attempt {
+    /// A rewrite of lines `from..to` of `path`: `code` is the whole file afterwards.
+    Edit { path: String, from: usize, to: usize, written: String, current: String, code: String, clean_prompt: String },
+    /// Xenon wrote the lines back unchanged.
+    Unchanged { path: String, from: usize, to: usize, target: String, clean_prompt: String },
+    /// Xenon said nothing needs to change, with its reason.
+    Done(String),
+    /// The run can't go on, with the reason.
+    Stop(String),
+}
+
+/// One edit for `goal`: Xenon picks the file, the agent picks the lines, Xenon rewrites them.
+fn attempt(
+    ctx: &RunContext,
+    goal: &str,
+    last_failure: &str,
+    tried: &mut HashMap<String, Vec<(usize, usize)>>,
+    report: &mut Report,
+) -> Result<Attempt, String> {
+    let RunContext { engine, model_name, root, files, searched, listing, deadline, cancel } = *ctx;
+    // The goal comes before the files and again after them: a recurrent model reads once, so
+    // it should know what it's looking for while it reads (see CODING_STRATEGIES.md). The
+    // edit's shape is set by how its reply is started (below), so it isn't described here.
+    let question = format!(
+        "Goal: {goal}\n\n{listing}{last_failure}Goal: {goal}\n\
+         Reply with a line `FILE: <path>` naming the one file above to change. If nothing needs \
+         to change, reply `FILE: none` and then `DONE: <one-sentence reason>`."
+    );
+
+    // The reply is started as `FILE:` so it can only be a path (G1 otherwise answers long code
+    // prompts with a <tool_call>).
+    let path_reply = ask(engine, model_name, &question, "FILE:", &first_line_done, deadline, cancel)?;
+    let written = path_reply["FILE:".len()..].lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_matches('`').to_string();
+    if written.is_empty() || written.eq_ignore_ascii_case("none") {
+        let done = ask(engine, model_name, &question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
+        let reason = reason_after(&done, "DONE:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
+        return Ok(Attempt::Done(reason));
+    }
+    // Files named by the caller are the limit. Files picked by search are only a guess, so
+    // Xenon may name another real file in the folder (search had missed walker.py where
+    // other files repeated the goal's words; Xenon named it anyway).
+    let named = snap_to_list(&written, files).or_else(|| {
+        searched
+            .then(|| crate::code_search::snap_path(root, &written))
+            .flatten()
+            .filter(|p| contained(root, &root.join(p)).is_ok())
+    });
+    let Some(path) = named else {
+        report.narration.push(format!("Xenon's reply began: {}", excerpt(&path_reply)));
+        return Ok(Attempt::Stop(format!("the model named {written}, which wasn't in the given file list")));
+    };
+    let current = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+    // Xenon recalls lines it read far back poorly, and given SEARCH/REPLACE it either
+    // misremembered a long line (five times in a row) or, shown the lines first, copied them
+    // into both halves. What it does well is rewrite lines shown just before its reply. So
+    // the agent picks the line that best matches the goal and has Xenon rewrite it and its
+    // neighbours. A few lines on either side are shown as context but never replaced: when
+    // they were part of the rewrite, Xenon dropped one of them.
+    let file_lines: Vec<&str> = current.lines().collect();
+    // Each place gets two tries, then the next-best place: retrying the same lines got the
+    // same wrong edit three times running, but a second try with the failure in front of it
+    // often fixes the first.
+    let tried_here = tried.entry(path.clone()).or_default();
+    let Some((from, to)) = crate::code_search::ranked_lines(&current, goal)
+        .into_iter()
+        .map(|line| edit_range(&file_lines, line))
+        .find(|range| tried_here.iter().filter(|r| *r == range).count() < TRIES_PER_PLACE)
+    else {
+        return Ok(Attempt::Stop(format!("tried every place in {path} that matches the goal")));
+    };
+    tried_here.push((from, to));
+    let target = file_lines[from..to].join("\n");
+    let before = file_lines[from.saturating_sub(CONTEXT_LINES)..from].join("\n");
+    let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
+    let lang = fence(&path);
+    // A short question of its own, without the file listing: with three large files read
+    // first, Xenon dropped entries from a line it was asked to add one to. But the lines to
+    // change stay in the reply's start, right before "become:": with them in the question
+    // instead, Xenon passed 2 of 7 edit tasks rather than 6 of 6.
+    let question_with = |failure: &str| {
+        format!(
+            "Goal: {goal}\n\n{failure}In `{path}`, the lines just before the ones to change:\n```{lang}\n{before}\n```\n\
+             and just after them:\n```{lang}\n{after}\n```\nGoal: {goal}"
+        )
+    };
+    let start = format!(
+        "Lines {first}-{to} of `{path}` are:\n```{lang}\n{target}\n```\nWith the goal done, they become:\n```{lang}\n",
+        first = from + 1
+    );
+    let start_len = start.len();
+    let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
+    let reply = ask(engine, model_name, &question_with(last_failure), &start, &closed, deadline, cancel)?;
+    let Some(written) = reply.get(start_len..).and_then(|rest| rest.split("```").next()) else {
+        report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
+        return Ok(Attempt::Stop("the model's reply had no new lines".to_string()));
+    };
+    let written = written.trim_end_matches(['\n', '\r']).to_string();
+    // The prompt this place gets without any failure feedback: the one a lesson pairs with the
+    // edit that finally passes here.
+    let clean_prompt = ask_prompt(model_name, &question_with(""), &start).map(|(a, b, _)| a + &b).unwrap_or_default();
+    if written.trim() == target.trim() {
+        return Ok(Attempt::Unchanged { path, from, to, target, clean_prompt });
+    }
+    let code = replace_lines(&current, from, to, &written);
+    Ok(Attempt::Edit { path, from, to, written, current, code, clean_prompt })
+}
+
+/// Asks Xenon to break `goal` into numbered steps, each one change in one place. The reply is
+/// started as "1." so it can only be a list. At most `MAX_STEPS` come back.
+fn plan(ctx: &RunContext, goal: &str, last_failure: &str) -> Result<Vec<String>, String> {
+    let question = format!(
+        "Goal: {goal}\n\n{}{last_failure}Goal: {goal}\n\
+         Break the goal into steps. Each step is one change in one place in one of the files above, \
+         and names that file. Number the steps. If one change does it, write one step.",
+        ctx.listing
+    );
+    let done = |t: &str| t.len() > 1500 || t.contains("\n\n") || t.contains("User:");
+    let reply = ask(ctx.engine, ctx.model_name, &question, "1.", &done, ctx.deadline, ctx.cancel)?;
+    Ok(parse_steps(&reply))
+}
+
+/// The steps of a numbered list ("1. ...", "2) ..."), in order, at most `MAX_STEPS`.
+fn parse_steps(reply: &str) -> Vec<String> {
+    reply
+        .lines()
+        .map(str::trim)
+        .take_while(|l| !l.starts_with("User:"))
+        .filter_map(|l| {
+            let digits = l.chars().take_while(char::is_ascii_digit).count();
+            let rest = l.get(digits..)?;
+            (digits > 0 && (rest.starts_with('.') || rest.starts_with(')'))).then(|| rest[1..].trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .take(MAX_STEPS)
+        .collect()
+}
+
+/// Runs `check` once on the untouched code if it hasn't been yet, recording its warnings.
+fn ensure_baseline(ctx: &RunContext, check: &Check, baselines: &mut HashMap<String, Vec<String>>, report: &mut Report) -> Result<(), String> {
+    let key = check.display();
+    if baselines.contains_key(&key) {
+        return Ok(());
+    }
+    let step = run_check(ctx.root, check, ctx.deadline, ctx.cancel)?;
+    // Failing already is often the point ("make the failing test pass"); the run succeeds
+    // only once the whole check passes, so it just goes in the report.
+    if step.exit_code != Some(0) {
+        report.narration.push(format!("`{key}` fails before any edit"));
+    }
+    baselines.insert(key, warnings(&format!("{}{}", step.stdout, step.stderr)));
+    Ok(())
+}
+
+/// Runs `check` after an edit. Ok(true) when it passes with no new warnings (and, for a goal to
+/// remove a warning, fewer of them); otherwise Ok(false) with the reason in `failure`.
+fn passes(
+    ctx: &RunContext,
+    check: &Check,
+    goal: &str,
+    baselines: &HashMap<String, Vec<String>>,
+    report: &mut Report,
+    failure: &mut String,
+) -> Result<bool, String> {
+    let step = run_check(ctx.root, check, ctx.deadline, ctx.cancel)?;
+    let mut output = format!("{}{}", step.stdout, step.stderr);
+    let before_warnings = baselines.get(&check.display()).cloned().unwrap_or_default();
+    let after_warnings = warnings(&output);
+    let new_warnings: Vec<String> = after_warnings.iter().filter(|w| !before_warnings.contains(w)).cloned().collect();
+    // A goal to remove a warning is only met when there are fewer of them afterwards.
+    let warning_stayed = asks_to_remove_a_warning(goal) && after_warnings.len() >= before_warnings.len();
+    let passed = step.exit_code == Some(0) && new_warnings.is_empty() && !warning_stayed;
+    if step.exit_code == Some(0) && !new_warnings.is_empty() {
+        output = format!("The tests passed, but the edit added compiler warnings:\n{}", new_warnings.join("\n"));
+    } else if step.exit_code == Some(0) && warning_stayed {
+        output = format!("The tests passed, but the warnings the goal is about are still there:\n{}", after_warnings.join("\n"));
+    }
+    report.runs.push(step);
+    report.narration.push(format!("Ran `{}`: {}", check.display(), if passed { "passed" } else { "failed" }));
+    let tail: String = output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
+    *failure = format!("`{}` failed with:\n```\n{}\n```\n", check.display(), tail.trim());
+    Ok(passed)
+}
+
 pub fn run(
     engine: &EngineState,
     model_name: &str,
@@ -734,14 +933,6 @@ pub fn run(
         snapshot_commit: snapshot_commit.clone(),
         lessons: Vec::new(),
     };
-    let mut budget = Budget::new();
-    let mut last_failure = String::new();
-    // Per check command: the compiler warnings it gave before any edit.
-    let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
-    // Per file: the line ranges already rewritten without success.
-    let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
-    // Per place (file and line range): the clean prompt of its first failed edit there.
-    let mut failed_at: HashMap<(String, usize, usize), String> = HashMap::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
     // With no names at all, search the folder for the goal and work on the best matches.
@@ -758,9 +949,8 @@ pub fn run(
         }
         report.narration.push(format!("Searched the folder for the goal and picked {}", files.join(", ")));
     }
-    let files = files.as_slice();
     let mut listing = String::new();
-    for file in files {
+    for file in &files {
         let path = match contained(root, &root.join(file)) {
             Ok(p) => p,
             Err(e) => {
@@ -771,221 +961,218 @@ pub fn run(
         let text = std::fs::read_to_string(&path).map_err(|e| format!("couldn't read {file}: {e}"))?;
         listing.push_str(&format!("File `{file}`:\n```{}\n{text}\n```\n\n", fence(file)));
     }
+    let budget_started = Instant::now();
+    let ctx = RunContext {
+        engine,
+        model_name,
+        root,
+        files: &files,
+        searched,
+        listing: &listing,
+        deadline: budget_started + Duration::from_secs(MAX_SECONDS),
+        cancel,
+    };
+
+    // Goals that need changes in several places (a rename and its callers, code and its test)
+    // are broken into steps first; one change keeps the one-edit loop.
+    let steps = plan(&ctx, goal, "")?;
+    if steps.len() > 1 {
+        report.narration.push(format!("Broke the goal into {} steps: {}", steps.len(), steps.join(" / ")));
+        run_steps(&ctx, goal, steps, &mut report, progress)?;
+    } else {
+        run_one(&ctx, goal, &mut report, progress)?;
+    }
+    Ok(report)
+}
+
+/// The one-edit loop: edit, check, and on failure undo and try again with the failure shown.
+fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(&[String])) -> Result<(), String> {
+    let mut budget = Budget::new();
+    let mut last_failure = String::new();
+    // Per check command: the compiler warnings it gave before any edit.
+    let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
+    // Per file: the line ranges already rewritten.
+    let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    // Per place (file and line range): the clean prompt of its first failed edit there.
+    let mut failed_at: HashMap<(String, usize, usize), String> = HashMap::new();
 
     loop {
         progress(&report.narration);
-        if cancel.load(Ordering::Relaxed) {
+        if ctx.cancel.load(Ordering::Relaxed) {
             report.stopped_reason = "cancelled".to_string();
-            break;
+            return Ok(());
         }
         if let Some(reason) = budget.exhausted() {
             report.stopped_reason = reason;
-            break;
+            return Ok(());
         }
-
-        if let Some(line) = cool_down(cancel) {
+        if let Some(line) = cool_down(ctx.cancel) {
             report.narration.push(line);
         }
 
-        // The goal comes before the files and again after them: a recurrent model reads once, so
-        // it should know what it's looking for while it reads (see CODING_STRATEGIES.md). The
-        // edit's shape is set by how its reply is started (below), so it isn't described here.
-        let question = format!(
-            "Goal: {goal}\n\n{listing}{last_failure}Goal: {goal}\n\
-             Reply with a line `FILE: <path>` naming the one file above to change. If nothing needs \
-             to change, reply `FILE: none` and then `DONE: <one-sentence reason>`."
-        );
-        let deadline = budget.started + Duration::from_secs(MAX_SECONDS);
-
-        // Two steps, each started for the model so it can only go one way: first the file (G1
-        // otherwise answers long code prompts with a <tool_call>), then the edit, begun with the
-        // SEARCH marker so the next thing written is lines from that file.
-        let path_reply = ask(engine, model_name, &question, "FILE:", &first_line_done, deadline, cancel)?;
-        let written = path_reply["FILE:".len()..].lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_matches('`').to_string();
-        if written.is_empty() || written.eq_ignore_ascii_case("none") {
-            let done = ask(engine, model_name, &question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
-            let reason = reason_after(&done, "DONE:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
-            report.narration.push(format!("Stopped: {reason}"));
-            report.stopped_reason = "finished".to_string();
-            break;
-        }
-        // Files named by the caller are the limit. Files picked by search are only a guess, so
-        // Xenon may name another real file in the folder (search had missed walker.py where
-        // other files repeated the goal's words; Xenon named it anyway).
-        let named = snap_to_list(&written, files).or_else(|| {
-            searched
-                .then(|| crate::code_search::snap_path(root, &written))
-                .flatten()
-                .filter(|p| contained(root, &root.join(p)).is_ok())
-        });
-        let Some(relative_path) = named else {
-            report.narration.push(format!("Xenon's reply began: {}", excerpt(&path_reply)));
-            report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
-            break;
+        let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, &last_failure, &mut tried, report)? {
+            Attempt::Edit { path, from, to, written, current, code, clean_prompt } => (path, from, to, written, current, code, clean_prompt),
+            Attempt::Unchanged { path, from, to, target, clean_prompt } => {
+                // Small models often copy the lines back unchanged while meaning to change them.
+                budget.edits += 1;
+                report.narration.push(format!("Xenon's edit to {path} changed nothing; asking again"));
+                failed_at.entry((path.clone(), from, to)).or_insert(clean_prompt);
+                last_failure = format!(
+                    "Your last edit to `{path}` wrote these lines back unchanged:\n```{lang}\n{target}\n```\n\
+                     This time, change them so the goal is done.\n\n",
+                    lang = fence(&path)
+                );
+                continue;
+            }
+            Attempt::Done(reason) => {
+                report.narration.push(format!("Stopped: {reason}"));
+                report.stopped_reason = "finished".to_string();
+                return Ok(());
+            }
+            Attempt::Stop(reason) => {
+                report.stopped_reason = reason;
+                return Ok(());
+            }
         };
-        let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
-        // Xenon recalls lines it read far back poorly, and given SEARCH/REPLACE it either
-        // misremembered a long line (five times in a row) or, shown the lines first, copied them
-        // into both halves. What it does well is rewrite lines shown just before its reply. So
-        // the agent picks the line that best matches the goal and has Xenon rewrite it and its
-        // two neighbours. A few lines on either side are shown as context but never replaced:
-        // when they were part of the rewrite, Xenon dropped one of them.
-        let file_lines: Vec<&str> = current.lines().collect();
-        // Each place gets two tries, then the next-best place: retrying the same lines got the
-        // same wrong edit three times running, but a second try with the failure in front of it
-        // often fixes the first.
-        let tried_here = tried.entry(relative_path.clone()).or_default();
-        let Some((from, to)) = crate::code_search::ranked_lines(&current, goal)
-            .into_iter()
-            .map(|line| edit_range(&file_lines, line))
-            .find(|range| tried_here.iter().filter(|r| *r == range).count() < TRIES_PER_PLACE)
-        else {
-            report.stopped_reason = format!("tried every place in {relative_path} that matches the goal");
-            break;
-        };
-        tried_here.push((from, to));
-        let target = file_lines[from..to].join("\n");
-        let before = file_lines[from.saturating_sub(CONTEXT_LINES)..from].join("\n");
-        let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
-        let lang = fence(&relative_path);
-        // A short question of its own, without the file listing: with three large files read
-        // first, Xenon dropped entries from a line it was asked to add one to. But the lines to
-        // change stay in the reply's start, right before "become:": with them in the question
-        // instead, Xenon passed 2 of 7 edit tasks rather than 6 of 6.
-        let question_with = |failure: &str| {
-            format!(
-                "Goal: {goal}\n\n{failure}In `{relative_path}`, the lines just before the ones to change:\n```{lang}\n{before}\n```\n\
-                 and just after them:\n```{lang}\n{after}\n```\nGoal: {goal}"
-            )
-        };
-        let edit_question = question_with(&last_failure);
-        let start = format!(
-            "Lines {first}-{to} of `{relative_path}` are:\n```{lang}\n{target}\n```\nWith the goal done, they become:\n```{lang}\n",
-            first = from + 1
-        );
-        let start_len = start.len();
-        let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
-        let reply = ask(engine, model_name, &edit_question, &start, &closed, deadline, cancel)?;
-        let Some(written) = reply.get(start_len..).and_then(|rest| rest.split("```").next()) else {
-            report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
-            report.stopped_reason = "the model's reply had no new lines".to_string();
-            break;
-        };
-        let written = written.trim_end_matches(['\n', '\r']);
-        // The prompt this place gets without any failure feedback: the one a lesson pairs with
-        // the edit that finally passes here.
-        let place = (relative_path.clone(), from, to);
-        let clean_prompt = ask_prompt(model_name, &question_with(""), &start).map(|(a, b, _)| a + &b).unwrap_or_default();
-        if written.trim() == target.trim() {
-            // Small models often copy the lines back unchanged while meaning to change them.
-            budget.edits += 1;
-            report.narration.push(format!("Xenon's edit to {relative_path} changed nothing; asking again"));
-            failed_at.entry(place).or_insert(clean_prompt);
-            last_failure = format!(
-                "Your last edit to `{relative_path}` wrote these lines back unchanged:\n```{lang}\n{target}\n```\n\
-                 This time, change them so the goal is done.\n\n"
-            );
-            continue;
-        }
-        let code = replace_lines(&current, from, to, written);
-        let why = format!("rewrote lines {}-{to}", from + 1);
         if code.trim() == current.trim() {
-            report.narration.push(format!("Stopped: Xenon proposed {relative_path} unchanged"));
+            report.narration.push(format!("Stopped: Xenon proposed {path} unchanged"));
             report.stopped_reason = "finished".to_string();
-            break;
+            return Ok(());
         }
 
         // Before the first edit a check covers, run it on the untouched code: tests that already
         // fail would make every edit look wrong, and its compiler warnings are the bar an edit
         // must not raise (Xenon once "removed" a warning by re-indenting, and every test passed).
-        let check = check_for(root, &relative_path, files);
+        let check = check_for(ctx.root, &path, ctx.files);
         if let Some(check) = &check {
-            let key = check.display();
-            if !baselines.contains_key(&key) {
-                let step = match run_check(root, check, deadline, cancel) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        report.stopped_reason = e;
-                        break;
-                    }
-                };
-                // Failing already is often the point ("make the failing test pass"); the run
-                // succeeds only once the whole check passes, so it just goes in the report.
-                if step.exit_code != Some(0) {
-                    report.narration.push(format!("`{key}` fails before any edit"));
-                }
-                baselines.insert(key, warnings(&format!("{}{}", step.stdout, step.stderr)));
-            }
+            ensure_baseline(ctx, check, &mut baselines, report)?;
         }
-
-        let change = match write_file(root, &relative_path, &code) {
-            Ok(c) => c,
-            Err(e) => {
-                report.stopped_reason = e;
-                break;
-            }
-        };
+        let change = write_file(ctx.root, &path, &code)?;
         budget.edits += 1;
-        report.narration.push(format!("Edited {relative_path}: {why}"));
+        report.narration.push(format!("Edited {path}: rewrote lines {}-{to}", from + 1));
         report.edits.push(change.clone());
         progress(&report.narration);
 
         let Some(check) = check else {
-            report.narration.push(format!("No check runs for {relative_path}'s file type, so stopping after the edit"));
+            report.narration.push(format!("No check runs for {path}'s file type, so stopping after the edit"));
             report.stopped_reason = "finished: edited, nothing to check it with".to_string();
-            break;
-        };
-        let step = match run_check(root, &check, deadline, cancel) {
-            Ok(s) => s,
-            Err(e) => {
-                report.stopped_reason = e;
-                break;
-            }
+            return Ok(());
         };
         budget.runs += 1;
-        let mut output = format!("{}{}", step.stdout, step.stderr);
-        let before_warnings = baselines.get(&check.display()).cloned().unwrap_or_default();
-        let new_warnings: Vec<String> = warnings(&output).into_iter().filter(|w| !before_warnings.contains(w)).collect();
-        // A goal to remove a warning is only met when there are fewer of them afterwards.
-        let after_warnings = warnings(&output);
-        let warning_stayed = asks_to_remove_a_warning(goal) && after_warnings.len() >= before_warnings.len();
-        let passed = step.exit_code == Some(0) && new_warnings.is_empty() && !warning_stayed;
-        if step.exit_code == Some(0) && !new_warnings.is_empty() {
-            output = format!("The tests passed, but the edit added compiler warnings:\n{}", new_warnings.join("\n"));
-        } else if step.exit_code == Some(0) && warning_stayed {
-            output = format!(
-                "The tests passed, but the warnings the goal is about are still there:\n{}",
-                after_warnings.join("\n")
-            );
-        }
-        report.runs.push(step);
-        if passed {
-            report.narration.push(format!("Ran `{}`: passed", check.display()));
+        let mut failure = String::new();
+        let place = (path.clone(), from, to);
+        if passes(ctx, &check, goal, &baselines, report, &mut failure)? {
             if let Some(prompt) = failed_at.remove(&place) {
                 report.lessons.push(Lesson { prompt, answer: format!("{written}\n```"), passed: true, source: "agent" });
             }
             report.stopped_reason = "finished: the tests pass".to_string();
-            break;
+            return Ok(());
         }
         // A failed edit is undone, so the next try starts from the original file and a run that
         // runs out of budget never leaves a broken one (one did, before this).
-        if let Err(e) = write_file(root, &relative_path, &change.before) {
-            report.stopped_reason = e;
-            break;
-        }
+        write_file(ctx.root, &path, &change.before)?;
         report.edits.pop();
-        report.narration.push(format!("Ran `{}`: failed, so undid the edit", check.display()));
+        report.narration.push("Undid the edit".to_string());
         failed_at.entry(place).or_insert(clean_prompt);
-        let tail: String = output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
         last_failure = format!(
-            "Your last edit to `{relative_path}` was:\n```diff\n{}\n```\nIt was undone because `{}` failed with:\n```\n{}\n```\n\n",
-            short_diff(&change.before, &change.after),
-            check.display(),
-            tail.trim()
+            "Your last edit to `{path}` was:\n```diff\n{}\n```\nIt was undone because {failure}\n",
+            short_diff(&change.before, &change.after)
         );
     }
+}
 
-    Ok(report)
+/// Several steps: make every step's edit, then check once. Checking after each step would undo
+/// every partial change (a renamed function breaks its callers until the next step). On a
+/// failure all of the steps are undone and the goal is planned again with the failure shown.
+fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut Report, progress: &dyn Fn(&[String])) -> Result<(), String> {
+    let mut budget = Budget::new();
+    let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
+    let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    let mut last_failure = String::new();
+
+    // The baselines come first, before any step changes a file.
+    let mut checks: Vec<Check> = Vec::new();
+    for file in ctx.files {
+        if let Some(check) = check_for(ctx.root, file, ctx.files) {
+            if !checks.iter().any(|c| c.display() == check.display()) {
+                ensure_baseline(ctx, &check, &mut baselines, report)?;
+                checks.push(check);
+            }
+        }
+    }
+
+    loop {
+        progress(&report.narration);
+        if ctx.cancel.load(Ordering::Relaxed) {
+            report.stopped_reason = "cancelled".to_string();
+            return Ok(());
+        }
+        if let Some(reason) = budget.exhausted() {
+            report.stopped_reason = reason;
+            return Ok(());
+        }
+        if let Some(line) = cool_down(ctx.cancel) {
+            report.narration.push(line);
+        }
+
+        let mut changes: Vec<FileChange> = Vec::new();
+        for (i, step) in steps.iter().enumerate() {
+            let step_goal = format!("{step} (step {} of {}; the whole goal: {goal})", i + 1, steps.len());
+            match attempt(ctx, &step_goal, &last_failure, &mut tried, report)? {
+                Attempt::Edit { path, from, to, code, .. } => {
+                    let change = write_file(ctx.root, &path, &code)?;
+                    budget.edits += 1;
+                    report.narration.push(format!("Step {}: edited {path}, lines {}-{to}", i + 1, from + 1));
+                    changes.push(change);
+                }
+                Attempt::Unchanged { path, .. } => report.narration.push(format!("Step {}: Xenon left {path} unchanged", i + 1)),
+                Attempt::Done(reason) => report.narration.push(format!("Step {}: nothing to change ({reason})", i + 1)),
+                Attempt::Stop(reason) => report.narration.push(format!("Step {}: skipped ({reason})", i + 1)),
+            }
+            progress(&report.narration);
+        }
+        if changes.is_empty() {
+            report.stopped_reason = "no step changed anything".to_string();
+            return Ok(());
+        }
+
+        // Every check that covers a changed file, once each.
+        let mut failure = String::new();
+        let mut all_passed = true;
+        let mut ran: Vec<String> = Vec::new();
+        for change in &changes {
+            let Some(check) = check_for(ctx.root, &change.path, ctx.files) else { continue };
+            if ran.contains(&check.display()) {
+                continue;
+            }
+            ran.push(check.display());
+            ensure_baseline(ctx, &check, &mut baselines, report)?;
+            budget.runs += 1;
+            if !passes(ctx, &check, goal, &baselines, report, &mut failure)? {
+                all_passed = false;
+                break;
+            }
+        }
+        if all_passed {
+            report.edits.extend(changes);
+            report.stopped_reason = if ran.is_empty() { "finished: edited, nothing to check it with" } else { "finished: the tests pass" }.to_string();
+            return Ok(());
+        }
+
+        // Undo every step, newest first, so each file returns to how it was.
+        for change in changes.iter().rev() {
+            write_file(ctx.root, &change.path, &change.before)?;
+        }
+        report.narration.push("Undid every step".to_string());
+        let diffs: Vec<String> = changes.iter().map(|c| format!("`{}`:\n```diff\n{}\n```", c.path, short_diff(&c.before, &c.after))).collect();
+        last_failure = format!("Your last edits were:\n{}\nThey were undone because {failure}\n", diffs.join("\n"));
+        steps = plan(ctx, goal, &last_failure)?;
+        if steps.is_empty() {
+            report.stopped_reason = "Xenon gave no steps".to_string();
+            return Ok(());
+        }
+        report.narration.push(format!("Planned again: {}", steps.join(" / ")));
+    }
 }
 
 #[cfg(test)]
@@ -1115,6 +1302,19 @@ mod tests {
         assert!(asks_to_remove_a_warning("Silence the dead_code warning on split_into_parts"));
         assert!(!asks_to_remove_a_warning("Add \"models\" to SKIP_DIRS"));
         assert!(!asks_to_remove_a_warning("Log a warning when the GPU is hot"));
+    }
+
+    #[test]
+    fn steps_are_read_from_a_numbered_list() {
+        let reply = "1. Rename calc_total in shop.py\n2) Update the import in report.py\n   3. Update test_shop.py\nUser: next";
+        assert_eq!(
+            parse_steps(reply),
+            vec!["Rename calc_total in shop.py", "Update the import in report.py", "Update test_shop.py"]
+        );
+        assert_eq!(parse_steps("1. Only one change"), vec!["Only one change"]);
+        assert!(parse_steps("Sure, here is a plan:").is_empty());
+        let many: String = (1..=9).map(|i| format!("{i}. step {i}\n")).collect();
+        assert_eq!(parse_steps(&many).len(), MAX_STEPS);
     }
 
     #[test]
