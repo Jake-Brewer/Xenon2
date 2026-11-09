@@ -59,7 +59,11 @@ typedef enum xenon_status {
 // - user_data: whatever pointer was passed into xenon_generate.
 // Return `false` to stop generation early (e.g. caller wants to cancel); return `true` to keep
 // going until max_tokens is reached.
+// When the model emits its end-of-text token, generation ends with one last call whose text is
+// "" and whose token_id is XENON_END_OF_TEXT: the model finished its reply on its own.
 typedef bool (*xenon_token_callback)(const char * text, uint32_t token_id, void * user_data);
+
+#define XENON_END_OF_TEXT 0u
 
 // Loads a quantized rwkv.cpp ggml model file and the matching World-tokenizer vocab file
 // (see inference-engine/tools/convert_world_vocab.py and inference-engine/data/world_vocab.bin).

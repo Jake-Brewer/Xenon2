@@ -632,7 +632,7 @@ struct CallbackCtx {
 
 extern "C" fn on_token(
     text: *const std::os::raw::c_char,
-    _token_id: u32,
+    token_id: u32,
     user_data: *mut c_void,
 ) -> bool {
     if user_data.is_null() {
@@ -644,6 +644,11 @@ extern "C" fn on_token(
     } else {
         unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("")
     };
+    if token_id == ffi::XENON_END_OF_TEXT && text_str.is_empty() {
+        // The model ended its reply; anything held back as a possible "User:" is real text.
+        flush_pending(ctx);
+        return false;
+    }
     absorb_token(ctx, text_str)
 }
 
@@ -1111,11 +1116,17 @@ impl SinkCtx<'_> {
     }
 }
 
-extern "C" fn on_sink_token(text: *const std::os::raw::c_char, _token_id: u32, user_data: *mut c_void) -> bool {
+extern "C" fn on_sink_token(text: *const std::os::raw::c_char, token_id: u32, user_data: *mut c_void) -> bool {
     if user_data.is_null() {
         return true;
     }
     let ctx = unsafe { &*(user_data as *const SinkCtx) };
+    if token_id == ffi::XENON_END_OF_TEXT && (text.is_null() || unsafe { *text } == 0) {
+        let rest = std::mem::take(&mut *ctx.pending.borrow_mut());
+        ctx.send(&rest);
+        ctx.ended_turn.set(true);
+        return false;
+    }
     ctx.tokens.set(ctx.tokens.get() + 1);
     crate::gpu_temp::throttle();
     let text = if text.is_null() { "" } else { unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("") };

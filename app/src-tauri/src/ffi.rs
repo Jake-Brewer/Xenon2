@@ -29,6 +29,9 @@ impl XenonStatus {
 }
 
 /// Matches `xenon_token_callback` in xenon_inference.h: `bool (*)(const char*, uint32_t, void*)`.
+/// token_id of the final, empty callback when the model ends its reply itself (see the header).
+pub const XENON_END_OF_TEXT: u32 = 0;
+
 pub type XenonTokenCallback =
     extern "C" fn(text: *const c_char, token_id: u32, user_data: *mut c_void) -> bool;
 

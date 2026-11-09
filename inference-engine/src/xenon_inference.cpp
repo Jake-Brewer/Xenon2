@@ -287,6 +287,17 @@ xenon_status run_generation_loop(
             repeat_penalty, state->recent_tokens, engine->rng
         );
 
+        // Token 0 is RWKV World's end-of-text: the model has finished. It decodes to nothing, so
+        // sampling past it starts a new, unrelated "document" (often an invented next user turn).
+        // Flush held-back bytes, then send an empty token-0 call as the end marker.
+        if (token == 0) {
+            if (!pending_utf8.empty()) {
+                callback(pending_utf8.c_str(), XENON_END_OF_TEXT, user_data);
+            }
+            callback("", XENON_END_OF_TEXT, user_data);
+            return XENON_OK;
+        }
+
         push_recent_tokens(state, &token, 1);
 
         const std::string & token_bytes = engine->tokenizer->decode_token(token);
