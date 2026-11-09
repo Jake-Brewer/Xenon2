@@ -85,6 +85,16 @@ fn find_unique(lines: &[&str], search: &[&str], same: impl Fn(&str, &str) -> boo
 /// The few lines of the file that share the most words with `wanted`, to show the model what is
 /// really there when its SEARCH lines miss.
 fn closest_lines(lines: &[&str], wanted: &str) -> Option<String> {
+    window(lines, wanted, 1, 3)
+}
+
+/// The lines of `text` around the one sharing the most words with `wanted`: `before` lines above
+/// it, and it plus `after - 1` below. `None` when no line shares a word.
+pub fn window_of(text: &str, wanted: &str, before: usize, after: usize) -> Option<String> {
+    window(&text.lines().collect::<Vec<_>>(), wanted, before, after)
+}
+
+fn window(lines: &[&str], wanted: &str, before: usize, after: usize) -> Option<String> {
     let words = |s: &str| -> std::collections::HashSet<String> {
         s.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| w.len() > 1).map(str::to_lowercase).collect()
     };
@@ -97,8 +107,8 @@ fn closest_lines(lines: &[&str], wanted: &str) -> Option<String> {
     if shared == 0 {
         return None;
     }
-    let from = best.saturating_sub(1);
-    let to = (best + 3).min(lines.len());
+    let from = best.saturating_sub(before);
+    let to = (best + after).min(lines.len());
     Some(lines[from..to].join("\n"))
 }
 

@@ -600,6 +600,7 @@ pub fn run(
     };
     let mut budget = Budget::new();
     let mut last_failure = String::new();
+    let mut last_missed = String::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
     // With no names at all, search the folder for the goal and work on the best matches.
@@ -674,16 +675,25 @@ pub fn run(
             report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
             break;
         };
+        let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
+        // Xenon recalls lines it read far back poorly (it rewrote a long line wrong five times in
+        // a row) but copies and edits them exactly when they come right before its reply. So the
+        // reply starts by quoting the lines most likely to change: those around the best match
+        // for the goal, or for the SEARCH line that just missed. Not fenced, so the whole-file
+        // fallback can never mistake them for a new file.
+        let near = edit_blocks::window_of(&current, if last_missed.is_empty() { goal } else { &last_missed }, 4, 8)
+            .map(|lines| format!("The lines of it that matter:\n{lines}\n"))
+            .unwrap_or_default();
         let reply = ask(
             engine,
             model_name,
             &question,
-            &format!("FILE: {relative_path}\n<<<<<<< SEARCH\n"),
+            &format!("FILE: {relative_path}\n{near}<<<<<<< SEARCH\n"),
             &reply_complete,
             deadline,
             cancel,
         )?;
-        let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
+        last_missed.clear();
         // Edit blocks, or failing those a whole new file in a code block.
         let blocks = edit_blocks::parse(&reply);
         if !blocks.is_empty() && blocks.iter().all(|b| b.search.trim() == b.replace.trim()) {
@@ -705,6 +715,7 @@ pub fn run(
                     budget.edits += 1;
                     report.narration.push(format!("An edit to {relative_path} didn't apply: {e}"));
                     last_failure = format!("Your last edit to `{relative_path}` didn't apply: {e}\n\n");
+                    last_missed = blocks.iter().find_map(|b| b.search.lines().find(|l| !l.trim().is_empty())).unwrap_or("").to_string();
                     continue;
                 }
             }
