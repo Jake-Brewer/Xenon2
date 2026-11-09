@@ -28,7 +28,7 @@ a coding API that a VS Code extension uses. RWKV is a recurrent model with no co
 - src-tauri/src/ffi.rs: Rust declarations for the C engine in inference-engine/.
 - src-tauri/src/code_api.rs: local OpenAI-compatible HTTP API on 127.0.0.1:47811 with a bearer
   token (chat completions, feedback, folder agent).
-- src-tauri/src/edit_blocks.rs: parses and leniently applies SEARCH/REPLACE edit blocks.
+
 - src-tauri/src/code_search.rs: finds the project lines that best match a question, added to
   coding prompts that name a workspace folder.
 - src-tauri/src/folder_agent.rs: autonomous loop that edits files in a folder, checks them
@@ -70,6 +70,7 @@ a coding API that a VS Code extension uses. RWKV is a recurrent model with no co
 - make_self_data.py: exam and training set about Xenon2 itself (where symbols are defined,
   commit messages, the repo map); `--score where` asks the running app.
 - eval_repo_map.py: asks Xenon to describe each file in this map and sends corrections.
+- run_edit_tasks.py, edit_tasks/: scores the folder agent on small edit tasks with hidden checks.
 - make_python_sft.py, make_python_data.py: build Python coding training sets.
 - eval_code.py: scores Xenon's Python answers by running their tests (pass@1).
 - export_feedback.py: turns app ratings into a training set.

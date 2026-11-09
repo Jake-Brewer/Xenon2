@@ -624,8 +624,15 @@ console windows. Its snapshot ignores untracked files and submodule changes (thi
 both), so runs here get an undo point. Debug builds won't edit `app/src-tauri` (tauri dev would
 restart the app mid-run).
 
-Next: train on the "where" and commit items (state tuning or LoRA) and re-score; score commit
-messages; let the folder agent find which files to edit with code search instead of a list.
+**Research and a working edit loop [x]** — `CODING_STRATEGIES.md` ranks what helps a small model
+on a large code base, with sources, and records how Xenon edits. The folder agent now finds its own
+files, has the model pick a file and then rewrite a few lines that the agent picks (each step
+started for it), and undoes failed edits. `training/run_edit_tasks.py`: 7 of 7 small tasks with
+hidden checks, 6–30 s each. First edit of its own repo from a goal alone: `b15c9c1` (36 s).
+
+Next: harder edit tasks (Rust and TypeScript, edits spanning places, goals that need reading
+more than one file); sampling several edits and letting the tests choose; then training on the
+"where" and commit items (state tuning or LoRA) and re-scoring.
 
 ## Future work (not yet scheduled)
 
