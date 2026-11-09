@@ -40,3 +40,4 @@ running code. Training helps its habits, not its knowledge of the repo.
 |---|---|---|
 | no search | 0 | 1 |
 | search, results before the question | 37 | 87 |
+| search, question before and after the results, definitions must start their line | 83 | 89 |

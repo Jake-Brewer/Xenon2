@@ -613,6 +613,7 @@ grep-style, in front of the question. The VS Code chat sends its folder. Held-ou
 |---|---|---|
 | no search | 0/100 | 1/100 |
 | search | 37/100 | 87/100 |
+| search, question asked before and after the results (2026-11-09) | 83/100 | 89/100 |
 
 Most misses name the right file but drop the leading folders (`src/inference.rs` for
 `app/src-tauri/src/inference.rs`): a good target for training on the 460 "where" training items.
