@@ -3,7 +3,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SseParser, discoveryPath, resolveConnection, sendFeedback } from "../client";
+import { SseParser, discoveryPath, resolveConnection, runFolderAgent, sendFeedback } from "../client";
 import { firstCodeBlock, pickCode, withContext } from "../context";
 
 test("SSE events split across chunks are joined", () => {
@@ -86,4 +86,35 @@ test("feedback posts the rating and correction as JSON", async () => {
   assert.equal(body.message_id, "5");
   assert.equal(body.rating, "bad");
   assert.equal(body.correction, "use list(reversed(xs))");
+});
+
+test("the folder agent is started, polled for progress, then its report returned", async () => {
+  const report = { stopped_reason: "finished", edits: [], runs: [], narration: ["Edited a.py: fix", "Stopped: done"], snapshot_commit: "abc" };
+  const replies = [
+    { id: "run-1" },
+    { state: "running", narration: ["Edited a.py: fix"], report: null, error: null },
+    { state: "done", narration: report.narration, report, error: null },
+  ];
+  const routes: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    routes.push(`${init.method} ${url}`);
+    const body = replies.shift();
+    return { ok: true, json: async () => body, text: async () => "" } as Response;
+  }) as typeof fetch;
+  const steps: string[] = [];
+  try {
+    const result = await runFolderAgent(
+      { url: "http://h", token: "t" },
+      { folder: "/f", goal: "g", files: ["a.py"] },
+      (line) => steps.push(line),
+      undefined,
+      0,
+    );
+    assert.equal(result.snapshot_commit, "abc");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.deepEqual(routes, ["POST http://h/v1/folder-agent", "GET http://h/v1/folder-agent/run-1", "GET http://h/v1/folder-agent/run-1"]);
+  assert.deepEqual(steps, ["Edited a.py: fix", "Stopped: done"]);
 });

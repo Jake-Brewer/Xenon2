@@ -6,6 +6,7 @@ import { ChatViewProvider, Host } from "./chatView";
 import { ChatMessage, health, resolveConnection, streamChat } from "./client";
 import { CodeContext, pickCode, withContext } from "./context";
 import { acceptPendingEdit, discardPendingEdit, hasPendingEdit, proposeFileEdit } from "./edit";
+import { runFolderAgentCommand } from "./folderAgent";
 
 const PROMPTS = {
   explain: "Explain what this code does, step by step, and point out anything surprising.",
@@ -177,6 +178,7 @@ export function activate(extension: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("xenon.applyEdit", () => acceptPendingEdit()),
     vscode.commands.registerCommand("xenon.discardEdit", () => discardPendingEdit()),
+    vscode.commands.registerCommand("xenon.improveFolder", () => runFolderAgentCommand(() => resolveConnection(settings()))),
   );
 
   registerParticipant(extension);

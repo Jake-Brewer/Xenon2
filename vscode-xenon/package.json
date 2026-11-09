@@ -48,6 +48,7 @@
       { "command": "xenon.tests", "title": "Write Tests", "category": "Xenon" },
       { "command": "xenon.docs", "title": "Add Documentation", "category": "Xenon" },
       { "command": "xenon.editFile", "title": "Edit This File…", "category": "Xenon" },
+      { "command": "xenon.improveFolder", "title": "Improve Files in This Folder…", "category": "Xenon" },
       { "command": "xenon.applyEdit", "title": "Apply Xenon's Edit", "category": "Xenon", "icon": "$(check)" },
       { "command": "xenon.discardEdit", "title": "Discard Xenon's Edit", "category": "Xenon", "icon": "$(discard)" },
       { "command": "xenon.newChat", "title": "New Chat", "category": "Xenon", "icon": "$(add)" },

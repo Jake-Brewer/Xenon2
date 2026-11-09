@@ -490,29 +490,39 @@ Apply or Discard from a notification (or the diff tab's title-bar buttons, `xeno
 New `vscode-xenon/src/edit.ts`; nothing here touches the chat sidebar's own insert/replace actions
 on code blocks, which still work as before for smaller snippets.
 
-**Project-folder agent mode — scoped, not started.** Asked for: point Xenon at a folder and let
-it read, run, and improve the Python in it on its own (edit → run tests/script → fix → repeat),
-reporting back when done rather than confirming each step. This is a materially different thing
-from the chat/file-edit pieces above — a stateful loop that both writes files *and* executes
-code it chose to run, unattended, for potentially many iterations. Decided before building it:
+**Project-folder agent (2026-11-08) [x]** — "Xenon: Improve Files in This Folder…" in the Command
+Palette. You give it a goal in English and a list of Python files in the open folder. It edits one
+file per turn, runs the tests (`python -m pytest` for `test_*.py`/`*_test.py`, plain `python`
+otherwise), feeds failures back into its next turn, and stops when the tests pass, when it says
+`DONE:`, or when it hits its budget. The report opens beside the editor: what it did and why,
+before/after for each file, test output, and an **Undo all of this** button. New
+`app/src-tauri/src/folder_agent.rs` and `vscode-xenon/src/folderAgent.ts`.
 
-- *Needs a real sandbox boundary, not an honor system.* The executed Python must not be able to
-  touch anything outside the folder the user pointed at. A plain `Command::new("python")` from
-  Rust has no such boundary on its own.
-- *Needs an automatic rollback point.* Before the loop touches anything, snapshot the folder
-  (a git stash or a throwaway branch) so "the autonomous batch went wrong" is a one-command
-  revert, not a manual diff-by-diff cleanup.
-- *Needs a hard budget.* Max edits, max test/script runs, max wall-clock time per folder-agent
-  run, so a bad fix-retry cycle can't run unbounded or touch many files before anyone sees it.
-- *Needs a real report, not a log dump.* Per-file diffs, the test output before and after each
-  change, and a short why-per-change, surfaced in VS Code when the run ends (or stops early on
-  budget).
-
-None of this is in `code_api.rs` or `vscode-xenon/` yet. It is a new module, not an extension of
-the single-question coding API — the API answers one prompt and returns; this is a loop that
-owns a working directory for a while. Left unbuilt deliberately rather than shipped half-sandboxed
-during unattended work; the four points above are the actual design, to build next with review
-rather than rushed.
+- *Containment:* every path is resolved and must stay inside the folder (no `../` escape), and
+  only files on the given list can be edited. Python runs with its working directory set to the
+  folder. This is not an OS sandbox (a script could still open an absolute path), so the git
+  rollback point is the real safety net.
+- *Rollback:* if the folder's git tree is clean, a `xenon-agent: snapshot before run` commit is
+  made first, and Undo resets to it. A tree with uncommitted changes gets no snapshot, so Undo can
+  never throw away the user's own unsaved work. Undo is then hidden.
+- *Budget:* 5 edits, 3 test runs, 10 minutes.
+- *Background job, not one long request:* `POST /v1/folder-agent` returns a run id right away
+  (202). `GET /v1/folder-agent/<id>` returns progress and the final report.
+  `POST /v1/folder-agent/<id>/cancel` stops the run before its next step. Only one run at a time
+  (409 otherwise). The first version held one HTTP request open for minutes. Clients timed out
+  and lost the report while the run kept the model busy.
+- *GPU care:* this laptop's 2060 is shared with another project and with games. Before each model
+  turn the agent checks `nvidia-smi` and, at 80°C or above, waits until the GPU is at 72°C or
+  below (up to 5 minutes). Generation stops as soon as the `WHY:`/`DONE:` line ends. The model
+  used to run on into an invented next turn, which wasted GPU time. A run also stops once the
+  tests pass, and treats an "edit" that leaves the file unchanged as done. Sharing with the other
+  project goes through a lease file outside the repo (`~/.gpu/LEASE.txt`).
+- *Measured (G1l 2.9B, RTX 2060):* the demo's buggy `add` was fixed in one edit and the test
+  passed. The run took 21 s, with a peak of 73°C. Before the fixes, the same run used its whole
+  3-run budget on no-op edits and reached 82°C. The app uses ~2.9 GB of VRAM resident and
+  ~4.8 GB at peak while generating.
+- Tests: 43 Rust (containment, snapshot/undo, dirty-tree skip, budget, reply parsing, stopping
+  generation early, unknown runs), 10 Node (including the start → poll → report client).
 
 ## Future work (not yet scheduled)
 

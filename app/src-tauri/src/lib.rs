@@ -2,6 +2,7 @@ mod code_api;
 mod example_bank;
 mod feedback;
 mod ffi;
+mod folder_agent;
 mod inference;
 mod memory;
 mod persistence;

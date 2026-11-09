@@ -25,6 +25,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::example_bank;
 use crate::feedback::{self, FeedbackEntry, FeedbackTurn};
+use crate::folder_agent;
 use crate::inference::{self, EngineState, Finish, SamplingParams};
 
 pub const DEFAULT_PORT: u16 = 47811;
@@ -264,6 +265,57 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                 Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
             }
         }
+        ("POST", "/v1/folder-agent") => {
+            let parsed = serde_json::from_slice::<FolderAgentRequest>(&request.body)
+                .map_err(|e| format!("invalid request JSON: {e}"));
+            match parsed {
+                Ok(req) => {
+                    let id = format!("run-{}", &new_token()[..16]);
+                    let started = folder_agent::start_job(
+                        engine.clone(),
+                        model_name.to_string(),
+                        std::path::PathBuf::from(&req.folder),
+                        req.goal,
+                        req.files,
+                        id.clone(),
+                    );
+                    match started {
+                        Ok(()) => write_json(&mut stream, "202 Accepted", &json!({ "id": id })).map_err(io),
+                        Err(e) => write_json(&mut stream, "409 Conflict", &error_body(&e)).map_err(io),
+                    }
+                }
+                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
+            }
+        }
+        ("GET", path) if path.starts_with("/v1/folder-agent/") => {
+            let id = path.trim_start_matches("/v1/folder-agent/");
+            match folder_agent::job_status(id) {
+                Some(status) => write_json(&mut stream, "200 OK", &json!(status)).map_err(io),
+                None => write_json(&mut stream, "404 Not Found", &error_body("no such run")).map_err(io),
+            }
+        }
+        ("POST", path) if path.starts_with("/v1/folder-agent/") && path.ends_with("/cancel") => {
+            let id = path.trim_start_matches("/v1/folder-agent/").trim_end_matches("/cancel");
+            if folder_agent::cancel_job(id) {
+                write_json(&mut stream, "200 OK", &json!({ "ok": true })).map_err(io)
+            } else {
+                write_json(&mut stream, "404 Not Found", &error_body("no such run")).map_err(io)
+            }
+        }
+        ("POST", "/v1/folder-agent/undo") => {
+            let parsed = serde_json::from_slice::<FolderAgentUndoRequest>(&request.body)
+                .map_err(|e| format!("invalid request JSON: {e}"));
+            match parsed {
+                Ok(req) => {
+                    let root = std::path::PathBuf::from(&req.folder);
+                    match folder_agent::undo(&root, &req.snapshot_commit) {
+                        Ok(()) => write_json(&mut stream, "200 OK", &json!({ "ok": true })).map_err(io),
+                        Err(e) => write_json(&mut stream, "500 Internal Server Error", &error_body(&e)).map_err(io),
+                    }
+                }
+                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
+            }
+        }
         ("POST", "/v1/feedback") => {
             let parsed = serde_json::from_slice::<FeedbackRequest>(&request.body)
                 .map_err(|e| format!("invalid request JSON: {e}"));
@@ -397,6 +449,22 @@ fn splice_examples(prior: &str, examples: &[example_bank::Example], style: Style
         out.push_str(&format!("User: {}\n\n{}: {}\n\n", example.question, style.label, example.answer));
     }
     out
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FolderAgentRequest {
+    /// Absolute path to the folder the agent may read, write, and run code in.
+    pub folder: String,
+    /// The English goal for this run, e.g. "add type hints and fix any failing tests".
+    pub goal: String,
+    /// Paths, relative to `folder`, the agent may read and edit. Nothing outside this list.
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FolderAgentUndoRequest {
+    pub folder: String,
+    pub snapshot_commit: String,
 }
 
 #[derive(Debug, Deserialize)]

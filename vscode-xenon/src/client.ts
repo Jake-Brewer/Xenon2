@@ -102,6 +102,88 @@ export async function sendFeedback(
   }
 }
 
+export interface FileChange {
+  path: string;
+  before: string;
+  after: string;
+}
+
+export interface RunStep {
+  command: string;
+  stdout: string;
+  stderr: string;
+  exit_code: number | null;
+}
+
+export interface FolderAgentReport {
+  stopped_reason: string;
+  edits: FileChange[];
+  runs: RunStep[];
+  narration: string[];
+  snapshot_commit: string | null;
+}
+
+interface JobStatus {
+  state: "running" | "done" | "failed";
+  narration: string[];
+  report: FolderAgentReport | null;
+  error: string | null;
+}
+
+async function call(connection: Connection, method: string, route: string, body?: unknown): Promise<unknown> {
+  const response = await fetch(`${connection.url}${route}`, {
+    method,
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${connection.token}` },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Xenon2 answered ${response.status}: ${detail}`);
+  }
+  return response.json();
+}
+
+/** Runs the autonomous folder agent (see `folder_agent.rs`): edits and runs Python inside
+ * `folder` toward `goal`, stopping on its own budget. A run takes minutes, so the server runs it
+ * as a background job and this polls it, passing each new narration line to `onStep`. Aborting
+ * `signal` asks the server to stop the run before its next step. */
+export async function runFolderAgent(
+  connection: Connection,
+  request: { folder: string; goal: string; files: string[] },
+  onStep: (line: string) => void,
+  signal?: AbortSignal,
+  pollMs = 2000,
+): Promise<FolderAgentReport> {
+  const { id } = (await call(connection, "POST", "/v1/folder-agent", request)) as { id: string };
+  let cancelSent = false;
+  let seen = 0;
+  for (;;) {
+    if (signal?.aborted && !cancelSent) {
+      cancelSent = true;
+      await call(connection, "POST", `/v1/folder-agent/${id}/cancel`);
+    }
+    const status = (await call(connection, "GET", `/v1/folder-agent/${id}`)) as JobStatus;
+    for (const line of status.narration.slice(seen)) onStep(line);
+    seen = status.narration.length;
+    if (status.state === "failed") throw new Error(status.error ?? "The folder agent failed.");
+    if (status.state === "done" && status.report) return status.report;
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+}
+
+/** Reverts a folder to the snapshot a prior `runFolderAgent` call took before its first edit. */
+export async function undoFolderAgent(connection: Connection, folder: string, snapshotCommit: string): Promise<void> {
+  const response = await fetch(`${connection.url}/v1/folder-agent/undo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${connection.token}` },
+    body: JSON.stringify({ folder, snapshot_commit: snapshotCommit }),
+  });
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "");
+    throw new Error(`Xenon2 answered ${response.status}: ${detail}`);
+  }
+}
+
 export async function health(connection: Connection, signal?: AbortSignal): Promise<{ model: string }> {
   const response = await fetch(`${connection.url}/health`, { signal });
   if (!response.ok) throw new Error(`Xenon2 answered ${response.status}`);
