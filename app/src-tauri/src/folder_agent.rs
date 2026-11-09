@@ -80,22 +80,6 @@ fn excerpt(reply: &str) -> String {
     }
 }
 
-/// True once a reply has its closing `WHY:`/`DONE:` line, so generation can stop there instead
-/// of running on into a made-up next turn (which only costs GPU time and heat).
-///
-/// A `WHY:` line only ends the reply once an edit is complete: Xenon sometimes gives its reason
-/// first and the edit after.
-fn reply_complete(text: &str) -> bool {
-    let line_done = |tag: &str| {
-        text.rfind(tag).is_some_and(|i| {
-            let rest = &text[i..];
-            rest.contains('\n') || rest.contains("User:")
-        })
-    };
-    let has_edit = text.contains(">>>>>>> REPLACE") || extract_code_block(text).is_some();
-    (has_edit && line_done("WHY:")) || (!has_edit && !text.contains("<<<<<<<") && line_done("DONE:"))
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,
@@ -646,15 +630,12 @@ pub fn run(
         }
 
         // The goal comes before the files and again after them: a recurrent model reads once, so
-        // it should know what it's looking for while it reads (see CODING_STRATEGIES.md). No
-        // example edit: Xenon copied the example's lines instead of the file's.
+        // it should know what it's looking for while it reads (see CODING_STRATEGIES.md). The
+        // edit's shape is set by how its reply is started (below), so it isn't described here.
         let question = format!(
             "Goal: {goal}\n\n{listing}{last_failure}Goal: {goal}\n\
-             Reply with a line `FILE: <path>` naming the one file above to change. Then edit blocks: \
-             a line `<<<<<<< SEARCH`, a few whole lines copied exactly from that file, a line \
-             `=======`, those lines as they should be, and a line `>>>>>>> REPLACE`. Then a line \
-             `WHY:` with a one-sentence reason. If nothing needs to change, reply `FILE: none` \
-             and then `DONE: <one-sentence reason>`."
+             Reply with a line `FILE: <path>` naming the one file above to change. If nothing needs \
+             to change, reply `FILE: none` and then `DONE: <one-sentence reason>`."
         );
         let deadline = budget.started + Duration::from_secs(MAX_SECONDS);
 
@@ -676,59 +657,49 @@ pub fn run(
             break;
         };
         let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
-        // Xenon recalls lines it read far back poorly (it rewrote a long line wrong five times in
-        // a row) but copies and edits them exactly when they come right before its reply. So the
-        // reply starts by quoting the lines most likely to change: those around the best match
-        // for the goal, or for the SEARCH line that just missed. Not fenced, so the whole-file
-        // fallback can never mistake them for a new file.
-        let near = edit_blocks::window_of(&current, if last_missed.is_empty() { goal } else { &last_missed }, 4, 8)
-            .map(|lines| format!("The lines of it that matter:\n{lines}\n"))
-            .unwrap_or_default();
-        let reply = ask(
-            engine,
-            model_name,
-            &question,
-            &format!("FILE: {relative_path}\n{near}<<<<<<< SEARCH\n"),
-            &reply_complete,
-            deadline,
-            cancel,
-        )?;
-        last_missed.clear();
-        // Edit blocks, or failing those a whole new file in a code block.
-        let blocks = edit_blocks::parse(&reply);
-        if !blocks.is_empty() && blocks.iter().all(|b| b.search.trim() == b.replace.trim()) {
-            // Small models often copy SEARCH into REPLACE while saying they changed it.
+        // Xenon recalls lines it read far back poorly, and given SEARCH/REPLACE it either
+        // misremembered a long line (five times in a row) or, shown the lines first, copied them
+        // into both halves. What it does well is rewrite lines shown just before its reply. So
+        // the agent picks the lines (around the best match for the goal, or for what the last
+        // try got wrong), quotes them at the start of the reply, and Xenon writes their new
+        // version. Swapping them in reuses the edit-block code, with the quoted lines as SEARCH.
+        let query = if last_missed.is_empty() { goal.to_string() } else { std::mem::take(&mut last_missed) };
+        let Some(lines) = edit_blocks::window_of(&current, &query, 4, 8) else {
+            report.stopped_reason = format!("couldn't find where in {relative_path} the goal applies");
+            break;
+        };
+        let lang = fence(&relative_path);
+        let start = format!("FILE: {relative_path}\nThese lines of it:\n```{lang}\n{lines}\n```\nwith the goal done, become:\n```{lang}\n");
+        let start_len = start.len();
+        let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
+        let reply = ask(engine, model_name, &question, &start, &closed, deadline, cancel)?;
+        let Some(written) = reply.get(start_len..).and_then(|rest| rest.split("```").next()) else {
+            report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
+            report.stopped_reason = "the model's reply had no new lines".to_string();
+            break;
+        };
+        let written = written.trim_end_matches(['\n', '\r']).to_string();
+        if written.trim() == lines.trim() {
+            // Small models often copy the lines back unchanged while meaning to change them.
             budget.edits += 1;
             report.narration.push(format!("Xenon's edit to {relative_path} changed nothing; asking again"));
             last_failure = format!(
-                "In your last reply the lines after `=======` were the same as the SEARCH lines, so nothing \
-                 changed. This time, after `=======`, write the lines as they should be after the fix.\n\n"
+                "Your last edit to `{relative_path}` wrote these lines back unchanged:\n```{lang}\n{lines}\n```\n\
+                 This time, change them so the goal is done.\n\n"
             );
             continue;
         }
-        let code = if !blocks.is_empty() {
-            match edit_blocks::apply_all(&current, &blocks) {
-                Ok(code) => code,
-                Err(e) => {
-                    // A failed edit still costs one from the budget, so a model that keeps
-                    // missing can't loop forever; the reason goes back to it.
-                    budget.edits += 1;
-                    report.narration.push(format!("An edit to {relative_path} didn't apply: {e}"));
-                    last_failure = format!("Your last edit to `{relative_path}` didn't apply: {e}\n\n");
-                    last_missed = blocks.iter().find_map(|b| b.search.lines().find(|l| !l.trim().is_empty())).unwrap_or("").to_string();
-                    continue;
-                }
+        let block = edit_blocks::Block { search: lines.clone(), replace: written };
+        let code = match edit_blocks::apply(&current, &block) {
+            Ok(code) => code,
+            Err(e) => {
+                report.stopped_reason = format!("couldn't put the new lines into {relative_path}: {e}");
+                break;
             }
-        } else if let Some(code) = extract_code_block(&reply) {
-            code
-        } else {
-            report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
-            report.stopped_reason = "the model's reply had no edit blocks or code block".to_string();
-            break;
         };
-        let why = reason_after(&reply, "WHY:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
+        let why = format!("rewrote the lines starting `{}`", lines.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim());
         if code.trim() == current.trim() {
-            report.narration.push(format!("Stopped: Xenon proposed {relative_path} unchanged ({why})"));
+            report.narration.push(format!("Stopped: Xenon proposed {relative_path} unchanged"));
             report.stopped_reason = "finished".to_string();
             break;
         }
@@ -816,15 +787,6 @@ pub fn run(
     }
 
     Ok(report)
-}
-
-fn extract_code_block(text: &str) -> Option<String> {
-    let start = text.find("```")?;
-    let after_fence = &text[start + 3..];
-    let body_start = after_fence.find('\n').map(|i| i + 1).unwrap_or(0);
-    let body = &after_fence[body_start..];
-    let end = body.find("```")?;
-    Some(body[..end].trim_end().to_string())
 }
 
 #[cfg(test)]
@@ -915,30 +877,11 @@ mod tests {
     }
 
     #[test]
-    fn extract_code_block_reads_the_first_fenced_block() {
-        let reply = "FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it\n";
-        assert_eq!(extract_code_block(reply), Some("x = 2".to_string()));
-    }
-
-    #[test]
-    fn extract_code_block_is_none_without_a_fence() {
-        assert_eq!(extract_code_block("no code here"), None);
-    }
-
-    #[test]
     fn reasons_stop_where_the_model_runs_on() {
         let reply = "FILE: a.py\n```python\nx = 2\n```\nWHY: fixed the sign.User: You are a senior engineer";
         assert_eq!(reason_after(reply, "WHY:").as_deref(), Some("fixed the sign."));
         assert_eq!(reason_after("DONE: nothing to do\nUser: more", "DONE:").as_deref(), Some("nothing to do"));
         assert_eq!(reason_after("no tag here", "WHY:"), None);
-    }
-
-    #[test]
-    fn generation_stops_once_the_reason_line_ends() {
-        assert!(!reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed"));
-        assert!(reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it.\n"));
-        assert!(reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it.User:"));
-        assert!(reply_complete("DONE: already passes\n"));
     }
 
     #[test]
@@ -956,15 +899,6 @@ mod tests {
         let after = "a\nb\nc\nD\ne\nf\n";
         assert_eq!(short_diff(before, after), " b\n c\n-d\n+D\n e\n f");
         assert_eq!(short_diff("x\n", "x\ny\n"), " x\n+y");
-    }
-
-    #[test]
-    fn a_reason_before_the_edit_does_not_end_the_reply() {
-        let reason_first = "FILE: a.py\nWHY: x should be 2.\n";
-        assert!(!reply_complete(reason_first));
-        assert!(!reply_complete(&format!("{reason_first}<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n")));
-        let done = format!("{reason_first}<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n");
-        assert!(reply_complete(&done));
     }
 
     #[test]

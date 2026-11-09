@@ -1,63 +1,20 @@
-//! SEARCH/REPLACE edit blocks: the model writes only what changes, not the whole file.
+//! Replaces a stretch of lines in a file: the model writes only what changes, not the whole file.
 //!
 //! At ~23 tokens/s a 300-line rewrite takes about two minutes and risks dropping code the model
-//! didn't mean to touch; an edit block takes seconds. The format is aider's, which models have
-//! seen a lot of:
-//!
-//! ```text
-//! <<<<<<< SEARCH
-//! lines as they are now
-//! =======
-//! lines as they should be
-//! >>>>>>> REPLACE
-//! ```
+//! didn't mean to touch; rewriting a dozen lines takes seconds. The folder agent quotes the lines
+//! to change (found with `window_of`) and Xenon writes their new version. This started as aider's
+//! SEARCH/REPLACE blocks, but Xenon couldn't fill in both halves (see `folder_agent.rs`).
 //!
 //! Applying is lenient, as aider found it must be (strict matching gave 9x more failed edits): an
 //! exact match first, then one that ignores indentation and trailing spaces, with the new lines
-//! re-indented to fit. A block must match exactly one place, so an edit never lands somewhere the
-//! model didn't mean.
+//! re-indented to fit, then one that forgives a line copied without its start. A block must match
+//! exactly one place, so an edit never lands somewhere the model didn't mean.
 
+/// Lines as they are now (`search`) and as they should be (`replace`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Block {
     pub search: String,
     pub replace: String,
-}
-
-const SEARCH: &str = "<<<<<<< SEARCH";
-const DIVIDER: &str = "=======";
-const REPLACE: &str = ">>>>>>> REPLACE";
-
-/// Every complete block in `text`, in order. An unfinished block at the end (a reply cut short)
-/// is left out.
-pub fn parse(text: &str) -> Vec<Block> {
-    let mut blocks = Vec::new();
-    let mut lines = text.lines();
-    while let Some(line) = lines.next() {
-        if !line.trim_end().ends_with(SEARCH) {
-            continue;
-        }
-        let mut search = Vec::new();
-        let mut replace = Vec::new();
-        let mut in_replace = false;
-        let mut closed = false;
-        for line in lines.by_ref() {
-            let marker = line.trim();
-            if !in_replace && marker == DIVIDER {
-                in_replace = true;
-            } else if in_replace && marker.starts_with(REPLACE) {
-                closed = true;
-                break;
-            } else if in_replace {
-                replace.push(line);
-            } else {
-                search.push(line);
-            }
-        }
-        if closed {
-            blocks.push(Block { search: search.join("\n"), replace: replace.join("\n") });
-        }
-    }
-    blocks
 }
 
 fn indent_of(line: &str) -> &str {
@@ -202,15 +159,6 @@ pub fn apply(text: &str, block: &Block) -> Result<String, String> {
     Ok(joined)
 }
 
-/// Applies every block in order. All or nothing: if one fails, the text is unchanged.
-pub fn apply_all(text: &str, blocks: &[Block]) -> Result<String, String> {
-    let mut out = text.to_string();
-    for (i, block) in blocks.iter().enumerate() {
-        out = apply(&out, block).map_err(|e| format!("edit {} of {}: {e}", i + 1, blocks.len()))?;
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,12 +167,6 @@ mod tests {
 
     fn block(search: &str, replace: &str) -> Block {
         Block { search: search.into(), replace: replace.into() }
-    }
-
-    #[test]
-    fn parses_blocks_and_skips_an_unfinished_one() {
-        let reply = "FILE: a.rs\n<<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 2;\n>>>>>>> REPLACE\nWHY: two\n<<<<<<< SEARCH\ncut";
-        assert_eq!(parse(reply), vec![block("    let x = 1;", "    let x = 2;")]);
     }
 
     #[test]
@@ -277,9 +219,4 @@ mod tests {
         assert_eq!(out, "fn main() {\n    println!(\"{x}\");\n}\n");
     }
 
-    #[test]
-    fn all_or_nothing() {
-        let blocks = [block("    let x = 1;", "    let x = 2;"), block("nope", "")];
-        assert!(apply_all(FILE, &blocks).unwrap_err().starts_with("edit 2 of 2"));
-    }
 }
