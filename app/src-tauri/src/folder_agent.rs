@@ -82,13 +82,18 @@ fn excerpt(reply: &str) -> String {
 
 /// True once a reply has its closing `WHY:`/`DONE:` line, so generation can stop there instead
 /// of running on into a made-up next turn (which only costs GPU time and heat).
+///
+/// A `WHY:` line only ends the reply once an edit is complete: Xenon sometimes gives its reason
+/// first and the edit after.
 fn reply_complete(text: &str) -> bool {
-    ["WHY:", "DONE:"].iter().any(|tag| {
-        text.find(tag).is_some_and(|i| {
+    let line_done = |tag: &str| {
+        text.rfind(tag).is_some_and(|i| {
             let rest = &text[i..];
             rest.contains('\n') || rest.contains("User:")
         })
-    })
+    };
+    let has_edit = text.contains(">>>>>>> REPLACE") || extract_code_block(text).is_some();
+    (has_edit && line_done("WHY:")) || (!has_edit && !text.contains("<<<<<<<") && line_done("DONE:"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -815,8 +820,17 @@ mod tests {
     fn generation_stops_once_the_reason_line_ends() {
         assert!(!reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed"));
         assert!(reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it.\n"));
-        assert!(reply_complete("WHY: fixed it.User:"));
+        assert!(reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it.User:"));
         assert!(reply_complete("DONE: already passes\n"));
+    }
+
+    #[test]
+    fn a_reason_before_the_edit_does_not_end_the_reply() {
+        let reason_first = "FILE: a.py\nWHY: x should be 2.\n";
+        assert!(!reply_complete(reason_first));
+        assert!(!reply_complete(&format!("{reason_first}<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n")));
+        let done = format!("{reason_first}<<<<<<< SEARCH\nx = 1\n=======\nx = 2\n>>>>>>> REPLACE\n");
+        assert!(reply_complete(&done));
     }
 
     #[test]
