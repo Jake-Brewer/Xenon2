@@ -973,14 +973,22 @@ pub fn run(
         cancel,
     };
 
-    // Goals that need changes in several places (a rename and its callers, code and its test)
-    // are broken into steps first; one change keeps the one-edit loop.
+    // Try the goal as a single sequence of edits first. The one-edit retry loop is more robust
+    // than multi-step mode for a small model (which over-decomposes simple goals), so steps are a
+    // fallback, used only when one edit at a time can't finish (a rename whose callers break until
+    // a later edit, say). A run that finished, was cancelled, or hit the time limit is not retried.
+    run_one(&ctx, goal, &mut report, progress)?;
+    if report.stopped_reason.starts_with("finished")
+        || report.stopped_reason == "cancelled"
+        || ctx.cancel.load(Ordering::Relaxed)
+        || ctx.deadline <= Instant::now()
+    {
+        return Ok(report);
+    }
     let steps = plan(&ctx, goal, "")?;
     if steps.len() > 1 {
-        report.narration.push(format!("Broke the goal into {} steps: {}", steps.len(), steps.join(" / ")));
+        report.narration.push(format!("One edit at a time didn't finish; broke the goal into {} steps: {}", steps.len(), steps.join(" / ")));
         run_steps(&ctx, goal, steps, &mut report, progress)?;
-    } else {
-        run_one(&ctx, goal, &mut report, progress)?;
     }
     Ok(report)
 }
