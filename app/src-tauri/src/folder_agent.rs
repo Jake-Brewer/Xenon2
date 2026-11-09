@@ -70,6 +70,16 @@ fn reason_after(text: &str, tag: &str) -> Option<String> {
     Some(rest.chars().take(300).collect())
 }
 
+/// The start of a reply the loop couldn't use, for the report.
+fn excerpt(reply: &str) -> String {
+    let text: String = reply.trim().chars().take(400).collect();
+    if text.is_empty() {
+        "(nothing)".to_string()
+    } else {
+        format!("{text:?}")
+    }
+}
+
 /// True once a reply has its closing `WHY:`/`DONE:` line, so generation can stop there instead
 /// of running on into a made-up next turn (which only costs GPU time and heat).
 fn reply_complete(text: &str) -> bool {
@@ -585,10 +595,12 @@ pub fn run(
             }
         }
 
-        let Some(file_line) = reply.lines().find(|l| l.starts_with("FILE:")) else {
+        let Some(file_line) = reply.lines().find(|l| l.trim_start().starts_with("FILE:")) else {
+            report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
             report.stopped_reason = "the model's reply didn't name a file to edit".to_string();
             break;
         };
+        let file_line = file_line.trim_start();
         let written = file_line.trim_start_matches("FILE:").trim().trim_matches('`').to_string();
         let Some(relative_path) = snap_to_list(&written, files) else {
             report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
@@ -622,6 +634,7 @@ pub fn run(
         } else if let Some(code) = extract_code_block(&reply) {
             code
         } else {
+            report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
             report.stopped_reason = "the model's reply had no edit blocks or code block".to_string();
             break;
         };
