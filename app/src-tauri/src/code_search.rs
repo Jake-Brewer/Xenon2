@@ -91,18 +91,50 @@ fn is_word_at(line: &str, at: usize, len: usize) -> bool {
     edge(before) && edge(after)
 }
 
-/// True when `line` defines `name` (e.g. `pub fn name(`, `def name`, `const name =`).
+/// Words that may come before a definer at the start of a definition line.
+const MODIFIERS: &[&str] = &["pub", "pub(crate)", "pub(super)", "async", "export", "default", "unsafe", "extern", "static", "abstract"];
+
+/// True when `line` defines `name` (e.g. `pub fn name(`, `def name`, `export const name =`), and
+/// not merely mentions it, as in a string or a comment.
 fn defines(line: &str, name: &str) -> bool {
     let lower = line.to_lowercase();
     let mut from = 0;
     while let Some(found) = lower[from..].find(name) {
         let at = from + found;
-        if is_word_at(&lower, at, name.len()) && DEFINERS.iter().any(|d| lower[..at].ends_with(d)) {
-            return true;
+        if is_word_at(&lower, at, name.len()) {
+            for definer in DEFINERS {
+                if let Some(before) = lower[..at].strip_suffix(definer) {
+                    if before.split_whitespace().all(|w| MODIFIERS.contains(&w)) {
+                        return true;
+                    }
+                }
+            }
         }
         from = at + name.len();
     }
     false
+}
+
+/// The file in `root` that a model-written path most likely means. Small models shorten paths
+/// (`src/inference.rs` for `app/src-tauri/src/inference.rs`) or add a stray leading `/`: this
+/// keeps an exact match, else takes the one file whose path ends with the given one. `None` when
+/// no file matches, or several do.
+pub fn snap_path(root: &Path, written: &str) -> Option<String> {
+    let written = written.trim().trim_matches('`').replace('\\', "/");
+    let written = written.trim_start_matches("./").trim_start_matches('/');
+    if written.is_empty() {
+        return None;
+    }
+    if root.join(written).is_file() {
+        return Some(written.to_string());
+    }
+    let suffix = format!("/{}", written.to_lowercase());
+    let mut found = source_files(root)
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .filter(|rel| format!("/{}", rel.to_lowercase()).ends_with(&suffix));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
 }
 
 /// The best-matching lines of `root` for `question`, formatted for the prompt, or "" when nothing
@@ -228,6 +260,24 @@ mod tests {
         let found = search(dir.path(), "Which file defines `threads_for`?");
         let first = found.lines().nth(1).unwrap();
         assert_eq!(first, "src/engine.rs:1: fn threads_for(layers: u32) -> u32 {", "{found}");
+    }
+
+    #[test]
+    fn shortened_paths_snap_to_the_one_real_file() {
+        let dir = project();
+        assert_eq!(snap_path(dir.path(), "src/engine.rs").as_deref(), Some("src/engine.rs"));
+        assert_eq!(snap_path(dir.path(), "/engine.rs").as_deref(), Some("src/engine.rs"));
+        assert_eq!(snap_path(dir.path(), "`App.vue`").as_deref(), Some("ui/App.vue"));
+        assert_eq!(snap_path(dir.path(), "src/missing.rs"), None);
+        assert_eq!(snap_path(dir.path(), "ine.rs"), None, "a suffix must start at a folder boundary");
+    }
+
+    #[test]
+    fn a_definition_must_start_its_line() {
+        assert!(defines("pub(crate) async fn threads_for(x: u32) {", "threads_for"));
+        assert!(defines("export function threadsFor() {", "threadsfor"));
+        assert!(!defines("write(\"a.rs\", \"fn threads_for() {}\");", "threads_for"));
+        assert!(!defines("// see fn threads_for", "threads_for"));
     }
 
     #[test]

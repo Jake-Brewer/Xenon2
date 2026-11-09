@@ -13,6 +13,7 @@ so it stays put as the repo grows). Writes JSONL with {kind, question, answer, s
     python training/make_self_data.py                  # training/out/self_data.jsonl
     python training/make_self_data.py --score where    # ask the running app the held-out "where" items
     python training/make_self_data.py --score where --no-search   # same, without searching the repo
+    python training/make_self_data.py --sft training/out/self_sft.jsonl   # training text (needs the app)
 """
 
 import argparse
@@ -130,12 +131,31 @@ def score(kind, search):
         print(f"{right}/{len(items)} exact path, {right_file}/{len(items)} right file")
 
 
+def write_sft(path):
+    """Training text for RWKV-PEFT ({"text": ...} per line): each train item's prompt exactly as
+    the running app builds it (through /v1/prompt, with code search for "where" items), then the
+    reference answer."""
+    items = [json.loads(line) for line in OUT.read_text(encoding="utf-8").splitlines()]
+    items = [i for i in items if i["split"] == "train"]
+    with open(path, "w", encoding="utf-8", newline="\n") as out:
+        for item in items:
+            body = {"messages": [{"role": "user", "content": item["question"]}]}
+            if item["kind"] == "where":
+                body["workspace"] = str(ROOT)
+            prompt = post("/v1/prompt", body)
+            out.write(json.dumps({"text": prompt["prior"] + prompt["last"] + " " + item["answer"].strip() + "\n\n"}) + "\n")
+    print(f"Wrote {len(items)} training texts to {path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--score", choices=["where", "commit", "file"], help="ask the running app the held-out items")
     parser.add_argument("--no-search", action="store_true", help="don't let the app search the repo (baseline)")
+    parser.add_argument("--sft", metavar="PATH", help="write the train items as RWKV-PEFT training text")
     args = parser.parse_args()
-    if args.score:
+    if args.sft:
+        write_sft(args.sft)
+    elif args.score:
         score(args.score, not args.no_search)
     else:
         build()

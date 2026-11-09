@@ -360,6 +360,20 @@ fn run_check(root: &Path, check: &Check, deadline: Instant, cancel: &AtomicBool)
     })
 }
 
+/// The file in `files` that a model-written name means: an exact match, else the one entry ending
+/// in it at a folder boundary (small models shorten paths, e.g. `src/x.rs` for `app/src/x.rs`).
+fn snap_to_list(written: &str, files: &[String]) -> Option<String> {
+    let written = written.replace('\\', "/");
+    let written = written.trim_start_matches("./").trim_start_matches('/');
+    if let Some(exact) = files.iter().find(|f| f.as_str() == written) {
+        return Some(exact.clone());
+    }
+    let suffix = format!("/{written}");
+    let mut found = files.iter().filter(|f| format!("/{f}").ends_with(&suffix));
+    let first = found.next()?;
+    found.next().is_none().then(|| first.clone())
+}
+
 /// The language name for a file's code fence.
 fn fence(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -503,6 +517,12 @@ pub fn run(
     let mut budget = Budget::new();
     let mut last_failure = String::new();
 
+    // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
+    let files: Vec<String> = files
+        .iter()
+        .map(|f| crate::code_search::snap_path(root, f).unwrap_or_else(|| f.clone()))
+        .collect();
+    let files = files.as_slice();
     let mut listing = String::new();
     for file in files {
         let path = match contained(root, &root.join(file)) {
@@ -553,11 +573,11 @@ pub fn run(
             report.stopped_reason = "the model's reply didn't name a file to edit".to_string();
             break;
         };
-        let relative_path = file_line.trim_start_matches("FILE:").trim().to_string();
-        if !files.contains(&relative_path) {
-            report.stopped_reason = format!("the model named {relative_path}, which wasn't in the given file list");
+        let written = file_line.trim_start_matches("FILE:").trim().trim_matches('`').to_string();
+        let Some(relative_path) = snap_to_list(&written, files) else {
+            report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
             break;
-        }
+        };
         let Some(code) = extract_code_block(&reply) else {
             report.stopped_reason = "the model's reply had no code block".to_string();
             break;
@@ -794,6 +814,16 @@ mod tests {
         assert_ne!(step.exit_code, Some(0));
         assert!(step.stderr.contains("no-such-command"), "{}", step.stderr);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_shortened_file_name_snaps_to_the_list() {
+        let files = vec!["app/src/x.rs".to_string(), "lib/y.py".to_string(), "a/y.py".to_string()];
+        assert_eq!(snap_to_list("app/src/x.rs", &files).as_deref(), Some("app/src/x.rs"));
+        assert_eq!(snap_to_list("src/x.rs", &files).as_deref(), Some("app/src/x.rs"));
+        assert_eq!(snap_to_list("/x.rs", &files).as_deref(), Some("app/src/x.rs"));
+        assert_eq!(snap_to_list("y.py", &files), None, "two files end in y.py");
+        assert_eq!(snap_to_list("z.rs", &files), None);
     }
 
     #[test]

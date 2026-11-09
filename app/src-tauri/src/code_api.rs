@@ -251,19 +251,8 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                 .and_then(|r| build_prompt(&r, Style::for_model(model_name)).map(|p| (r, p)));
             match parsed {
                 Ok((chat, mut prompt)) => {
-                    let last_question = chat
-                        .messages
-                        .last()
-                        .map(|m| message_text(&m.content))
-                        .unwrap_or_default();
-                    if let Some(root) = chat.workspace.as_deref().map(std::path::Path::new).filter(|p| p.is_dir()) {
-                        let started = std::time::Instant::now();
-                        let found = crate::code_search::search(root, &last_question);
-                        eprintln!("xenon2: code search took {} ms, found {} chars", started.elapsed().as_millis(), found.len());
-                        if !found.is_empty() {
-                            prompt.last = with_found_lines(&prompt.last, &found);
-                        }
-                    }
+                    let last_question = last_question(&chat);
+                    add_search(&chat, &mut prompt);
                     let examples = example_bank::examples_for(app, &last_question, AGENT);
                     if !examples.is_empty() {
                         eprintln!("xenon2: code API using {} rated example(s) in this prompt", examples.len());
@@ -271,6 +260,33 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                     }
                     chat_completion(&mut stream, app, engine, &chat, &prompt)
                 }
+                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
+            }
+        }
+        // The prompt a chat request would get, without generating (and without rated examples,
+        // which change as ratings come in). Training data is built through this, so it always
+        // matches what the model sees in use.
+        ("POST", "/v1/prompt") => {
+            let parsed = serde_json::from_slice::<ChatRequest>(&request.body)
+                .map_err(|e| format!("invalid request JSON: {e}"))
+                .and_then(|r| build_prompt(&r, Style::for_model(model_name)).map(|p| (r, p)));
+            match parsed {
+                Ok((chat, mut prompt)) => {
+                    add_search(&chat, &mut prompt);
+                    write_json(&mut stream, "200 OK", &json!({ "prior": prompt.prior, "last": prompt.last })).map_err(io)
+                }
+                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
+            }
+        }
+        // Code search as a tool: the lines of `workspace` that best match `query`.
+        ("POST", "/v1/search") => {
+            let parsed = serde_json::from_slice::<SearchRequest>(&request.body).map_err(|e| format!("invalid request JSON: {e}"));
+            match parsed {
+                Ok(req) if std::path::Path::new(&req.workspace).is_dir() => {
+                    let found = crate::code_search::search(std::path::Path::new(&req.workspace), &req.query);
+                    write_json(&mut stream, "200 OK", &json!({ "lines": found })).map_err(io)
+                }
+                Ok(req) => write_json(&mut stream, "400 Bad Request", &error_body(&format!("{} is not a folder", req.workspace))).map_err(io),
                 Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
             }
         }
@@ -451,13 +467,15 @@ Xenon: ", &format!("
     Ok(Prompt { prior, last: format!("User: {question}\n\n{}:{}", style.label, style.opener), params })
 }
 
-/// Puts search results inside the new user turn, ahead of the question, so the model reads them
-/// as part of what was asked. Like rated examples, they stay out of the cached `prior`.
+/// Puts search results inside the new user turn as question, results, question again. A recurrent
+/// model reads once, front to back, so it should know what to look for before the results, and
+/// asking again after them helps recall (+11 points on average across 16 recurrent models, RWKV
+/// among them: "Just Read Twice", arXiv 2407.05483). Like rated examples, they stay out of the
+/// cached `prior`.
 fn with_found_lines(last: &str, found: &str) -> String {
-    match last.strip_prefix("User: ") {
-        Some(rest) => format!("User: {}\n{rest}", clean(found)),
-        None => last.to_string(),
-    }
+    let Some(rest) = last.strip_prefix("User: ") else { return last.to_string() };
+    let Some((question, reply_start)) = rest.split_once("\n\n") else { return last.to_string() };
+    format!("User: {question}\n{}\n{question}\n\n{reply_start}", clean(found))
 }
 
 /// Appends rated examples to `text` as "User: ... / <label>: ..." turns, the same shape as the
@@ -480,6 +498,28 @@ pub struct FolderAgentRequest {
     pub goal: String,
     /// Paths, relative to `folder`, the agent may read and edit. Nothing outside this list.
     pub files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SearchRequest {
+    pub workspace: String,
+    pub query: String,
+}
+
+fn last_question(chat: &ChatRequest) -> String {
+    chat.messages.last().map(|m| message_text(&m.content)).unwrap_or_default()
+}
+
+/// When the request names a workspace folder, puts the lines of it that best match the question
+/// in front of the question.
+fn add_search(chat: &ChatRequest, prompt: &mut Prompt) {
+    let Some(root) = chat.workspace.as_deref().map(std::path::Path::new).filter(|p| p.is_dir()) else { return };
+    let started = std::time::Instant::now();
+    let found = crate::code_search::search(root, &last_question(chat));
+    eprintln!("xenon2: code search took {} ms, found {} chars", started.elapsed().as_millis(), found.len());
+    if !found.is_empty() {
+        prompt.last = with_found_lines(&prompt.last, &found);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -621,6 +661,15 @@ mod tests {
 
     fn request(messages: Value) -> ChatRequest {
         serde_json::from_value(json!({ "messages": messages })).unwrap()
+    }
+
+    #[test]
+    fn found_lines_sit_between_two_copies_of_the_question() {
+        let last = "User: where is x?\n\nAssistant: <think></think>";
+        assert_eq!(
+            with_found_lines(last, "a.rs:1: fn x() {}\n"),
+            "User: where is x?\na.rs:1: fn x() {}\nwhere is x?\n\nAssistant: <think></think>"
+        );
     }
 
     #[test]
