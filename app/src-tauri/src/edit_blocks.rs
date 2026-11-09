@@ -82,6 +82,26 @@ fn find_unique(lines: &[&str], search: &[&str], same: impl Fn(&str, &str) -> boo
     found
 }
 
+/// The few lines of the file that share the most words with `wanted`, to show the model what is
+/// really there when its SEARCH lines miss.
+fn closest_lines(lines: &[&str], wanted: &str) -> Option<String> {
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        s.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| w.len() > 1).map(str::to_lowercase).collect()
+    };
+    let wanted = words(wanted);
+    let (best, shared) = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (i, words(l).intersection(&wanted).count()))
+        .max_by_key(|&(i, n)| (n, std::cmp::Reverse(i)))?;
+    if shared == 0 {
+        return None;
+    }
+    let from = best.saturating_sub(1);
+    let to = (best + 3).min(lines.len());
+    Some(lines[from..to].join("\n"))
+}
+
 /// Applies `block` to `text`, or says why it couldn't.
 pub fn apply(text: &str, block: &Block) -> Result<String, String> {
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
@@ -101,28 +121,67 @@ pub fn apply(text: &str, block: &Block) -> Result<String, String> {
     }
     let replace: Vec<&str> = block.replace.lines().collect();
 
-    let (start, reindent) = if let Some(start) = find_unique(&lines, search, |a, b| a.trim_end() == b.trim_end()) {
-        (start, None)
+    // A line the model copied without its start, e.g. `const X = ...` for `export const X = ...`.
+    // Each missing start must leave at least half the line, so short fragments don't match.
+    let clipped = |a: &str, b: &str| {
+        let (a, b) = (a.trim(), b.trim());
+        !b.is_empty() && a.ends_with(b) && b.len() * 2 >= a.len()
+    };
+    let (start, reindent, exact_lines) = if let Some(start) = find_unique(&lines, search, |a, b| a.trim_end() == b.trim_end()) {
+        (start, false, true)
     } else if let Some(start) = find_unique(&lines, search, |a, b| a.trim() == b.trim()) {
-        // Matched ignoring indentation: shift the new lines by the difference on the first line.
-        (start, Some((indent_of(search[0]).to_string(), indent_of(lines[start]).to_string())))
+        (start, true, true)
+    } else if let Some(start) = find_unique(&lines, search, clipped) {
+        (start, true, false)
     } else {
         let first_line = search[0].trim();
         let count = lines.iter().filter(|l| l.trim() == first_line).count();
         return Err(if count > 1 {
             format!("the SEARCH lines starting `{first_line}` match {count} places; include more lines so they match one")
         } else {
-            format!("the SEARCH lines starting `{first_line}` aren't in the file; copy them exactly from it")
+            let mut message = format!("the SEARCH lines starting `{first_line}` aren't in the file; copy them exactly from it");
+            if let Some(near) = closest_lines(&lines, first_line) {
+                message.push_str(&format!(". The closest lines in the file are:\n{near}"));
+            }
+            message
         });
+    };
+    // Matched ignoring indentation: shift the new lines by the difference on the first line.
+    let (from, to) = (indent_of(search[0]).to_string(), indent_of(lines[start]).to_string());
+    // What the model left off each matched line, to put back on the line that replaces it.
+    let missing: Vec<&str> = if exact_lines {
+        Vec::new()
+    } else {
+        search
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let real = lines[start + i].trim();
+                &real[..real.len() - s.trim().len()]
+            })
+            .collect()
     };
 
     let mut out: Vec<String> = lines[..start].iter().map(|l| l.to_string()).collect();
-    for line in &replace {
-        let line = match &reindent {
-            Some(_) if line.trim().is_empty() => String::new(),
-            Some((from, to)) if line.starts_with(from.as_str()) => format!("{to}{}", &line[from.len()..]),
-            _ => line.to_string(),
+    for (i, line) in replace.iter().enumerate() {
+        let mut line = if !reindent {
+            line.to_string()
+        } else if line.trim().is_empty() {
+            String::new()
+        } else if let Some(rest) = line.strip_prefix(from.as_str()) {
+            format!("{to}{rest}")
+        } else {
+            line.to_string()
         };
+        // Line i of the replacement stands for line i of the search when the counts agree;
+        // otherwise only the first line can be paired up.
+        let paired = if replace.len() == search.len() { missing.get(i) } else if i == 0 { missing.first() } else { None };
+        if let Some(head) = paired.filter(|h| !h.is_empty()) {
+            let body = line.trim_start();
+            if !body.is_empty() && !body.starts_with(head.trim()) {
+                line = format!("{}{head}{body}", indent_of(&line));
+            }
+        }
         out.push(line);
     }
     out.extend(lines[start + search.len()..].iter().map(|l| l.to_string()));
@@ -168,6 +227,24 @@ mod tests {
     fn a_match_ignoring_indentation_is_reindented() {
         let out = apply(FILE, &block("let x = 1;\nprintln!(\"{x}\");", "let x = 2;\nprintln!(\"{x}\");")).unwrap();
         assert_eq!(out, FILE.replace("x = 1", "x = 2"));
+    }
+
+    #[test]
+    fn a_line_copied_without_its_start_still_matches_and_keeps_it() {
+        let file = "/** Skip these. */\nexport const SKIP = new Set([\"a\", \"b\"]);\n";
+        let out = apply(file, &block("const SKIP = new Set([\"a\", \"b\"]);", "const SKIP = new Set([\"a\", \"b\", \"models\"]);")).unwrap();
+        assert_eq!(out, "/** Skip these. */\nexport const SKIP = new Set([\"a\", \"b\", \"models\"]);\n");
+    }
+
+    #[test]
+    fn a_short_fragment_does_not_match_a_long_line() {
+        assert!(apply(FILE, &block("1;", "2;")).is_err());
+    }
+
+    #[test]
+    fn a_miss_shows_the_closest_real_lines() {
+        let err = apply(FILE, &block("let x = 5;\nprint(x)", "")).unwrap_err();
+        assert!(err.contains("closest lines in the file are:\nfn main() {\n    let x = 1;"), "{err}");
     }
 
     #[test]

@@ -585,7 +585,7 @@ pub fn run(
              Reply in this exact shape: a line `FILE: <path>` naming one file above, then one or \
              more edit blocks, each copying a few lines exactly from that file and giving their \
              replacement:\n\
-             <<<<<<< SEARCH\n    let x = 1;\n=======\n    let x = 2;\n>>>>>>> REPLACE\n\
+             <<<<<<< SEARCH\n(a few whole lines copied exactly from the file)\n=======\n(those lines as they should be)\n>>>>>>> REPLACE\n\
              then a line starting with `WHY:` giving a one-sentence reason. If the goal is already \
              met and nothing needs to change, reply with exactly `DONE: <one-sentence reason>` instead."
         );
