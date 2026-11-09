@@ -690,15 +690,20 @@ pub fn run(
         let before = file_lines[from.saturating_sub(CONTEXT_LINES)..from].join("\n");
         let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
         let lang = fence(&relative_path);
-        let start = format!(
-            "FILE: {relative_path}\nLines {first}-{to} of it are:\n```{lang}\n{target}\n```\n\
-             (just before them:\n```{lang}\n{before}\n```\nand just after:\n```{lang}\n{after}\n```)\n\
-             With the goal done, lines {first}-{to} become:\n```{lang}\n",
+        // A short question of its own, without the file listing: with three large files read
+        // first, Xenon dropped entries from a line it was asked to add one to; with only the
+        // lines in front of it, it got the same edit right.
+        let edit_question = format!(
+            "Goal: {goal}\n\n{last_failure}In `{relative_path}`, just before the lines to change:\n```{lang}\n{before}\n```\n\
+             Lines {first}-{to}, the lines to change:\n```{lang}\n{target}\n```\n\
+             Just after them:\n```{lang}\n{after}\n```\n\
+             Goal: {goal}\nWrite lines {first}-{to} with the goal done.",
             first = from + 1
         );
+        let start = format!("```{lang}\n");
         let start_len = start.len();
         let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
-        let reply = ask(engine, model_name, &question, &start, &closed, deadline, cancel)?;
+        let reply = ask(engine, model_name, &edit_question, &start, &closed, deadline, cancel)?;
         let Some(written) = reply.get(start_len..).and_then(|rest| rest.split("```").next()) else {
             report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
             report.stopped_reason = "the model's reply had no new lines".to_string();
