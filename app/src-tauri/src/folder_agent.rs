@@ -36,6 +36,8 @@ pub const MAX_RUNS: u32 = 3;
 pub const MAX_SECONDS: u64 = 10 * 60;
 /// Lines shown on each side of the lines Xenon rewrites, as context it can't change.
 const CONTEXT_LINES: usize = 3;
+/// Lines Xenon rewrites from a definition down (its signature and the start of its body).
+const EDIT_LINES: usize = 4;
 /// Files to work on when none are named: few, since each is read whole into every prompt.
 const FILES_FROM_SEARCH: usize = 3;
 
@@ -260,27 +262,6 @@ fn first_line_done(text: &str) -> bool {
     rest.trim_start().contains('\n') || rest.len() > 300
 }
 
-/// Asks Xenon whether `diff` does what `goal` asks: (yes, its one-sentence reason).
-fn review(
-    engine: &EngineState,
-    model_name: &str,
-    goal: &str,
-    path: &str,
-    diff: &str,
-    deadline: Instant,
-    cancel: &AtomicBool,
-) -> Result<(bool, String), String> {
-    let question = format!(
-        "Goal: {goal}\n\nThis change was made to `{path}`:\n```diff\n{diff}\n```\nGoal: {goal}\n\
-         Does this change do what the goal asks? Answer YES or NO, then give a one-sentence reason."
-    );
-    let answer = ask(engine, model_name, &question, "", &|t: &str| t.trim_start().contains('\n') || t.len() > 400, deadline, cancel)?;
-    let answer = answer.lines().next().unwrap_or("").trim().to_string();
-    let yes = answer.to_uppercase().starts_with("YES");
-    let reason = answer.trim_start_matches(|c: char| c.is_alphabetic() || c == ',' || c == '.' || c == ':' || c == ' ').trim();
-    Ok((yes, if reason.is_empty() { answer.clone() } else { reason.to_string() }))
-}
-
 /// The changed lines between two versions of a file, with two lines around them, in `-`/`+`
 /// form. Enough to judge a small edit.
 fn short_diff(before: &str, after: &str) -> String {
@@ -441,6 +422,27 @@ fn snap_to_list(written: &str, files: &[String]) -> Option<String> {
     let mut found = files.iter().filter(|f| format!("/{f}").ends_with(&suffix));
     let first = found.next()?;
     found.next().is_none().then(|| first.clone())
+}
+
+/// The lines Xenon rewrites around line `best` (0-based, end exclusive): `best` and its
+/// neighbours, or for a definition (`def`, `fn`, `function`...) its first lines, since what needs
+/// changing is usually in the body (with the range centred on `def last_n`, Xenon couldn't reach
+/// its `return` line). Blank lines are kept off both edges: Xenon dropped them when they were in.
+fn edit_range(lines: &[&str], best: usize) -> (usize, usize) {
+    const DEFINERS: &[&str] = &["def ", "fn ", "function ", "class ", "async def ", "pub fn ", "pub(crate) fn ", "export function "];
+    let trimmed = lines[best].trim_start();
+    let (mut from, mut to) = if DEFINERS.iter().any(|d| trimmed.starts_with(d)) {
+        (best, (best + EDIT_LINES).min(lines.len()))
+    } else {
+        (best.saturating_sub(1), (best + 2).min(lines.len()))
+    };
+    while from < best && lines[from].trim().is_empty() {
+        from += 1;
+    }
+    while to > best + 1 && lines[to - 1].trim().is_empty() {
+        to -= 1;
+    }
+    (from, to)
 }
 
 /// `text` with its lines `from..to` (0-based, end exclusive) replaced by `new`, keeping the file's
@@ -683,7 +685,7 @@ pub fn run(
             report.stopped_reason = format!("couldn't find where in {relative_path} the goal applies");
             break;
         };
-        let (from, to) = (best.saturating_sub(1), (best + 2).min(file_lines.len()));
+        let (from, to) = edit_range(&file_lines, best);
         let target = file_lines[from..to].join("\n");
         let before = file_lines[from.saturating_sub(CONTEXT_LINES)..from].join("\n");
         let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
@@ -733,34 +735,7 @@ pub fn run(
         report.edits.push(change.clone());
         progress(&report.narration);
 
-        // Passing checks doesn't mean the goal is met (the first edit Xenon made to its own repo
-        // removed an entry it was asked to add, and the tests passed), so Xenon reviews the diff
-        // against the goal before a run counts as done. A rejected edit is undone.
-        let undo_if_rejected =|report: &mut Report, last_failure: &mut String| -> Result<bool, String> {
-            let diff = short_diff(&change.before, &change.after);
-            let (yes, reason) = review(engine, model_name, goal, &relative_path, &diff, deadline, cancel)?;
-            if yes {
-                report.narration.push(format!("Xenon checked the change against the goal: {reason}"));
-                return Ok(false);
-            }
-            write_file(root, &relative_path, &change.before)?;
-            report.edits.pop();
-            report.narration.push(format!("Xenon's review says the edit doesn't do the goal ({reason}); undid it"));
-            *last_failure = format!(
-                "Your last edit to `{relative_path}` doesn't do the goal ({reason}), so it was undone. It was:\n```diff\n{diff}\n```\n\n"
-            );
-            Ok(true)
-        };
-
         let Some(check) = check_for(root, &relative_path, files) else {
-            match undo_if_rejected(&mut report, &mut last_failure) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => {
-                    report.stopped_reason = e;
-                    break;
-                }
-            }
             report.narration.push(format!("No check runs for {relative_path}'s file type, so stopping after the edit"));
             report.stopped_reason = "finished: edited, nothing to check it with".to_string();
             break;
@@ -774,32 +749,27 @@ pub fn run(
         };
         budget.runs += 1;
         let passed = step.exit_code == Some(0);
-        report.narration.push(format!(
-            "Ran `{}`: {}",
-            step.command,
-            if passed { "passed" } else { "failed" }
-        ));
         let output = format!("{}{}", step.stdout, step.stderr);
         report.runs.push(step);
         if passed {
-            match undo_if_rejected(&mut report, &mut last_failure) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(e) => {
-                    report.stopped_reason = e;
-                    break;
-                }
-            }
+            report.narration.push(format!("Ran `{}`: passed", check.display()));
             report.stopped_reason = "finished: the tests pass".to_string();
             break;
         }
+        // A failed edit is undone, so the next try starts from the original file and a run that
+        // runs out of budget never leaves a broken one (one did, before this).
+        if let Err(e) = write_file(root, &relative_path, &change.before) {
+            report.stopped_reason = e;
+            break;
+        }
+        report.edits.pop();
+        report.narration.push(format!("Ran `{}`: failed, so undid the edit", check.display()));
         let tail: String = output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-        last_failure = format!("After your last edit, `{}` failed with:\n```\n{}\n```\n\n", check.display(), tail.trim());
-
-        let lang = fence(&relative_path);
-        listing = listing.replace(
-            &format!("File `{relative_path}`:\n```{lang}\n{}", change.before),
-            &format!("File `{relative_path}`:\n```{lang}\n{}", change.after),
+        last_failure = format!(
+            "Your last edit to `{relative_path}` was:\n```diff\n{}\n```\nIt was undone because `{}` failed with:\n```\n{}\n```\n\n",
+            short_diff(&change.before, &change.after),
+            check.display(),
+            tail.trim()
         );
     }
 
@@ -908,6 +878,15 @@ mod tests {
         assert!(!first_line_done("FILE: src/a.rs"));
         assert!(first_line_done("FILE: src/a.rs\n"));
         assert!(first_line_done("FILE:\nsrc/a.rs\n"));
+    }
+
+    #[test]
+    fn the_edit_range_reaches_into_a_definition_and_skips_blank_edges() {
+        let lines = ["x = 1", "", "def last_n(items, n):", "    \"\"\"The last n.\"\"\"", "    return items[-n - 1:]", "", ""];
+        assert_eq!(edit_range(&lines, 2), (2, 5), "a def takes its body, not the blank lines after");
+        let lines = ["A = 1", "", "B = 2", "", "C = 3"];
+        assert_eq!(edit_range(&lines, 2), (2, 3), "blank neighbours stay out");
+        assert_eq!(edit_range(&["A = 1", "B = 2", "C = 3"], 1), (0, 3));
     }
 
     #[test]

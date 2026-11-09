@@ -14,6 +14,7 @@ Results go to training/out/edit_tasks.jsonl. Needs the Xenon2 app running.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -59,7 +60,9 @@ def run_task(task):
         seconds = round(time.time() - started)
         report = status.get("report") or {}
         shutil.copy(task / "check.py", Path(tmp) / "check.py")
-        check = subprocess.run([sys.executable, str(Path(tmp) / "check.py")], cwd=folder, capture_output=True, text=True)
+        # Python looks for imports beside the script, not in the working folder.
+        env = {**os.environ, "PYTHONPATH": str(folder)}
+        check = subprocess.run([sys.executable, str(Path(tmp) / "check.py")], cwd=folder, capture_output=True, text=True, env=env)
         diff = subprocess.run(["git", "diff"], cwd=folder, capture_output=True, text=True).stdout
     return {
         "task": task.name,
