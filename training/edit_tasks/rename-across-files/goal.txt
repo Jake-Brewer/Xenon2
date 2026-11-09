@@ -1,0 +1,1 @@
+Rename the function calc_total to order_total everywhere it is used.

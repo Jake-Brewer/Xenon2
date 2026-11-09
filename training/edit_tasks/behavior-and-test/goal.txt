@@ -1,0 +1,1 @@
+slugify should keep digits: slugify("Room 101") should be "room-101". Update the code and its test.

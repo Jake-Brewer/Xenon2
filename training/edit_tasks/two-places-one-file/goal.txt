@@ -1,0 +1,1 @@
+Add a MAX_RETRIES = 5 constant at the top of client.py and use it in both fetch and upload instead of the number 3.
