@@ -524,7 +524,9 @@ fn volatile_header_text(facts: &[sloth_memory::SlothFact], examples: &[example_b
     out
 }
 
-const STOP_SEQUENCES: &[&str] = &["\n\nUser:", "\n\nuser:"];
+/// Where a reply ends: the model starting the next user turn. It usually leaves a blank line
+/// first, but G1 sometimes uses a single newline, which without a cap would run on unchecked.
+const STOP_SEQUENCES: &[&str] = &["\n\nUser:", "\n\nuser:", "\nUser:", "\nuser:"];
 
 /// Reply length is meant to be unbounded, like the context. Replies end on their own at a stop
 /// sequence, and the user ends a long one with Stop (`stop_generation`); the engine just needs
@@ -1083,12 +1085,18 @@ struct SinkCtx<'a> {
     tokens: std::cell::Cell<i32>,
     ended_turn: std::cell::Cell<bool>,
     cancelled: std::cell::Cell<bool>,
+    /// Everything the model wrote, stop sequence included, for logging an empty reply.
+    raw: RefCell<String>,
+    sent_any: std::cell::Cell<bool>,
 }
 
 impl SinkCtx<'_> {
     fn send(&self, text: &str) {
         if text.is_empty() || self.cancelled.get() {
             return;
+        }
+        if !text.trim().is_empty() {
+            self.sent_any.set(true);
         }
         if !(self.sink.borrow_mut())(text) {
             self.cancelled.set(true);
@@ -1103,6 +1111,7 @@ extern "C" fn on_sink_token(text: *const std::os::raw::c_char, _token_id: u32, u
     let ctx = unsafe { &*(user_data as *const SinkCtx) };
     ctx.tokens.set(ctx.tokens.get() + 1);
     let text = if text.is_null() { "" } else { unsafe { CStr::from_ptr(text) }.to_str().unwrap_or("") };
+    ctx.raw.borrow_mut().push_str(text);
     let mut pending = ctx.pending.borrow_mut();
     pending.push_str(text);
     for stop in STOP_SEQUENCES {
@@ -1192,6 +1201,8 @@ pub(crate) fn generate_code(
         tokens: std::cell::Cell::new(0),
         ended_turn: std::cell::Cell::new(false),
         cancelled: std::cell::Cell::new(false),
+        raw: RefCell::new(String::new()),
+        sent_any: std::cell::Cell::new(false),
     };
     let status = unsafe {
         ffi::xenon_generate_with_state(
@@ -1212,6 +1223,11 @@ pub(crate) fn generate_code(
     if !ctx.ended_turn.get() {
         let rest = std::mem::take(&mut *ctx.pending.borrow_mut());
         ctx.send(&rest[..rest.len() - stop_hold_len(&rest)]);
+    }
+    if !ctx.sent_any.get() {
+        let raw = ctx.raw.borrow();
+        let head: String = raw.chars().take(200).collect();
+        eprintln!("xenon2: code API reply was empty; the model wrote {head:?} ({} tokens)", ctx.tokens.get());
     }
     Ok(if ctx.cancelled.get() {
         Finish::Cancelled
@@ -1247,4 +1263,18 @@ pub async fn generate_response(
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_next_turn_after_one_newline_is_held_back() {
+        assert_eq!(stop_hold_len("Done.\nUs"), 3);
+        assert_eq!(stop_hold_len("Done.\n"), 1);
+        assert_eq!(stop_hold_len("Done."), 0);
+        assert!(STOP_SEQUENCES.iter().any(|s| "Done.\nUser:".ends_with(s)));
+        assert!(STOP_SEQUENCES.iter().any(|s| "Done.\n\nUser:".ends_with(s)));
+    }
 }
