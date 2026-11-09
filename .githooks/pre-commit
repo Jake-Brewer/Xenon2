@@ -1,0 +1,21 @@
+#!/bin/sh
+# Refuses commits that would put big binaries straight into git history: a joined model file
+# (commit its parts, which LFS stores), or any staged file over 100 MB that LFS isn't handling.
+status=0
+for f in $(git diff --cached --name-only --diff-filter=AM); do
+  case "$f" in
+    models/*.bin)
+      echo "pre-commit: $f is a joined model. Commit its .partN files instead (they go to LFS)." >&2
+      status=1
+      continue ;;
+  esac
+  [ -f "$f" ] || continue
+  if [ "$(git check-attr filter -- "$f" | sed 's/.*: //')" != "lfs" ]; then
+    size=$(wc -c < "$f")
+    if [ "$size" -gt 104857600 ]; then
+      echo "pre-commit: $f is $((size / 1048576)) MB and not tracked by LFS. Add a pattern to .gitattributes." >&2
+      status=1
+    fi
+  fi
+done
+exit $status

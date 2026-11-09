@@ -1,0 +1,6 @@
+# Model weights live in Git LFS. GitHub's LFS takes files up to 2 GB, so a full model is stored as
+# models/<name>.bin.part1, .part2, ... and joined on first use (scripts/join_models.py, or the app
+# at startup). The joined models/*.bin itself is ignored.
+models/*.bin.part* filter=lfs diff=lfs merge=lfs -text
+# Weights we train ourselves (state tunes, LoRA), under 2 GB each.
+models/tuned/** filter=lfs diff=lfs merge=lfs -text

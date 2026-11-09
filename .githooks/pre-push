@@ -1,0 +1,4 @@
+#!/bin/sh
+# Git LFS's own hook. Kept here because core.hooksPath points at .githooks (scripts/setup-repo.sh).
+command -v git-lfs >/dev/null 2>&1 || { printf >&2 "\nThis repo keeps its model weights in Git LFS, but git-lfs is not installed.\nInstall it from https://git-lfs.com, then run scripts/setup-repo.sh.\n"; exit 2; }
+git lfs pre-push "$@"

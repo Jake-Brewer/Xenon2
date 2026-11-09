@@ -5,6 +5,7 @@ mod ffi;
 mod folder_agent;
 mod inference;
 mod memory;
+mod model_parts;
 mod persistence;
 mod sloth_memory;
 mod voice;

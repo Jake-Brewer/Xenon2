@@ -282,6 +282,9 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     // XENON_MODEL names another file in models/ (e.g. rwkv-7-g1l-2.9B-Q5_1.bin) to compare models.
     let model_file = std::env::var("XENON_MODEL").unwrap_or_else(|_| "rwkv-7-world-2.9B-Q5_1.bin".to_string());
     let model_path = repo_root.join("models").join(model_file);
+    if let Err(e) = crate::model_parts::ensure_joined(&model_path) {
+        eprintln!("xenon2: {e}");
+    }
     let vocab_path = repo_root
         .join("inference-engine")
         .join("data")
