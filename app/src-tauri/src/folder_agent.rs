@@ -511,6 +511,34 @@ fn replace_lines(text: &str, from: usize, to: usize, new: &str) -> String {
     joined
 }
 
+/// The compiler warnings in a check's output, each as its message plus where it points (rustc's
+/// `warning: ...` line and its ` --> file:line` line), without line numbers, so a warning that
+/// only moved because lines were added above it still counts as the same one. Summary lines
+/// ("`app` (lib) generated 1 warning") are left out.
+fn warnings(output: &str) -> Vec<String> {
+    let lines: Vec<&str> = output.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(message) = line.strip_prefix("warning: ") else { continue };
+        if message.contains("generated") && message.starts_with('`') {
+            continue;
+        }
+        let place = lines
+            .get(i + 1)
+            .and_then(|l| l.trim_start().strip_prefix("--> "))
+            .map(|p| p.split(':').next().unwrap_or(p).replace('\\', "/"))
+            .unwrap_or_default();
+        out.push(format!("{message} ({place})"));
+    }
+    out
+}
+
+/// True for goals like "silence the dead_code warning on X" or "fix the unused-import warnings".
+fn asks_to_remove_a_warning(goal: &str) -> bool {
+    let goal = goal.to_lowercase();
+    goal.contains("warning") && ["silence", "remove", "fix", "get rid of", "clear"].iter().any(|v| goal.contains(v))
+}
+
 /// The language name for a file's code fence.
 fn fence(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -653,6 +681,8 @@ pub fn run(
     };
     let mut budget = Budget::new();
     let mut last_failure = String::new();
+    // Per check command: the compiler warnings it gave before any edit.
+    let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
     // With no names at all, search the folder for the goal and work on the best matches.
@@ -790,6 +820,30 @@ pub fn run(
             break;
         }
 
+        // Before the first edit a check covers, run it on the untouched code: tests that already
+        // fail would make every edit look wrong, and its compiler warnings are the bar an edit
+        // must not raise (Xenon once "removed" a warning by re-indenting, and every test passed).
+        let check = check_for(root, &relative_path, files);
+        if let Some(check) = &check {
+            let key = check.display();
+            if !baselines.contains_key(&key) {
+                let step = match run_check(root, check, deadline, cancel) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        report.stopped_reason = e;
+                        break;
+                    }
+                };
+                if step.exit_code != Some(0) {
+                    report.narration.push(format!("`{key}` already fails before any edit"));
+                    report.stopped_reason = format!("`{key}` fails before any edit; fix that first");
+                    report.runs.push(step);
+                    break;
+                }
+                baselines.insert(key, warnings(&format!("{}{}", step.stdout, step.stderr)));
+            }
+        }
+
         let change = match write_file(root, &relative_path, &code) {
             Ok(c) => c,
             Err(e) => {
@@ -802,7 +856,7 @@ pub fn run(
         report.edits.push(change.clone());
         progress(&report.narration);
 
-        let Some(check) = check_for(root, &relative_path, files) else {
+        let Some(check) = check else {
             report.narration.push(format!("No check runs for {relative_path}'s file type, so stopping after the edit"));
             report.stopped_reason = "finished: edited, nothing to check it with".to_string();
             break;
@@ -815,8 +869,21 @@ pub fn run(
             }
         };
         budget.runs += 1;
-        let passed = step.exit_code == Some(0);
-        let output = format!("{}{}", step.stdout, step.stderr);
+        let mut output = format!("{}{}", step.stdout, step.stderr);
+        let before_warnings = baselines.get(&check.display()).cloned().unwrap_or_default();
+        let new_warnings: Vec<String> = warnings(&output).into_iter().filter(|w| !before_warnings.contains(w)).collect();
+        // A goal to remove a warning is only met when there are fewer of them afterwards.
+        let after_warnings = warnings(&output);
+        let warning_stayed = asks_to_remove_a_warning(goal) && after_warnings.len() >= before_warnings.len();
+        let passed = step.exit_code == Some(0) && new_warnings.is_empty() && !warning_stayed;
+        if step.exit_code == Some(0) && !new_warnings.is_empty() {
+            output = format!("The tests passed, but the edit added compiler warnings:\n{}", new_warnings.join("\n"));
+        } else if step.exit_code == Some(0) && warning_stayed {
+            output = format!(
+                "The tests passed, but the warnings the goal is about are still there:\n{}",
+                after_warnings.join("\n")
+            );
+        }
         report.runs.push(step);
         if passed {
             report.narration.push(format!("Ran `{}`: passed", check.display()));
@@ -954,6 +1021,22 @@ mod tests {
         let lines = ["A = 1", "", "B = 2", "", "C = 3"];
         assert_eq!(edit_range(&lines, 2), (2, 3), "blank neighbours stay out");
         assert_eq!(edit_range(&["A = 1", "B = 2", "C = 3"], 1), (0, 3));
+    }
+
+    #[test]
+    fn warnings_are_read_without_line_numbers_or_summaries() {
+        let output = "warning: function `split_into_parts` is never used\n  --> src\\model_parts.rs:84:8\n   |\n\
+                      warning: `app` (lib) generated 1 warning\n";
+        assert_eq!(warnings(output), vec!["function `split_into_parts` is never used (src/model_parts.rs)"]);
+        let moved = output.replace(":84:8", ":90:8");
+        assert_eq!(warnings(&moved), warnings(output), "a warning that moved is the same warning");
+    }
+
+    #[test]
+    fn goals_about_removing_a_warning_are_recognised() {
+        assert!(asks_to_remove_a_warning("Silence the dead_code warning on split_into_parts"));
+        assert!(!asks_to_remove_a_warning("Add \"models\" to SKIP_DIRS"));
+        assert!(!asks_to_remove_a_warning("Log a warning when the GPU is hot"));
     }
 
     #[test]
