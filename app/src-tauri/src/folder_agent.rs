@@ -110,6 +110,19 @@ pub struct Report {
     pub narration: Vec<String>,
     /// The snapshot commit to revert to, if one was taken (the tree was clean at the start).
     pub snapshot_commit: Option<String>,
+    /// Mistakes this run fixed, for the next training batch. Not sent to clients: prompts are large.
+    #[serde(skip)]
+    pub lessons: Vec<Lesson>,
+}
+
+/// A mistake Xenon later fixed: the prompt of an edit that failed its checks, and the edit that
+/// passed at the same lines. Never a failed edit as the answer: Xenon learns the repair.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Lesson {
+    pub prompt: String,
+    pub answer: String,
+    pub passed: bool,
+    pub source: &'static str,
 }
 
 /// Checks that `candidate` (already joined to `root`) stays inside `root` once symlinks and
@@ -253,6 +266,19 @@ fn ask(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
+    let (prior, last, params) = ask_prompt(model_name, question, start)?;
+    let mut text = start.to_string();
+    let mut sink = |piece: &str| {
+        text.push_str(piece);
+        !done(&text) && Instant::now() < deadline && !cancel.load(Ordering::Relaxed)
+    };
+    inference::generate_code(engine, &prior, &last, params, &mut sink)?;
+    Ok(text.trim().to_string())
+}
+
+/// The prompt `ask` gives the model, as (cached part, the rest, sampling settings). The two
+/// strings together are exactly the text the model reads before its reply.
+fn ask_prompt(model_name: &str, question: &str, start: &str) -> Result<(String, String, inference::SamplingParams), String> {
     let style = Style::for_model(model_name);
     let request = ChatRequest {
         messages: vec![ChatMessage { role: "user".to_string(), content: serde_json::Value::String(question.to_string()) }],
@@ -273,13 +299,7 @@ fn ask(
     };
     let prior = format!("{}{user_turn}", prompt.prior);
     let last = format!("{reply_start}{start}");
-    let mut text = start.to_string();
-    let mut sink = |piece: &str| {
-        text.push_str(piece);
-        !done(&text) && Instant::now() < deadline && !cancel.load(Ordering::Relaxed)
-    };
-    inference::generate_code(engine, &prior, &last, prompt.params, &mut sink)?;
-    Ok(text.trim().to_string())
+    Ok((prior, last, prompt.params))
 }
 
 /// True once the text after `FILE:` has a complete non-blank line (or has run long).
@@ -616,7 +636,17 @@ fn update(id: &str, change: impl FnOnce(&mut JobStatus)) {
 
 /// Starts a run on its own thread. Only one run at a time: they share the one loaded model, and
 /// stacking them only queues GPU work on a laptop that is already warm.
-pub fn start_job(engine: EngineState, model_name: String, root: PathBuf, goal: String, files: Vec<String>, id: String) -> Result<(), String> {
+/// `lessons_file` (the app's `mistakes.jsonl`) gets one line per mistake the run fixed, for the
+/// next training batch (training/build_batch.py).
+pub fn start_job(
+    engine: EngineState,
+    model_name: String,
+    root: PathBuf,
+    goal: String,
+    files: Vec<String>,
+    id: String,
+    lessons_file: Option<PathBuf>,
+) -> Result<(), String> {
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut jobs = jobs().lock().unwrap_or_else(|p| p.into_inner());
@@ -629,6 +659,11 @@ pub fn start_job(engine: EngineState, model_name: String, root: PathBuf, goal: S
     std::thread::spawn(move || {
         let progress = |narration: &[String]| update(&id, |s| s.narration = narration.to_vec());
         let outcome = run(&engine, &model_name, &root, &goal, &files, &progress, &cancel);
+        if let (Ok(report), Some(path)) = (&outcome, &lessons_file) {
+            if let Err(e) = save_lessons(path, &report.lessons) {
+                eprintln!("xenon2: couldn't save the run's lessons: {e}");
+            }
+        }
         update(&id, |s| match outcome {
             Ok(report) => {
                 s.state = "done".into();
@@ -641,6 +676,23 @@ pub fn start_job(engine: EngineState, model_name: String, root: PathBuf, goal: S
             }
         });
     });
+    Ok(())
+}
+
+/// Appends lessons to `path` as JSON lines.
+fn save_lessons(path: &Path, lessons: &[Lesson]) -> Result<(), String> {
+    use std::io::Write;
+    if lessons.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| e.to_string())?;
+    for lesson in lessons {
+        let line = serde_json::to_string(lesson).map_err(|e| e.to_string())?;
+        writeln!(file, "{line}").map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -680,6 +732,7 @@ pub fn run(
         runs: Vec::new(),
         narration: Vec::new(),
         snapshot_commit: snapshot_commit.clone(),
+        lessons: Vec::new(),
     };
     let mut budget = Budget::new();
     let mut last_failure = String::new();
@@ -687,6 +740,8 @@ pub fn run(
     let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
     // Per file: the line ranges already rewritten without success.
     let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+    // Per place (file and line range): the clean prompt of its first failed edit there.
+    let mut failed_at: HashMap<(String, usize, usize), String> = HashMap::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
     // With no names at all, search the folder for the goal and work on the best matches.
@@ -797,10 +852,13 @@ pub fn run(
         // first, Xenon dropped entries from a line it was asked to add one to. But the lines to
         // change stay in the reply's start, right before "become:": with them in the question
         // instead, Xenon passed 2 of 7 edit tasks rather than 6 of 6.
-        let edit_question = format!(
-            "Goal: {goal}\n\n{last_failure}In `{relative_path}`, the lines just before the ones to change:\n```{lang}\n{before}\n```\n\
-             and just after them:\n```{lang}\n{after}\n```\nGoal: {goal}"
-        );
+        let question_with = |failure: &str| {
+            format!(
+                "Goal: {goal}\n\n{failure}In `{relative_path}`, the lines just before the ones to change:\n```{lang}\n{before}\n```\n\
+                 and just after them:\n```{lang}\n{after}\n```\nGoal: {goal}"
+            )
+        };
+        let edit_question = question_with(&last_failure);
         let start = format!(
             "Lines {first}-{to} of `{relative_path}` are:\n```{lang}\n{target}\n```\nWith the goal done, they become:\n```{lang}\n",
             first = from + 1
@@ -814,10 +872,15 @@ pub fn run(
             break;
         };
         let written = written.trim_end_matches(['\n', '\r']);
+        // The prompt this place gets without any failure feedback: the one a lesson pairs with
+        // the edit that finally passes here.
+        let place = (relative_path.clone(), from, to);
+        let clean_prompt = ask_prompt(model_name, &question_with(""), &start).map(|(a, b, _)| a + &b).unwrap_or_default();
         if written.trim() == target.trim() {
             // Small models often copy the lines back unchanged while meaning to change them.
             budget.edits += 1;
             report.narration.push(format!("Xenon's edit to {relative_path} changed nothing; asking again"));
+            failed_at.entry(place).or_insert(clean_prompt);
             last_failure = format!(
                 "Your last edit to `{relative_path}` wrote these lines back unchanged:\n```{lang}\n{target}\n```\n\
                  This time, change them so the goal is done.\n\n"
@@ -898,6 +961,9 @@ pub fn run(
         report.runs.push(step);
         if passed {
             report.narration.push(format!("Ran `{}`: passed", check.display()));
+            if let Some(prompt) = failed_at.remove(&place) {
+                report.lessons.push(Lesson { prompt, answer: format!("{written}\n```"), passed: true, source: "agent" });
+            }
             report.stopped_reason = "finished: the tests pass".to_string();
             break;
         }
@@ -909,6 +975,7 @@ pub fn run(
         }
         report.edits.pop();
         report.narration.push(format!("Ran `{}`: failed, so undid the edit", check.display()));
+        failed_at.entry(place).or_insert(clean_prompt);
         let tail: String = output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
         last_failure = format!(
             "Your last edit to `{relative_path}` was:\n```diff\n{}\n```\nIt was undone because `{}` failed with:\n```\n{}\n```\n\n",
@@ -1048,6 +1115,24 @@ mod tests {
         assert!(asks_to_remove_a_warning("Silence the dead_code warning on split_into_parts"));
         assert!(!asks_to_remove_a_warning("Add \"models\" to SKIP_DIRS"));
         assert!(!asks_to_remove_a_warning("Log a warning when the GPU is hot"));
+    }
+
+    #[test]
+    fn lessons_are_saved_as_json_lines() {
+        let dir = temp_repo();
+        let path = dir.join("data").join("mistakes.jsonl");
+        let lesson = Lesson { prompt: "P".into(), answer: "A
+```".into(), passed: true, source: "agent" };
+        save_lessons(&path, &[lesson.clone()]).unwrap();
+        save_lessons(&path, &[]).unwrap();
+        save_lessons(&path, &[lesson]).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(first["answer"], "A
+```");
+        assert_eq!(first["passed"], true);
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

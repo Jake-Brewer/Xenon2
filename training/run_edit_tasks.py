@@ -35,7 +35,8 @@ def git(folder, *args):
 
 
 def run_agent(folder, goal):
-    job = post("/v1/folder-agent", {"folder": str(folder), "goal": goal, "files": []})
+    # learn: false keeps these runs out of the training batch; this is Xenon's exam.
+    job = post("/v1/folder-agent", {"folder": str(folder), "goal": goal, "files": [], "learn": False})
     url, token = connection()
     while True:
         req = urllib.request.Request(f"{url}/v1/folder-agent/{job['id']}", headers={"Authorization": "Bearer " + token})

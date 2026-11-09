@@ -303,6 +303,7 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                         req.goal,
                         req.files,
                         id.clone(),
+                        crate::memory::effective_data_dir(app).ok().filter(|_| req.learn).map(|d| d.join("mistakes.jsonl")),
                     );
                     match started {
                         Ok(()) => write_json(&mut stream, "202 Accepted", &json!({ "id": id })).map_err(io),
@@ -500,6 +501,14 @@ pub struct FolderAgentRequest {
     /// Empty or left out: the agent searches the folder for the goal and picks a few files.
     #[serde(default)]
     pub files: Vec<String>,
+    /// Whether mistakes the run fixes go into the next training batch. Benchmarks turn this off,
+    /// so Xenon is never trained on its own exam.
+    #[serde(default = "default_learn")]
+    pub learn: bool,
+}
+
+fn default_learn() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]
