@@ -226,8 +226,20 @@ impl Budget {
 ///
 /// `start` is written into the reply before the model begins, and comes back at the front of the
 /// returned text. Starting the reply with `FILE:` keeps G1, which was trained on tool use, from
-/// answering a long code prompt with a `<tool_call>` instead of an edit.
-fn ask(engine: &EngineState, model_name: &str, question: &str, start: &str, deadline: Instant, cancel: &AtomicBool) -> Result<String, String> {
+/// answering a long code prompt with a `<tool_call>` instead of an edit. Generation ends when
+/// `done` says the text so far is complete.
+///
+/// The question goes in the cached part of the prompt, so asking it again with a different
+/// `start` doesn't re-read the files in it.
+fn ask(
+    engine: &EngineState,
+    model_name: &str,
+    question: &str,
+    start: &str,
+    done: &dyn Fn(&str) -> bool,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
     let style = Style::for_model(model_name);
     let request = ChatRequest {
         messages: vec![ChatMessage { role: "user".to_string(), content: serde_json::Value::String(question.to_string()) }],
@@ -239,15 +251,69 @@ fn ask(engine: &EngineState, model_name: &str, question: &str, start: &str, dead
         repeat_penalty: None,
         workspace: None,
     };
-    let mut prompt = code_api::build_prompt(&request, style)?;
-    prompt.last.push_str(start);
+    let prompt = code_api::build_prompt(&request, style)?;
+    // `last` is "User: ...\n\n<label>: ..."; the user turn ends on a turn boundary, which is
+    // where cached prompts must end.
+    let (user_turn, reply_start) = match prompt.last.rfind("\n\n") {
+        Some(i) => prompt.last.split_at(i + 2),
+        None => ("", prompt.last.as_str()),
+    };
+    let prior = format!("{}{user_turn}", prompt.prior);
+    let last = format!("{reply_start}{start}");
     let mut text = start.to_string();
     let mut sink = |piece: &str| {
         text.push_str(piece);
-        !reply_complete(&text) && Instant::now() < deadline && !cancel.load(Ordering::Relaxed)
+        !done(&text) && Instant::now() < deadline && !cancel.load(Ordering::Relaxed)
     };
-    inference::generate_code(engine, &prompt.prior, &prompt.last, prompt.params, &mut sink)?;
+    inference::generate_code(engine, &prior, &last, prompt.params, &mut sink)?;
     Ok(text.trim().to_string())
+}
+
+/// True once the text after `FILE:` has a complete non-blank line (or has run long).
+fn first_line_done(text: &str) -> bool {
+    let rest = text.strip_prefix("FILE:").unwrap_or(text);
+    rest.trim_start().contains('\n') || rest.len() > 300
+}
+
+/// Asks Xenon whether `diff` does what `goal` asks: (yes, its one-sentence reason).
+fn review(
+    engine: &EngineState,
+    model_name: &str,
+    goal: &str,
+    path: &str,
+    diff: &str,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(bool, String), String> {
+    let question = format!(
+        "Goal: {goal}\n\nThis change was made to `{path}`:\n```diff\n{diff}\n```\nGoal: {goal}\n\
+         Does this change do what the goal asks? Answer YES or NO, then give a one-sentence reason."
+    );
+    let answer = ask(engine, model_name, &question, "", &|t: &str| t.trim_start().contains('\n') || t.len() > 400, deadline, cancel)?;
+    let answer = answer.lines().next().unwrap_or("").trim().to_string();
+    let yes = answer.to_uppercase().starts_with("YES");
+    let reason = answer.trim_start_matches(|c: char| c.is_alphabetic() || c == ',' || c == '.' || c == ':' || c == ' ').trim();
+    Ok((yes, if reason.is_empty() { answer.clone() } else { reason.to_string() }))
+}
+
+/// The changed lines between two versions of a file, with two lines around them, in `-`/`+`
+/// form. Enough to judge a small edit.
+fn short_diff(before: &str, after: &str) -> String {
+    let a: Vec<&str> = before.lines().collect();
+    let b: Vec<&str> = after.lines().collect();
+    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let suffix = a[prefix..].iter().rev().zip(b[prefix..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let mut out = Vec::new();
+    for line in &a[prefix.saturating_sub(2)..prefix] {
+        out.push(format!(" {line}"));
+    }
+    out.extend(a[prefix..a.len() - suffix].iter().map(|l| format!("-{l}")));
+    out.extend(b[prefix..b.len() - suffix].iter().map(|l| format!("+{l}")));
+    let after_end = (a.len() - suffix + 2).min(a.len());
+    for line in &a[a.len() - suffix..after_end] {
+        out.push(format!(" {line}"));
+    }
+    out.join("\n")
 }
 
 /// A command that checks an edit: tests where the project has them, else a typecheck or a run.
@@ -579,39 +645,44 @@ pub fn run(
         }
 
         // The goal comes before the files and again after them: a recurrent model reads once, so
-        // it should know what it's looking for while it reads (see CODING_STRATEGIES.md).
+        // it should know what it's looking for while it reads (see CODING_STRATEGIES.md). No
+        // example edit: Xenon copied the example's lines instead of the file's.
         let question = format!(
             "Goal: {goal}\n\n{listing}{last_failure}Goal: {goal}\n\
-             Reply in this exact shape: a line `FILE: <path>` naming one file above, then one or \
-             more edit blocks, each copying a few lines exactly from that file and giving their \
-             replacement:\n\
-             <<<<<<< SEARCH\n(a few whole lines copied exactly from the file)\n=======\n(those lines as they should be)\n>>>>>>> REPLACE\n\
-             then a line starting with `WHY:` giving a one-sentence reason. If the goal is already \
-             met and nothing needs to change, reply with exactly `DONE: <one-sentence reason>` instead."
+             Reply with a line `FILE: <path>` naming the one file above to change. Then edit blocks: \
+             a line `<<<<<<< SEARCH`, a few whole lines copied exactly from that file, a line \
+             `=======`, those lines as they should be, and a line `>>>>>>> REPLACE`. Then a line \
+             `WHY:` with a one-sentence reason. If nothing needs to change, reply `FILE: none` \
+             and then `DONE: <one-sentence reason>`."
         );
         let deadline = budget.started + Duration::from_secs(MAX_SECONDS);
-        let reply = ask(engine, model_name, &question, "FILE:", deadline, cancel)?;
 
-        // With the reply started as `FILE:`, "nothing to do" shows up as a DONE: line and no edit.
-        if edit_blocks::parse(&reply).is_empty() && extract_code_block(&reply).is_none() {
-            if let Some(reason) = reason_after(&reply, "DONE:") {
-                report.narration.push(format!("Stopped: {reason}"));
-                report.stopped_reason = "finished".to_string();
-                break;
-            }
-        }
-
-        let Some(file_line) = reply.lines().find(|l| l.trim_start().starts_with("FILE:")) else {
-            report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
-            report.stopped_reason = "the model's reply didn't name a file to edit".to_string();
+        // Two steps, each started for the model so it can only go one way: first the file (G1
+        // otherwise answers long code prompts with a <tool_call>), then the edit, begun with the
+        // SEARCH marker so the next thing written is lines from that file.
+        let path_reply = ask(engine, model_name, &question, "FILE:", &first_line_done, deadline, cancel)?;
+        let written = path_reply["FILE:".len()..].lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_matches('`').to_string();
+        if written.is_empty() || written.eq_ignore_ascii_case("none") {
+            let done = ask(engine, model_name, &question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
+            let reason = reason_after(&done, "DONE:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
+            report.narration.push(format!("Stopped: {reason}"));
+            report.stopped_reason = "finished".to_string();
             break;
-        };
-        let file_line = file_line.trim_start();
-        let written = file_line.trim_start_matches("FILE:").trim().trim_matches('`').to_string();
+        }
         let Some(relative_path) = snap_to_list(&written, files) else {
+            report.narration.push(format!("Xenon's reply began: {}", excerpt(&path_reply)));
             report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
             break;
         };
+        let reply = ask(
+            engine,
+            model_name,
+            &question,
+            &format!("FILE: {relative_path}\n<<<<<<< SEARCH\n"),
+            &reply_complete,
+            deadline,
+            cancel,
+        )?;
         let current = std::fs::read_to_string(root.join(&relative_path)).unwrap_or_default();
         // Edit blocks, or failing those a whole new file in a code block.
         let blocks = edit_blocks::parse(&reply);
@@ -663,7 +734,34 @@ pub fn run(
         report.edits.push(change.clone());
         progress(&report.narration);
 
+        // Passing checks doesn't mean the goal is met (the first edit Xenon made to its own repo
+        // removed an entry it was asked to add, and the tests passed), so Xenon reviews the diff
+        // against the goal before a run counts as done. A rejected edit is undone.
+        let undo_if_rejected =|report: &mut Report, last_failure: &mut String| -> Result<bool, String> {
+            let diff = short_diff(&change.before, &change.after);
+            let (yes, reason) = review(engine, model_name, goal, &relative_path, &diff, deadline, cancel)?;
+            if yes {
+                report.narration.push(format!("Xenon checked the change against the goal: {reason}"));
+                return Ok(false);
+            }
+            write_file(root, &relative_path, &change.before)?;
+            report.edits.pop();
+            report.narration.push(format!("Xenon's review says the edit doesn't do the goal ({reason}); undid it"));
+            *last_failure = format!(
+                "Your last edit to `{relative_path}` doesn't do the goal ({reason}), so it was undone. It was:\n```diff\n{diff}\n```\n\n"
+            );
+            Ok(true)
+        };
+
         let Some(check) = check_for(root, &relative_path, files) else {
+            match undo_if_rejected(&mut report, &mut last_failure) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    report.stopped_reason = e;
+                    break;
+                }
+            }
             report.narration.push(format!("No check runs for {relative_path}'s file type, so stopping after the edit"));
             report.stopped_reason = "finished: edited, nothing to check it with".to_string();
             break;
@@ -685,6 +783,14 @@ pub fn run(
         let output = format!("{}{}", step.stdout, step.stderr);
         report.runs.push(step);
         if passed {
+            match undo_if_rejected(&mut report, &mut last_failure) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(e) => {
+                    report.stopped_reason = e;
+                    break;
+                }
+            }
             report.stopped_reason = "finished: the tests pass".to_string();
             break;
         }
@@ -822,6 +928,23 @@ mod tests {
         assert!(reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it.\n"));
         assert!(reply_complete("FILE: a.py\n```python\nx = 2\n```\nWHY: fixed it.User:"));
         assert!(reply_complete("DONE: already passes\n"));
+    }
+
+    #[test]
+    fn the_path_step_ends_at_the_end_of_its_line() {
+        assert!(!first_line_done("FILE:"));
+        assert!(!first_line_done("FILE:\n"));
+        assert!(!first_line_done("FILE: src/a.rs"));
+        assert!(first_line_done("FILE: src/a.rs\n"));
+        assert!(first_line_done("FILE:\nsrc/a.rs\n"));
+    }
+
+    #[test]
+    fn a_short_diff_shows_the_change_with_two_lines_around_it() {
+        let before = "a\nb\nc\nd\ne\nf\n";
+        let after = "a\nb\nc\nD\ne\nf\n";
+        assert_eq!(short_diff(before, after), " b\n c\n-d\n+D\n e\n f");
+        assert_eq!(short_diff("x\n", "x\ny\n"), " x\n+y");
     }
 
     #[test]
