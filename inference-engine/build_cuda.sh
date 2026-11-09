@@ -3,6 +3,7 @@
 # The desktop app links build-cuda-app ahead of the CPU build. See README.md.
 set -euo pipefail
 cd "$(dirname "$0")"
+./apply_patches.sh
 
 if ! command -v nvcc >/dev/null 2>&1; then
   echo "nvcc is not on PATH. Install the CUDA toolkit, then re-run." >&2

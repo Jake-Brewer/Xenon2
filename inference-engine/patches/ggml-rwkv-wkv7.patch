@@ -1,0 +1,390 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index c714fc8c..ae487437 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -513,6 +513,7 @@ extern "C" {
+         GGML_OP_GET_REL_POS,
+         GGML_OP_ADD_REL_POS,
+         GGML_OP_RWKV_WKV6,
++        GGML_OP_RWKV_WKV7,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -1873,6 +1874,19 @@ extern "C" {
+             struct ggml_tensor  * td,
+             struct ggml_tensor  * state);
+ 
++    // RWKV-7 time mixing. r, w, k, v, a, b: [S, H, n_tokens]; state: [S * S * H, n_seqs].
++    // w is the per-channel decay, already in (0, 1). Result: [S * H, n_tokens + S * n_seqs],
++    // the output followed by the new state.
++    GGML_API struct ggml_tensor * ggml_rwkv_wkv7(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * r,
++            struct ggml_tensor  * w,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            struct ggml_tensor  * state);
++
+     // custom operators
+ 
+     typedef void (*ggml_unary_op_f32_t) (const int, float *, const float *);
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index b7fefb9d..3c641ddb 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -12000,6 +12000,93 @@ static void ggml_compute_forward_rwkv_wkv6(
+     }
+ }
+ 
++// ggml_compute_forward_rwkv_wkv7
++
++static void ggml_compute_forward_rwkv_wkv7_f32(
++        const struct ggml_compute_params * params,
++        struct ggml_tensor * dst) {
++    const int64_t T = dst->src[1]->ne[2];
++    const int64_t C = dst->ne[0];
++    const int64_t HEADS = dst->src[1]->ne[1];
++    const int64_t n_seqs = dst->src[6]->ne[1];
++    const int64_t head_size = C / HEADS;
++
++    float * dst_data = (float *) dst->data;
++    float * state = ((float *) dst->data) + C * T;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int h_start = (HEADS * ith) / nth;
++    const int h_end = ((HEADS * (ith + 1)) / nth < HEADS) ? (HEADS * (ith + 1)) / nth : HEADS;
++
++    float * r = (float *) dst->src[0]->data;
++    float * w = (float *) dst->src[1]->data;
++    float * k = (float *) dst->src[2]->data;
++    float * v = (float *) dst->src[3]->data;
++    float * a = (float *) dst->src[4]->data;
++    float * b = (float *) dst->src[5]->data;
++
++    const int64_t t_stride = HEADS * head_size;
++    const int64_t h_stride = C / HEADS;
++    GGML_ASSERT(C % HEADS == 0);
++    const int64_t h_stride_2d = head_size * head_size;
++
++    for (int64_t t = 0; t < T; t++) {
++        const int64_t t_offset = t * t_stride;
++        const int64_t state_offset = head_size * C * (t / (T / n_seqs));
++        float * state_cur = state + state_offset;
++        float * state_prev = t % (T / n_seqs) ? state_cur : (float *) dst->src[6]->data + state_offset;
++
++        for (int64_t h = h_start; h < h_end; h++) {
++            const int64_t h_offset = h * h_stride;
++            const int64_t t_h_offset = t_offset + h_offset;
++            const int64_t h_2d_offset = h * h_stride_2d;
++
++            for (int64_t i = 0; i < head_size; i++) {
++                const int64_t t_h_i_offset = t_h_offset + i;
++                const int64_t h_2d_i_offset = h_2d_offset + i * h_stride;
++
++                const float v_val = v[t_h_i_offset];
++
++                float sa = 0, result = 0;
++                for (int64_t j = 0; j < head_size; j++) {
++                    sa += a[t_h_offset + j] * state_prev[h_2d_i_offset + j];
++                }
++
++                for (int64_t j = 0; j < head_size; j++) {
++                    const int64_t t_h_j_offset = t_h_offset + j;
++                    const int64_t h_2d_i_j_offset = h_2d_i_offset + j;
++
++                    const float kv_val = v_val * k[t_h_j_offset];
++                    const float prev_state_val = state_prev[h_2d_i_j_offset];
++                    state_cur[h_2d_i_j_offset] = prev_state_val * w[t_h_j_offset] + kv_val + sa * b[t_h_j_offset];
++                    result += state_cur[h_2d_i_j_offset] * r[t_h_j_offset];
++                }
++                dst_data[t_h_i_offset] = result;
++            }
++        }
++    }
++}
++
++static void ggml_compute_forward_rwkv_wkv7(
++        const struct ggml_compute_params * params,
++        struct ggml_tensor * dst) {
++
++    const struct ggml_tensor * src0 = dst->src[0];
++
++    switch (src0->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_rwkv_wkv7_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_map_unary
+ 
+ static void ggml_compute_forward_map_unary_f32(
+@@ -12749,6 +12836,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_rwkv_wkv6(params, tensor);
+             } break;
++        case GGML_OP_RWKV_WKV7:
++            {
++                ggml_compute_forward_rwkv_wkv7(params, tensor);
++            } break;
+         case GGML_OP_MAP_UNARY:
+             {
+                 ggml_unary_op_f32_t fun;
+@@ -13040,6 +13131,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_FLASH_ATTN_BACK:
+         case GGML_OP_SSM_CONV:
+         case GGML_OP_SSM_SCAN:
++        case GGML_OP_RWKV_WKV7:
+             {
+                 n_tasks = n_threads;
+             } break;
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index c180adc8..1976d78d 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -37,6 +37,7 @@
+ #include "ggml-cuda/unary.cuh"
+ #include "ggml-cuda/upscale.cuh"
+ #include "ggml-cuda/wkv6.cuh"
++#include "ggml-cuda/wkv7.cuh"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -2167,6 +2168,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_RWKV_WKV6:
+             ggml_cuda_op_rwkv_wkv6(ctx, dst);
+             break;
++        case GGML_OP_RWKV_WKV7:
++            ggml_cuda_op_rwkv_wkv7(ctx, dst);
++            break;
+         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+             ggml_cuda_cross_entropy_loss_back(ctx, dst);
+             break;
+@@ -3010,6 +3014,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_TIMESTEP_EMBEDDING:
+         case GGML_OP_LEAKY_RELU:
+         case GGML_OP_RWKV_WKV6:
++        case GGML_OP_RWKV_WKV7:
+             return true;
+         case GGML_OP_FLASH_ATTN_EXT: {
+ #ifndef FLASH_ATTN_AVAILABLE
+diff --git a/src/ggml-cuda/wkv7.cu b/src/ggml-cuda/wkv7.cu
+new file mode 100644
+index 00000000..4011fd24
+--- /dev/null
++++ b/src/ggml-cuda/wkv7.cu
+@@ -0,0 +1,101 @@
++// RWKV-7 time mixing on CUDA, ported from upstream ggml (src/ggml-cuda/wkv.cu, rwkv_wkv7_f32).
++// One block per (sequence, head); one thread per row of that head's S x S state.
++#include "common.cuh"
++#include "wkv7.cuh"
++
++template <int block_size>
++static __global__ void rwkv_wkv7_f32(const int B, const int T, const int C, const int H, const float * r, const float * w, const float * k, const float * v, const float * a, const float * b, const float * s, float * dst) {
++    const int tid = threadIdx.x;
++    const int bid = blockIdx.x;
++
++    const int head_size = block_size;
++    const int batch_i = bid / H;
++    const int head_i = bid % H;
++    const int state_size = C * head_size;
++    const int n_seq_tokens = T / B;
++
++    float state[head_size];
++    __shared__ float _r[head_size], _w[head_size], _k[head_size], _a[head_size], _b[head_size];
++
++    #pragma unroll
++    for (int i = 0; i < head_size; i++) {
++        state[i] = s[batch_i * state_size + head_i * head_size * head_size + tid * head_size + i];
++    }
++
++    for (int t = batch_i * n_seq_tokens * C + head_i * head_size + tid; t < (batch_i + 1) * n_seq_tokens * C + head_i * head_size + tid; t += C) {
++        __syncthreads();
++        _r[tid] = r[t];
++        _w[tid] = w[t];
++        _k[tid] = k[t];
++        _a[tid] = a[t];
++        _b[tid] = b[t];
++        __syncthreads();
++
++        float sa = 0;
++        #pragma unroll
++        for (int j = 0; j < head_size; j += 4) {
++            const float4 & av = (float4 &)(_a[j]);
++            const float4 & sv = (float4 &)(state[j]);
++            sa += av.x * sv.x;
++            sa += av.y * sv.y;
++            sa += av.z * sv.z;
++            sa += av.w * sv.w;
++        }
++
++        const float _v = v[t];
++        float y = 0;
++        #pragma unroll
++        for (int j = 0; j < head_size; j += 4) {
++            const float4 & rv = (float4 &)(_r[j]);
++            const float4 & wv = (float4 &)(_w[j]);
++            const float4 & kv = (float4 &)(_k[j]);
++            const float4 & bv = (float4 &)(_b[j]);
++            float4 & sv = (float4 &)(state[j]);
++
++            sv.x = sv.x * wv.x + kv.x * _v + sa * bv.x;
++            sv.y = sv.y * wv.y + kv.y * _v + sa * bv.y;
++            sv.z = sv.z * wv.z + kv.z * _v + sa * bv.z;
++            sv.w = sv.w * wv.w + kv.w * _v + sa * bv.w;
++
++            y += sv.x * rv.x;
++            y += sv.y * rv.y;
++            y += sv.z * rv.z;
++            y += sv.w * rv.w;
++        }
++        dst[t] = y;
++    }
++
++    #pragma unroll
++    for (int i = 0; i < head_size; i++) {
++        dst[T * C + batch_i * state_size + head_i * head_size * head_size + tid * head_size + i] = state[i];
++    }
++}
++
++void ggml_cuda_op_rwkv_wkv7(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const float * r_d = (const float *) dst->src[0]->data;
++    const float * w_d = (const float *) dst->src[1]->data;
++    const float * k_d = (const float *) dst->src[2]->data;
++    const float * v_d = (const float *) dst->src[3]->data;
++    const float * a_d = (const float *) dst->src[4]->data;
++    const float * b_d = (const float *) dst->src[5]->data;
++    const float * s_d = (const float *) dst->src[6]->data;
++
++    const int64_t B = dst->src[6]->ne[1];
++    const int64_t T = dst->src[0]->ne[2];
++    const int64_t C = dst->ne[0];
++    const int64_t H = dst->src[0]->ne[1];
++
++    float * dst_d = (float *) dst->data;
++
++    cudaStream_t stream = ctx.stream();
++
++    GGML_ASSERT(dst->src[6]->type == GGML_TYPE_F32);
++    GGML_ASSERT(C % H == 0);
++    GGML_ASSERT(C / H == CUDA_WKV7_BLOCK_SIZE || C / H == CUDA_WKV7_BLOCK_SIZE * 2);
++
++    if (C / H == CUDA_WKV7_BLOCK_SIZE) {
++        rwkv_wkv7_f32<CUDA_WKV7_BLOCK_SIZE><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
++    } else {
++        rwkv_wkv7_f32<CUDA_WKV7_BLOCK_SIZE * 2><<<B * H, C / H, 0, stream>>>(B, T, C, H, r_d, w_d, k_d, v_d, a_d, b_d, s_d, dst_d);
++    }
++}
+diff --git a/src/ggml-cuda/wkv7.cuh b/src/ggml-cuda/wkv7.cuh
+new file mode 100644
+index 00000000..84cebe52
+--- /dev/null
++++ b/src/ggml-cuda/wkv7.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++#define CUDA_WKV7_BLOCK_SIZE 64
++
++void ggml_cuda_op_rwkv_wkv7(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml.c b/src/ggml.c
+index 2bbe5f48..9dade916 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -968,6 +968,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GET_REL_POS",
+     "ADD_REL_POS",
+     "RWKV_WKV6",
++    "RWKV_WKV7",
+ 
+     "UNARY",
+ 
+@@ -987,7 +988,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_ADAMW",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
++static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1064,6 +1065,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "get_rel_pos(x)",
+     "add_rel_pos(x)",
+     "rwkv_wkv6(k, v, r, tf, td, s)",
++    "rwkv_wkv7(r, w, k, v, a, b, s)",
+ 
+     "unary(x)",
+ 
+@@ -1083,7 +1085,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "adamw(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 82, "GGML_OP_COUNT != 82");
++static_assert(GGML_OP_COUNT == 83, "GGML_OP_COUNT != 83");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4667,6 +4669,54 @@ struct ggml_tensor * ggml_rwkv_wkv6(
+     return result;
+ }
+ 
++// ggml_rwkv_wkv7
++
++struct ggml_tensor * ggml_rwkv_wkv7(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * r,
++        struct ggml_tensor  * w,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b,
++        struct ggml_tensor  * state) {
++    GGML_ASSERT(ggml_is_contiguous(r));
++    GGML_ASSERT(ggml_is_contiguous(w));
++    GGML_ASSERT(ggml_is_contiguous(k));
++    GGML_ASSERT(ggml_is_contiguous(v));
++    GGML_ASSERT(ggml_is_contiguous(a));
++    GGML_ASSERT(ggml_is_contiguous(b));
++    GGML_ASSERT(ggml_is_contiguous(state));
++
++    const int64_t S = k->ne[0];
++    const int64_t H = k->ne[1];
++    const int64_t n_tokens = k->ne[2];
++    const int64_t n_seqs = state->ne[1];
++    {
++        GGML_ASSERT(r->ne[0] == S && r->ne[1] == H && r->ne[2] == n_tokens);
++        GGML_ASSERT(w->ne[0] == S && w->ne[1] == H && w->ne[2] == n_tokens);
++        GGML_ASSERT(v->ne[0] == S && v->ne[1] == H && v->ne[2] == n_tokens);
++        GGML_ASSERT(a->ne[0] == S && a->ne[1] == H && a->ne[2] == n_tokens);
++        GGML_ASSERT(b->ne[0] == S && b->ne[1] == H && b->ne[2] == n_tokens);
++        GGML_ASSERT(ggml_nelements(state) == S * S * H * n_seqs);
++    }
++
++    // concat output and new_state
++    const int64_t ne[4] = { S * H, n_tokens + S * n_seqs, 1, 1 };
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    result->op     = GGML_OP_RWKV_WKV7;
++    result->src[0] = r;
++    result->src[1] = w;
++    result->src[2] = k;
++    result->src[3] = v;
++    result->src[4] = a;
++    result->src[5] = b;
++    result->src[6] = state;
++
++    return result;
++}
++
+ // ggml_unary
+ 
+ static struct ggml_tensor * ggml_unary_impl(

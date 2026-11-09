@@ -198,12 +198,14 @@ void push_recent_tokens(xenon_state * state, const uint32_t * tokens, size_t cou
 }
 
 // Tokens per rwkv_eval_sequence call during prefill. XENON_PREFILL_CHUNK overrides it for
-// measurement.
+// measurement. With RWKV-7's WKV and L2-norm steps native (inference-engine/patches/), bigger
+// chunks keep the GPU busy: on the RTX 2060, ~1500 tokens took 7.2 s at 16, 1.7 s at 128 and
+// 1.4 s at 256, with ~20 MB more VRAM at 128.
 size_t prefill_chunk_size() {
     static const size_t size = [] {
         const char * env = std::getenv("XENON_PREFILL_CHUNK");
         long v = env ? std::strtol(env, nullptr, 10) : 0;
-        return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(16);
+        return v > 0 ? static_cast<size_t>(v) : static_cast<size_t>(128);
     }();
     return size;
 }

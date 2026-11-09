@@ -1,0 +1,26 @@
+diff --git a/rwkv_graph.inc b/rwkv_graph.inc
+index b4b9a2b..f399462 100644
+--- a/rwkv_graph.inc
++++ b/rwkv_graph.inc
+@@ -431,7 +431,9 @@ static struct ggml_tensor * rwkv_att_v7(
+ 
+     struct ggml_tensor * k = ggml_mul_mat(ctx, layer.att_key, xk);
+     struct ggml_tensor * kk = ggml_reshape_3d(ctx, ggml_mul(ctx, k, layer.att_k_k), head_size, head_count, sequence_length);
+-    kk = rwkv_l2norm(ctx, kk);
++    // L2 norm per head as a native op so it stays on the GPU: x / |x| equals rms_norm(x) / sqrt(n).
++    // rwkv_l2norm (a CPU-only custom op) forced a GPU->CPU round trip in every layer.
++    kk = ggml_scale(ctx, ggml_rms_norm(ctx, kk, 1e-24f), 1.0f / sqrtf((float) head_size));
+ 
+     struct ggml_tensor * ka = ggml_mul(ctx, k, layer.att_k_a);
+     k = ggml_add(ctx, k, ggml_sub(ctx, ggml_mul(ctx, a, ka), ka));
+@@ -457,7 +459,9 @@ static struct ggml_tensor * rwkv_att_v7(
+     v = ggml_reshape_3d(ctx, v, head_size, head_count, sequence_length);
+     a = ggml_reshape_3d(ctx, a, head_size, head_count, sequence_length);
+ 
+-    struct ggml_tensor * wkv_out = rwkv_wkv_v7(ctx, state.att_heads, r, w, k, v, ggml_neg(ctx, kk), ggml_mul(ctx, kk, a));
++    // Native op (patched into ggml, see inference-engine/patches/): runs on CUDA too, unlike the
++    // ggml_map_custom1 CPU version in rwkv_operators_wkv_v7.inc, which forced a GPU->CPU round trip.
++    struct ggml_tensor * wkv_out = ggml_rwkv_wkv7(ctx, r, w, k, v, ggml_neg(ctx, kk), ggml_mul(ctx, kk, a), state.att_heads);
+     x = ggml_view_1d(ctx, wkv_out, n_embed * sequence_length, 0);
+ 
+     state.att_heads = ggml_view_1d(ctx, wkv_out, n_embed * head_size, n_embed * sequence_length * sizeof(float));

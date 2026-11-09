@@ -5,6 +5,7 @@
 # On the RTX 2060 laptop, run ./build_cuda.sh instead.
 set -euo pipefail
 cd "$(dirname "$0")"
+./apply_patches.sh
 
 cmake -B rwkv.cpp/build-cpu -S rwkv.cpp \
   -DRWKV_CUBLAS=OFF \

@@ -157,6 +157,17 @@ $env:CUDA_PATH = [System.Environment]::GetEnvironmentVariable("CUDA_PATH","Machi
 `$env:CUDA_PATH` from the process environment, which a pre-existing shell won't have picked up
 after a fresh CUDA Toolkit install.)
 
+### 0. Apply our patches to rwkv.cpp (every platform, once per checkout)
+
+```bash
+./apply_patches.sh     # Git Bash on Windows; build_cpu.sh / build_cuda.sh run it themselves
+```
+`patches/ggml-rwkv-wkv7.patch` adds ggml's native RWKV-7 time-mixing op (`GGML_OP_RWKV_WKV7`,
+CPU and CUDA, ported from upstream ggml), and `patches/rwkv-cpp-native-wkv7.patch` makes
+rwkv.cpp's RWKV-7 graph use it. Without them, RWKV-7's WKV step runs as a CPU-only custom op
+even when every layer is on the GPU, so each layer round-trips through the CPU. The patches
+are kept here rather than in a fork of the submodule; the script skips any already applied.
+
 ### 1a. Build rwkv.cpp, CPU-only
 
 ```powershell
