@@ -259,7 +259,7 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                     let examples = example_bank::examples_for(app, &last_question, AGENT);
                     if !examples.is_empty() {
                         eprintln!("xenon2: code API using {} rated example(s) in this prompt", examples.len());
-                        prompt.prior = splice_examples(&prompt.prior, &examples, Style::for_model(model_name));
+                        prompt.last = splice_examples("", &examples, Style::for_model(model_name)) + &prompt.last;
                     }
                     chat_completion(&mut stream, app, engine, &chat, &prompt)
                 }
@@ -440,10 +440,10 @@ Xenon: ", &format!("
     Ok(Prompt { prior, last: format!("User: {question}\n\n{}:{}", style.label, style.opener), params })
 }
 
-/// Inserts rated examples right before the final (uncached) part of `prior`, as "User: ... /
-/// <label>: ..." turns, same shape as the chat window's example bank (see `example_bank.rs`).
-/// Appending them anywhere else would land after the cached prefix boundary and defeat the
-/// prefix cache on every request; here they ride along with whatever in `prior` isn't cached yet.
+/// Appends rated examples to `text` as "User: ... / <label>: ..." turns, the same shape as the
+/// chat window's example bank (see `example_bank.rs`). They go in the uncached final part of the
+/// prompt, just before the new question: in the cached `prior` they would change it, and the next
+/// follow-up (whose history doesn't have them) would miss the cache and re-read everything.
 fn splice_examples(prior: &str, examples: &[example_bank::Example], style: Style) -> String {
     let mut out = prior.to_string();
     for example in examples {
