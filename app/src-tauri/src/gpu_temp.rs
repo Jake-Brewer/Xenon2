@@ -16,10 +16,13 @@ pub const HOT_C: u32 = 80;
 pub const COOL_C: u32 = 72;
 /// From here up, each token waits `pace_ms_per_c()` per degree above `pace_from_c() - 1`, so the
 /// GPU settles around a target temperature instead of sawtoothing up to the hard pause at `HOT_C`.
-/// `XENON_PACE_FROM_C` and `XENON_PACE_MS_PER_C` override the defaults (74 °C, 12 ms) so the pace
-/// can be swept at runtime; a lower start or a steeper slope holds a cooler, steadier temperature.
-const DEFAULT_PACE_FROM_C: u32 = 74;
-const DEFAULT_PACE_MS_PER_C: u64 = 12;
+/// `XENON_PACE_FROM_C` and `XENON_PACE_MS_PER_C` override the defaults so the pace can be swept at
+/// runtime (scripts/pace_sweep.py). Defaults from that sweep on the RTX 2060 laptop, 500-token
+/// replies: from 76 C at 8 ms/C gave 19.0 tok/s sustained with no pauses (peak 77 C); 74 C at
+/// 12 ms/C gave 15.6; pacing earlier or harder was slower still; no pacing gave 14.1 with a 13 s
+/// pause at 80 C.
+const DEFAULT_PACE_FROM_C: u32 = 76;
+const DEFAULT_PACE_MS_PER_C: u64 = 8;
 const POLL: Duration = Duration::from_secs(1);
 
 fn env_u32(name: &str, default: u32) -> u32 {
