@@ -549,11 +549,27 @@ it reading the 6.7k-character overview cold. A follow-up took 3 s (cached), thou
 was wrong (it named `persistence.ts` for the Stop button). Feedback examples now go in the
 uncached tail of coding prompts, so they no longer break the cache for the next follow-up.
 
-**Next: GPU prefill for RWKV-7.** Reading (prefill) runs at ~35 tok/s at best because the
-vendored ggml has no GPU kernel for RWKV-7's WKV op (rwkv.cpp runs its own CPU version through
-`ggml_map_custom1`). Upstream ggml has `GGML_OP_RWKV_WKV7` with a CUDA kernel. Plan: carry it as
-a patch applied at build time (not a fork of the submodule), build into a separate folder,
-check that logits match the current engine, measure, and only then switch the app.
+**RWKV-7 fully on the GPU (2026-11-08) [x]** — reading was slow (~35 tok/s at best) because two
+steps of every RWKV-7 layer were CPU-only `ggml_map_custom` ops in rwkv.cpp: the WKV time mix and
+the L2 norm of `kk`. With all layers offloaded, ggml's scheduler still sent each layer's data to
+the CPU and back for them. `inference-engine/patches/` now adds ggml's native
+`GGML_OP_RWKV_WKV7` (CPU and CUDA, ported from upstream ggml) and computes the L2 norm as
+`rms_norm(x) / sqrt(n)`, a native op. `apply_patches.sh` applies them to the submodule (no fork);
+`build_cpu.sh`/`build_cuda.sh` run it first. Default prefill chunk raised from 16 to 128 tokens.
+Measured on the RTX 2060, G1l 2.9B Q5_1, with another project's jobs loading the CPU:
+
+| | old build | patched |
+|---|---|---|
+| ~1500-token prompt, time to first token | 96 s | 1.7 s |
+| 200 tokens one at a time | 281 s | 10 s |
+| VRAM | ~3.0 GB | ~3.0 GB (+20 MB at chunk 128) |
+
+Accuracy, by comparing the two builds' logits on `app/README.md` (rwkv.cpp's Python bindings,
+`scratchpad` script): mean loss per token 2.885 old vs 2.874 patched, 98% same top-1 token, KL
+0.002 after a 1500-token prefill (also 0.002 at chunk 128). The CPU path (0 GPU layers): KL
+0.00006, 100% same top-1, same speed, so CPU-only machines lose nothing. Greedy text can still
+differ between builds or chunk sizes, since summation order changes floating-point rounding.
+The prior "35 tok/s" reading cap and the advice to keep sent context small are now out of date.
 
 ## Future work (not yet scheduled)
 

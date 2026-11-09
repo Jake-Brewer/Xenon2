@@ -26,7 +26,7 @@ function settings() {
     token: config.get<string>("token", ""),
     maxTokens: config.get<number>("maxTokens", 262144),
     temperature: config.get<number>("temperature", 0.3),
-    maxContextChars: config.get<number>("maxContextChars", 3000),
+    maxContextChars: config.get<number>("maxContextChars", 0),
   };
 }
 
