@@ -62,58 +62,72 @@ uint32_t sample_logits(
         logits = logits_buf.data();
     }
 
+    // Greedy: the largest logit is the most probable token; no softmax needed.
+    if (temperature <= 0.0f) {
+        return static_cast<uint32_t>(std::max_element(logits, logits + n_vocab) - logits);
+    }
+
+    // Everything below gives the same distribution as rwkv.cpp's sampling.py, but touches only
+    // the few tokens top-p keeps instead of sorting and re-weighting all 65,536 every token: that
+    // took 9 ms a token, a sixth of the whole step, on the RTX 2060 laptop.
     std::vector<float> probs(n_vocab);
-
     float max_logit = *std::max_element(logits, logits + n_vocab);
-
     double sum = 0.0;
     for (size_t i = 0; i < n_vocab; i++) {
-        probs[i] = std::exp(static_cast<double>(logits[i] - max_logit));
+        probs[i] = std::exp(logits[i] - max_logit);
         sum += probs[i];
     }
+    const float inv_sum = static_cast<float>(1.0 / sum);
     for (size_t i = 0; i < n_vocab; i++) {
-        probs[i] = static_cast<float>(probs[i] / sum);
+        probs[i] *= inv_sum;
     }
 
-    if (temperature <= 0.0f) {
-        return static_cast<uint32_t>(std::max_element(probs.begin(), probs.end()) - probs.begin());
-    }
-
+    // The kept tokens: with top-p, the most probable ones until their total passes top_p, plus
+    // any others exactly as probable as the last one (as the original cutoff comparison kept).
+    // The top 64 almost always suffice; the sort widens until they do.
+    std::vector<uint32_t> kept;
     if (top_p < 1.0f && top_p > 0.0f) {
-        std::vector<float> sorted_probs = probs;
-        std::sort(sorted_probs.begin(), sorted_probs.end(), std::greater<float>());
-
-        double cumulative = 0.0;
-        float cutoff = sorted_probs.back();
-        for (float p : sorted_probs) {
-            cumulative += p;
-            if (cumulative > top_p) {
-                cutoff = p;
-                break;
+        std::vector<uint32_t> order(n_vocab);
+        std::iota(order.begin(), order.end(), 0u);
+        auto by_prob = [&](uint32_t a, uint32_t b) { return probs[a] > probs[b]; };
+        float cutoff = -1.0f;
+        for (size_t k = std::min<size_t>(64, n_vocab); cutoff < 0.0f; k = std::min(k * 4, n_vocab)) {
+            std::partial_sort(order.begin(), order.begin() + k, order.end(), by_prob);
+            double cumulative = 0.0;
+            for (size_t i = 0; i < k; i++) {
+                cumulative += probs[order[i]];
+                if (cumulative > top_p) {
+                    cutoff = probs[order[i]];
+                    break;
+                }
+            }
+            if (cutoff < 0.0f && k == n_vocab) {
+                cutoff = probs[order[n_vocab - 1]];
             }
         }
-
-        for (size_t i = 0; i < n_vocab; i++) {
-            if (probs[i] < cutoff) probs[i] = 0.0f;
-        }
-    }
-
-    if (temperature != 1.0f) {
-        double s = 0.0;
-        for (size_t i = 0; i < n_vocab; i++) {
-            probs[i] = std::pow(probs[i], 1.0f / temperature);
-            s += probs[i];
-        }
-        for (size_t i = 0; i < n_vocab; i++) {
-            probs[i] = static_cast<float>(probs[i] / s);
+        for (uint32_t t : order) {
+            if (probs[t] < cutoff) break;
+            kept.push_back(t);
         }
     } else {
-        double s = std::accumulate(probs.begin(), probs.end(), 0.0);
-        for (size_t i = 0; i < n_vocab; i++) probs[i] = static_cast<float>(probs[i] / s);
+        kept.resize(n_vocab);
+        std::iota(kept.begin(), kept.end(), 0u);
     }
 
-    std::discrete_distribution<uint32_t> dist(probs.begin(), probs.end());
-    return dist(rng);
+    // Temperature reshapes the kept probabilities (p^(1/T), renormalized), then one draw.
+    std::vector<double> weights(kept.size());
+    double total = 0.0;
+    for (size_t i = 0; i < kept.size(); i++) {
+        double p = probs[kept[i]];
+        weights[i] = temperature != 1.0f ? std::pow(p, 1.0 / temperature) : p;
+        total += weights[i];
+    }
+    double r = std::uniform_real_distribution<double>(0.0, total)(rng);
+    for (size_t i = 0; i < kept.size(); i++) {
+        r -= weights[i];
+        if (r < 0.0) return kept[i];
+    }
+    return kept.back();
 }
 
 // Returns the length of the prefix of `buf` that consists of complete, valid UTF-8 sequences,
