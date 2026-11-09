@@ -62,9 +62,11 @@ export async function runFolderAgentCommand(connection: () => Connection): Promi
     vscode.window.showWarningMessage("Open a folder first, then ask Xenon to work in it.");
     return;
   }
+  const open = vscode.window.activeTextEditor?.document.uri;
   const relativeFiles = await vscode.window.showInputBox({
-    prompt: "Which Python files should Xenon work on? (comma-separated, relative to the workspace root)",
+    prompt: "Which files should Xenon work on? (comma-separated, relative to the workspace root)",
     placeHolder: "e.g. src/util.py, tests/test_util.py",
+    value: open?.scheme === "file" ? vscode.workspace.asRelativePath(open, false) : undefined,
   });
   if (!relativeFiles) return;
   const files = relativeFiles

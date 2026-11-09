@@ -589,6 +589,43 @@ it to `memory.rs`). One correction each fixed all three on the next ask. "Tell m
 repo" through the VS Code overview now takes ~25 s (was 246 s), nearly all of it writing the
 answer; precise lookups like "which file has the Stop button" still come back wrong.
 
+## Phase 12 — Maintaining its own code base [ ] (started 2026-11-09)
+
+Xenon's scope is now Xenon2 itself: answering questions about this repo, editing it, and running
+its checks. Model and feature work is judged by that.
+
+**Keyboard lag fixed [x]** — with every layer on the GPU, each of the 6 ggml CPU workers spun a
+core waiting on it (60 s of CPU in a 14 s, 200-token run) and typing lagged. One worker is faster
+(23.1 vs 19.8 tok/s, 10 s of CPU). The app now uses one worker when the whole model is on the GPU,
+physical cores minus one otherwise, and runs below normal priority. While Xenon writes, the app
+now uses about one core.
+
+**Exam from the repo [x]** — `training/make_self_data.py` writes 643 items with answers taken
+from the repo: 560 "which file defines X" (from the source), 54 commit diff → message, 29 file →
+repo-map description. Every 5th is held out. `--score where` asks the running app.
+
+**Code search [x]** — the coding API takes an optional `workspace` folder; `code_search.rs` finds
+the lines that best match the question (keywords weighted by rarity, identifiers and their
+definitions weighted up, dependencies and submodules skipped; ~60 ms on this repo) and puts them,
+grep-style, in front of the question. The VS Code chat sends its folder. Held-out "where" items:
+
+| | exact path | right file |
+|---|---|---|
+| no search | 0/100 | 1/100 |
+| search | 37/100 | 87/100 |
+
+Most misses name the right file but drop the leading folders (`src/inference.rs` for
+`app/src-tauri/src/inference.rs`): a good target for training on the 460 "where" training items.
+
+**Folder agent beyond Python [x]** — checks an edit with pytest, `cargo test`, `npm test`, or
+`vue-tsc`/`tsc`, picked from the nearest `Cargo.toml`/`package.json`, with a time limit and no
+console windows. Its snapshot ignores untracked files and submodule changes (this repo always has
+both), so runs here get an undo point. Debug builds won't edit `app/src-tauri` (tauri dev would
+restart the app mid-run).
+
+Next: train on the "where" and commit items (state tuning or LoRA) and re-score; score commit
+messages; let the folder agent find which files to edit with code search instead of a list.
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
