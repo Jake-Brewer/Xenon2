@@ -1,0 +1,1 @@
+Raise the request timeout from 30 to 60 seconds.

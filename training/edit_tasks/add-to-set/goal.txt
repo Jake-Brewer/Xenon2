@@ -1,0 +1,1 @@
+Add "models" to SKIP_DIRS in walker.py, so the walker stops listing model weight files.

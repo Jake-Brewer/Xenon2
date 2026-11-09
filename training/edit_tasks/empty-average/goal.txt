@@ -1,0 +1,1 @@
+Make the failing test pass: the average of an empty list should be 0.

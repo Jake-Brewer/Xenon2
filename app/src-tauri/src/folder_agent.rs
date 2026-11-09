@@ -29,12 +29,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::code_api::{self, ChatMessage, ChatRequest, Style};
-use crate::edit_blocks;
 use crate::inference::{self, EngineState};
 
 pub const MAX_EDITS: u32 = 5;
 pub const MAX_RUNS: u32 = 3;
 pub const MAX_SECONDS: u64 = 10 * 60;
+/// Lines shown on each side of the lines Xenon rewrites, as context it can't change.
+const CONTEXT_LINES: usize = 3;
 /// Files to work on when none are named: few, since each is read whole into every prompt.
 const FILES_FROM_SEARCH: usize = 3;
 
@@ -442,6 +443,21 @@ fn snap_to_list(written: &str, files: &[String]) -> Option<String> {
     found.next().is_none().then(|| first.clone())
 }
 
+/// `text` with its lines `from..to` (0-based, end exclusive) replaced by `new`, keeping the file's
+/// line endings and its final newline.
+fn replace_lines(text: &str, from: usize, to: usize, new: &str) -> String {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<&str> = lines[..from].to_vec();
+    out.extend(new.lines());
+    out.extend(&lines[to..]);
+    let mut joined = out.join(newline);
+    if text.ends_with('\n') {
+        joined.push_str(newline);
+    }
+    joined
+}
+
 /// The language name for a file's code fence.
 fn fence(path: &str) -> &'static str {
     match path.rsplit('.').next().unwrap_or("") {
@@ -584,7 +600,6 @@ pub fn run(
     };
     let mut budget = Budget::new();
     let mut last_failure = String::new();
-    let mut last_missed = String::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
     // With no names at all, search the folder for the goal and work on the best matches.
@@ -660,16 +675,25 @@ pub fn run(
         // Xenon recalls lines it read far back poorly, and given SEARCH/REPLACE it either
         // misremembered a long line (five times in a row) or, shown the lines first, copied them
         // into both halves. What it does well is rewrite lines shown just before its reply. So
-        // the agent picks the lines (around the best match for the goal, or for what the last
-        // try got wrong), quotes them at the start of the reply, and Xenon writes their new
-        // version. Swapping them in reuses the edit-block code, with the quoted lines as SEARCH.
-        let query = if last_missed.is_empty() { goal.to_string() } else { std::mem::take(&mut last_missed) };
-        let Some(lines) = edit_blocks::window_of(&current, &query, 4, 8) else {
+        // the agent picks the line that best matches the goal and has Xenon rewrite it and its
+        // two neighbours. A few lines on either side are shown as context but never replaced:
+        // when they were part of the rewrite, Xenon dropped one of them.
+        let file_lines: Vec<&str> = current.lines().collect();
+        let Some(best) = crate::code_search::best_line(&current, goal) else {
             report.stopped_reason = format!("couldn't find where in {relative_path} the goal applies");
             break;
         };
+        let (from, to) = (best.saturating_sub(1), (best + 2).min(file_lines.len()));
+        let target = file_lines[from..to].join("\n");
+        let before = file_lines[from.saturating_sub(CONTEXT_LINES)..from].join("\n");
+        let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
         let lang = fence(&relative_path);
-        let start = format!("FILE: {relative_path}\nThese lines of it:\n```{lang}\n{lines}\n```\nwith the goal done, become:\n```{lang}\n");
+        let start = format!(
+            "FILE: {relative_path}\nLines {first}-{to} of it are:\n```{lang}\n{target}\n```\n\
+             (just before them:\n```{lang}\n{before}\n```\nand just after:\n```{lang}\n{after}\n```)\n\
+             With the goal done, lines {first}-{to} become:\n```{lang}\n",
+            first = from + 1
+        );
         let start_len = start.len();
         let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
         let reply = ask(engine, model_name, &question, &start, &closed, deadline, cancel)?;
@@ -678,26 +702,19 @@ pub fn run(
             report.stopped_reason = "the model's reply had no new lines".to_string();
             break;
         };
-        let written = written.trim_end_matches(['\n', '\r']).to_string();
-        if written.trim() == lines.trim() {
+        let written = written.trim_end_matches(['\n', '\r']);
+        if written.trim() == target.trim() {
             // Small models often copy the lines back unchanged while meaning to change them.
             budget.edits += 1;
             report.narration.push(format!("Xenon's edit to {relative_path} changed nothing; asking again"));
             last_failure = format!(
-                "Your last edit to `{relative_path}` wrote these lines back unchanged:\n```{lang}\n{lines}\n```\n\
+                "Your last edit to `{relative_path}` wrote these lines back unchanged:\n```{lang}\n{target}\n```\n\
                  This time, change them so the goal is done.\n\n"
             );
             continue;
         }
-        let block = edit_blocks::Block { search: lines.clone(), replace: written };
-        let code = match edit_blocks::apply(&current, &block) {
-            Ok(code) => code,
-            Err(e) => {
-                report.stopped_reason = format!("couldn't put the new lines into {relative_path}: {e}");
-                break;
-            }
-        };
-        let why = format!("rewrote the lines starting `{}`", lines.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim());
+        let code = replace_lines(&current, from, to, written);
+        let why = format!("rewrote lines {}-{to}", from + 1);
         if code.trim() == current.trim() {
             report.narration.push(format!("Stopped: Xenon proposed {relative_path} unchanged"));
             report.stopped_reason = "finished".to_string();
@@ -891,6 +908,13 @@ mod tests {
         assert!(!first_line_done("FILE: src/a.rs"));
         assert!(first_line_done("FILE: src/a.rs\n"));
         assert!(first_line_done("FILE:\nsrc/a.rs\n"));
+    }
+
+    #[test]
+    fn replacing_lines_keeps_the_rest_and_the_line_endings() {
+        assert_eq!(replace_lines("a\nb\nc\nd\n", 1, 3, "B\nC2\nC3"), "a\nB\nC2\nC3\nd\n");
+        assert_eq!(replace_lines("a\r\nb\r\nc\r\n", 1, 2, "x"), "a\r\nx\r\nc\r\n");
+        assert_eq!(replace_lines("a\nb", 0, 1, ""), "b");
     }
 
     #[test]

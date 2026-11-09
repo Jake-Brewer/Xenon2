@@ -137,6 +137,39 @@ pub fn snap_path(root: &Path, written: &str) -> Option<String> {
     found.next().is_none().then_some(first)
 }
 
+/// The line of `text` (0-based) that best matches `question`, weighted as `search` weighs files:
+/// common words count for nothing, rare ones and identifiers for more, a definition for most.
+pub fn best_line(text: &str, question: &str) -> Option<usize> {
+    let words = keywords(question);
+    let lowered: Vec<String> = text.lines().map(str::to_lowercase).collect();
+    let weights: Vec<f32> = words
+        .iter()
+        .map(|w| {
+            let df = lowered.iter().filter(|l| l.contains(&w.text)).count();
+            if df == 0 {
+                0.0
+            } else {
+                ((lowered.len() as f32 + 1.0) / df as f32).ln() * if w.strong { 3.0 } else { 1.0 }
+            }
+        })
+        .collect();
+    let (best, score) = text
+        .lines()
+        .zip(&lowered)
+        .enumerate()
+        .map(|(i, (line, lower))| {
+            let score: f32 = words
+                .iter()
+                .zip(&weights)
+                .filter(|(w, _)| lower.contains(&w.text))
+                .map(|(w, weight)| if w.strong && defines(line, &w.text) { weight * 5.0 } else { *weight })
+                .sum();
+            (i, score)
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))?;
+    (score > 0.0).then_some(best)
+}
+
 /// One file's match: its path and best lines (1-based number, text), in file order.
 pub struct Hit {
     pub path: String,
@@ -288,6 +321,17 @@ mod tests {
         assert_eq!(snap_path(dir.path(), "`App.vue`").as_deref(), Some("ui/App.vue"));
         assert_eq!(snap_path(dir.path(), "src/missing.rs"), None);
         assert_eq!(snap_path(dir.path(), "ine.rs"), None, "a suffix must start at a folder boundary");
+    }
+
+    #[test]
+    fn the_best_line_ignores_common_words() {
+        let text = "// Turns what's open in the editor into the code block.\n\
+                    /** Directories that never help. */\n\
+                    export const SKIP_DIRS = new Set([\"node_modules\", \".git\"]);\n\
+                    export function formatOverview(workspace) {}\n";
+        let goal = "Add \"models\" to SKIP_DIRS in the extension's context.ts, so the workspace overview stops listing the model files.";
+        assert_eq!(best_line(text, goal), Some(2));
+        assert_eq!(best_line(text, "what is the weather"), None);
     }
 
     #[test]

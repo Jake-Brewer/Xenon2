@@ -1,0 +1,8 @@
+"""Settings for the downloader."""
+
+RETRIES = 3
+BACKOFF_SECONDS = 2
+REQUEST_TIMEOUT_SECONDS = 30
+MAX_CONNECTIONS = 8
+USER_AGENT = "downloader/1.0"
+CHUNK_BYTES = 65536

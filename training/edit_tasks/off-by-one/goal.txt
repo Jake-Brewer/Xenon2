@@ -1,0 +1,1 @@
+last_n returns one item too many. Fix it so last_n(items, n) returns the last n items.
