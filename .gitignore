@@ -23,3 +23,6 @@ voice-pipeline/models/*.onnx.json
 
 # Eval outputs
 training/out/
+
+# cargo-mutants results (mutation testing of app/src-tauri)
+app/src-tauri/mutants.out*/
