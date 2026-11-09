@@ -185,12 +185,12 @@ impl Budget {
 
 /// Asks the model a plain coding-API question and returns its reply as plain text (no
 /// streaming, no example-bank splicing — this loop's own prompts carry their own context).
-fn ask(engine: &EngineState, model_name: &str, question: &str) -> Result<String, String> {
+fn ask(engine: &EngineState, model_name: &str, question: &str, deadline: Instant, cancel: &AtomicBool) -> Result<String, String> {
     let style = Style::for_model(model_name);
     let request = ChatRequest {
         messages: vec![ChatMessage { role: "user".to_string(), content: serde_json::Value::String(question.to_string()) }],
         stream: false,
-        max_tokens: Some(1200),
+        max_tokens: Some(inference::MAX_REPLY_TOKENS),
         max_completion_tokens: None,
         temperature: Some(0.2),
         top_p: None,
@@ -200,7 +200,7 @@ fn ask(engine: &EngineState, model_name: &str, question: &str) -> Result<String,
     let mut text = String::new();
     let mut sink = |piece: &str| {
         text.push_str(piece);
-        !reply_complete(&text)
+        !reply_complete(&text) && Instant::now() < deadline && !cancel.load(Ordering::Relaxed)
     };
     inference::generate_code(engine, &prompt.prior, &prompt.last, prompt.params, &mut sink)?;
     Ok(text.trim().to_string())
@@ -387,7 +387,8 @@ pub fn run(
              `WHY:` giving a one-sentence reason. If the goal is already met and nothing needs to \
              change, reply with exactly `DONE: <one-sentence reason>` instead."
         );
-        let reply = ask(engine, model_name, &question)?;
+        let deadline = budget.started + Duration::from_secs(MAX_SECONDS);
+        let reply = ask(engine, model_name, &question, deadline, cancel)?;
 
         if !reply.contains("FILE:") {
             if let Some(reason) = reason_after(&reply, "DONE:") {

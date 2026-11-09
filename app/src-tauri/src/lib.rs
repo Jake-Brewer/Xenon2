@@ -170,6 +170,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             inference::generate_response,
+            inference::stop_generation,
             inference::get_model_name,
             inference::get_inference_device,
             persistence::save_conversation_file,

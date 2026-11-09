@@ -32,8 +32,9 @@ pub const DEFAULT_PORT: u16 = 47811;
 const PORT_ATTEMPTS: u16 = 10;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_MAX_TOKENS: i32 = 800;
-const MAX_MAX_TOKENS: i32 = 2048;
+// Replies are unbounded by design; the client's Stop (hanging up) ends a long one.
+const DEFAULT_MAX_TOKENS: i32 = inference::MAX_REPLY_TOKENS;
+const MAX_MAX_TOKENS: i32 = inference::MAX_REPLY_TOKENS;
 pub const MODEL_ID: &str = "xenon";
 /// Feedback agent tag for the coding API, so its examples never mix with chat's.
 pub const AGENT: &str = "code";
@@ -718,7 +719,7 @@ Assistant: <think></think>");
     fn clamps_sampling_settings() {
         let parsed: ChatRequest = serde_json::from_value(json!({
             "messages": [{ "role": "user", "content": "hi" }],
-            "max_tokens": 100000, "temperature": -1.0, "top_p": 0.0,
+            "max_tokens": 10_000_000, "temperature": -1.0, "top_p": 0.0,
         }))
         .unwrap();
         let params = build_prompt_world(&parsed).unwrap().params;

@@ -278,9 +278,20 @@ type MemoryProgressPayload = {
 type MemoryDonePayload = { filesCopied: number; totalBytes: number };
 type MemoryErrorPayload = { message: string };
 
+// Replies have no length cap, so this is how a long one ends. The backend stops at the next token
+// and the usual generation-done event finishes the message with what was written so far.
+function stopReply() {
+  invoke("stop_generation").catch((err) => console.warn("[App] stop_generation failed:", err));
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape" && store.generating) stopReply();
+}
+
 onMounted(async () => {
   applyViewport();
   window.addEventListener("resize", applyViewport);
+  window.addEventListener("keydown", onKeydown);
 
   // Phase 5: fetch the backend's actually-loaded model name first (so any conversation created
   // or loaded afterwards has a real fallback value -- see store.newChat/autoSave), then restore
@@ -368,6 +379,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener("resize", applyViewport);
+  window.removeEventListener("keydown", onKeydown);
   unlistenToken?.();
   unlistenDone?.();
   unlistenError?.();
@@ -437,6 +449,10 @@ onUnmounted(() => {
         <div v-if="store.modelMismatchWarning" class="error-banner model-mismatch-banner">
           {{ store.modelMismatchWarning }}
           <button class="dismiss-btn" title="Dismiss" @click="store.modelMismatchDismissed = true">✕</button>
+        </div>
+
+        <div v-if="store.generating" class="stop-row">
+          <button class="stop-btn" title="Stop the reply (Esc)" @click="stopReply">■ Stop</button>
         </div>
 
         <MessageInput
@@ -618,6 +634,27 @@ onUnmounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
+}
+
+.stop-row {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  padding: 0.3rem 0 0;
+}
+
+.stop-btn {
+  background: #2a2a2e;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 6px;
+  padding: 0.3rem 0.9rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.stop-btn:hover {
+  background: #3a3a40;
 }
 
 .error-banner.file-error {

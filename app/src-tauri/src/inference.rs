@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::ffi::{c_void, CStr, CString};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -525,6 +526,19 @@ fn volatile_header_text(facts: &[sloth_memory::SlothFact], examples: &[example_b
 
 const STOP_SEQUENCES: &[&str] = &["\n\nUser:", "\n\nuser:"];
 
+/// Reply length is meant to be unbounded, like the context. Replies end on their own at a stop
+/// sequence, and the user ends a long one with Stop (`stop_generation`); the engine just needs
+/// some positive number, so this is a 256k backstop rather than a real limit.
+pub(crate) const MAX_REPLY_TOKENS: i32 = 262_144;
+
+/// Set by the chat window's Stop button; the token callback ends the reply at the next token.
+static STOP_CHAT: AtomicBool = AtomicBool::new(false);
+
+#[tauri::command]
+pub fn stop_generation() {
+    STOP_CHAT.store(true, Ordering::Relaxed);
+}
+
 /// How many trailing bytes of `text` are a proper prefix of a stop sequence. Those bytes stay
 /// buffered so the chat never shows the next "User:" prompt, or a cursor sitting on it.
 fn stop_hold_len(text: &str) -> usize {
@@ -560,6 +574,9 @@ fn emit_visible(ctx: &CallbackCtx, text: &str) {
 /// Appends one generated fragment. Returns false when the model has started the next user turn
 /// and generation should stop. The "User:" text itself is not emitted.
 fn absorb_token(ctx: &CallbackCtx, text: &str) -> bool {
+    if STOP_CHAT.load(Ordering::Relaxed) {
+        return false;
+    }
     if text.is_empty() {
         return true;
     }
@@ -1012,7 +1029,7 @@ fn generate_blocking(
             engine,
             turn_state,
             suffix_c.as_ptr(),
-            200,  // max_tokens
+            MAX_REPLY_TOKENS,
             0.8,  // temperature (matches Phase 1 CLI harness default)
             0.5,  // top_p (matches Phase 1 CLI harness default)
             // repeat_penalty (Phase 7 follow-up, 2026-08-02): added after real usage showed this
@@ -1031,6 +1048,9 @@ fn generate_blocking(
     };
 
     unsafe { ffi::xenon_state_free(turn_state) };
+    // Cleared after the reply, not before: a Stop pressed while the prompt was still being read
+    // would otherwise be lost.
+    STOP_CHAT.store(false, Ordering::Relaxed);
 
     // Drop a held "\n\nUser:" prefix. Anything else still buffered is real reply text.
     flush_pending(&ctx);

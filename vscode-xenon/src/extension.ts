@@ -24,7 +24,7 @@ function settings() {
   return {
     serverUrl: config.get<string>("serverUrl", ""),
     token: config.get<string>("token", ""),
-    maxTokens: config.get<number>("maxTokens", 800),
+    maxTokens: config.get<number>("maxTokens", 262144),
     temperature: config.get<number>("temperature", 0.3),
     maxContextChars: config.get<number>("maxContextChars", 3000),
   };

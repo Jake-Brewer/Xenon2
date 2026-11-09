@@ -103,10 +103,10 @@
         },
         "xenon.maxTokens": {
           "type": "number",
-          "default": 800,
+          "default": 262144,
           "minimum": 16,
-          "maximum": 2048,
-          "description": "Longest reply, in tokens."
+          "maximum": 262144,
+          "description": "Longest reply, in tokens. Replies normally end on their own; this is only a backstop, and Stop ends a long one."
         },
         "xenon.temperature": {
           "type": "number",
