@@ -27,5 +27,6 @@ fi
 npm run tauri build -- --no-bundle
 export XENON_MODEL="${XENON_MODEL:-rwkv-7-g1l-2.9B-Q5_1.bin}"
 cd ..
-nohup "app/$exe" >/dev/null 2>&1 &
-echo "started $exe with $XENON_MODEL"
+log="${TMPDIR:-${TEMP:-/tmp}}/xenon2-release.log"
+nohup "app/$exe" >"$log" 2>&1 &
+echo "started $exe with $XENON_MODEL; log: $log"

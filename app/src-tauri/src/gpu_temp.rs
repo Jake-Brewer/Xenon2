@@ -1,7 +1,12 @@
 //! Keeps the laptop's GPU from running hot during long generations. A background thread reads the
-//! temperature with `nvidia-smi` every few seconds; `throttle()`, called between tokens, pauses
-//! generation once the GPU reaches `HOT_C` until it is back down to `COOL_C`. Machines without
-//! `nvidia-smi` (no NVIDIA GPU) never start the thread, and `throttle()` then does nothing.
+//! temperature with `nvidia-smi` every second; `throttle()`, called between tokens, paces
+//! generation from `PACE_FROM_C` up (a short wait per token, longer the hotter it is) so the GPU
+//! settles below `HOT_C`, and still pauses outright at `HOT_C` until it is back down to `COOL_C`.
+//! Machines without `nvidia-smi` (no NVIDIA GPU) never start the thread, and `throttle()` then does
+//! nothing.
+//!
+//! Why pace: on the RTX 2060 laptop the GPU went from 70 to 80 C in about 5 s of writing, and the
+//! pauses down to 72 C took 13-16 s each, so a 300-token reply wrote for 11 s out of 40.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -9,7 +14,10 @@ use std::time::{Duration, Instant};
 
 pub const HOT_C: u32 = 80;
 pub const COOL_C: u32 = 72;
-const POLL: Duration = Duration::from_secs(3);
+/// From here up, each token waits `PACE_MS_PER_C` per degree above `PACE_FROM_C - 1`.
+pub const PACE_FROM_C: u32 = 74;
+const PACE_MS_PER_C: u64 = 12;
+const POLL: Duration = Duration::from_secs(1);
 /// A pause never lasts longer than this, so a stuck sensor can't freeze a reply.
 const MAX_PAUSE: Duration = Duration::from_secs(120);
 
@@ -52,10 +60,24 @@ pub fn current() -> u32 {
     TEMP_C.load(Ordering::Relaxed)
 }
 
-/// Waits while the GPU is hot. Returns how long it waited, so callers can log or report it.
-pub fn throttle() -> Duration {
-    if current() < HOT_C {
+/// The wait before the next token at `temp_c`: none when cool, a little more per degree as the
+/// GPU warms, so generation slows to what the cooling can carry instead of stopping.
+pub fn pace_for(temp_c: u32) -> Duration {
+    if temp_c < PACE_FROM_C || temp_c >= HOT_C {
         return Duration::ZERO;
+    }
+    Duration::from_millis(PACE_MS_PER_C * u64::from(temp_c + 1 - PACE_FROM_C))
+}
+
+/// Paces or pauses while the GPU is hot. Returns how long it waited.
+pub fn throttle() -> Duration {
+    let now = current();
+    if now < HOT_C {
+        let wait = pace_for(now);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
+        return wait;
     }
     let started = Instant::now();
     let hot = current();
@@ -65,4 +87,17 @@ pub fn throttle() -> Duration {
     let waited = started.elapsed();
     eprintln!("xenon2: paused {:.0}s to let the GPU cool ({hot}°C -> {}°C)", waited.as_secs_f32(), current());
     waited
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacing_grows_with_heat_and_hands_over_to_the_pause_at_hot() {
+        assert_eq!(pace_for(70), Duration::ZERO);
+        assert_eq!(pace_for(PACE_FROM_C), Duration::from_millis(PACE_MS_PER_C));
+        assert!(pace_for(79) > pace_for(76));
+        assert_eq!(pace_for(HOT_C), Duration::ZERO, "at HOT_C throttle() pauses instead");
+    }
 }
