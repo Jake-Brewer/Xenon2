@@ -1,0 +1,100 @@
+diff --git a/rwkv.h b/rwkv.h
+index 978ed45..64fd647 100644
+--- a/rwkv.h
++++ b/rwkv.h
+@@ -114,6 +114,15 @@ extern "C" {
+         float * logits_out
+     );
+ 
++    // Xenon2: keeping the state on the device between tokens, instead of copying it in and out on
++    // every rwkv_eval. Copy a state in with rwkv_state_to_device, evaluate tokens with
++    // rwkv_eval_on_device (only logits come back), and copy the state out with
++    // rwkv_state_from_device. The state stays on the device until the next rwkv_eval or
++    // rwkv_state_to_device on this context.
++    RWKV_API bool rwkv_state_to_device(struct rwkv_context * ctx, const float * state);
++    RWKV_API bool rwkv_state_from_device(struct rwkv_context * ctx, float * state);
++    RWKV_API bool rwkv_eval_on_device(struct rwkv_context * ctx, const uint32_t token, float * logits_out);
++
+     // Evaluates the model for a sequence of tokens.
+     // Uses a faster algorithm than `rwkv_eval` if you do not need the state and logits for every token. Best used with sequence lengths of 64 or so.
+     // Has to build a computation graph on the first call for a given sequence, but will use this cached graph for subsequent calls of the same sequence length.
+diff --git a/rwkv_eval.inc b/rwkv_eval.inc
+index f017920..27e2166 100644
+--- a/rwkv_eval.inc
++++ b/rwkv_eval.inc
+@@ -34,14 +34,7 @@ static void rwkv_eval_graph(struct rwkv_computation_graph & graph, const bool co
+     ggml_backend_sched_graph_compute(graph.sched, graph.cgraph);
+ }
+ 
+-// API function.
+-bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * state_in, float * state_out, float * logits_out) {
+-    ctx->last_error = RWKV_ERROR_NONE;
+-
+-    const struct rwkv_file_header & header = ctx->model->header;
+-    const size_t n_vocab = header.n_vocab;
+-    RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, token < n_vocab, "Token (%" PRId32 ") is out of range (0 .. %zu)", token, n_vocab - 1);
+-
++static void rwkv_ensure_serial_sched(struct rwkv_context * ctx) {
+     if (!ctx->serial_graph.sched) {
+         // Xenon2: state, its per-layer slices and the token live on the first backend (the GPU when
+         // there is one). On the CPU backend they split each token's graph 66 ways on an RTX 2060.
+@@ -66,6 +59,17 @@ bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * st
+ 
+         ggml_backend_sched_alloc_graph(ctx->serial_graph.sched, ctx->serial_graph.cgraph);
+     }
++}
++
++// API function.
++bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * state_in, float * state_out, float * logits_out) {
++    ctx->last_error = RWKV_ERROR_NONE;
++
++    const struct rwkv_file_header & header = ctx->model->header;
++    const size_t n_vocab = header.n_vocab;
++    RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, token < n_vocab, "Token (%" PRId32 ") is out of range (0 .. %zu)", token, n_vocab - 1);
++
++    rwkv_ensure_serial_sched(ctx);
+ 
+     rwkv_set_inputs(ctx, ctx->serial_graph, state_in);
+     ggml_backend_tensor_set(ctx->serial_graph.tokens, &token, 0, rwkv_tensor_nbytes(ctx->serial_graph.tokens));
+@@ -77,6 +81,41 @@ bool rwkv_eval(struct rwkv_context * ctx, const uint32_t token, const float * st
+     return true;
+ }
+ 
++// Xenon2: the state can stay on the device between tokens. rwkv_eval copies it in and out every
++// token, 20.6 MB each way for a 2.9B RWKV-7, 7.5 ms of a ~47 ms token on an RTX 2060.
++
++// API function.
++bool rwkv_state_to_device(struct rwkv_context * ctx, const float * state) {
++    ctx->last_error = RWKV_ERROR_NONE;
++    rwkv_ensure_serial_sched(ctx);
++    rwkv_set_inputs(ctx, ctx->serial_graph, state);
++    return true;
++}
++
++// API function.
++bool rwkv_state_from_device(struct rwkv_context * ctx, float * state) {
++    ctx->last_error = RWKV_ERROR_NONE;
++    RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, ctx->serial_graph.sched, "no state on the device yet");
++    ggml_backend_tensor_get(ctx->serial_graph.input_state, state, 0, rwkv_tensor_nbytes(ctx->serial_graph.input_state));
++    return true;
++}
++
++// API function.
++bool rwkv_eval_on_device(struct rwkv_context * ctx, const uint32_t token, float * logits_out) {
++    ctx->last_error = RWKV_ERROR_NONE;
++
++    const size_t n_vocab = ctx->model->header.n_vocab;
++    RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, token < n_vocab, "Token (%" PRId32 ") is out of range (0 .. %zu)", token, n_vocab - 1);
++    RWKV_CTX_ASSERT_FALSE_MSG(ctx, RWKV_ERROR_ARGS, ctx->serial_graph.sched, "call rwkv_state_to_device first");
++
++    ggml_backend_tensor_set(ctx->serial_graph.tokens, &token, 0, rwkv_tensor_nbytes(ctx->serial_graph.tokens));
++    rwkv_eval_graph(ctx->serial_graph, logits_out != NULL);
++    // The new state becomes the next token's input without leaving the device.
++    ggml_backend_tensor_copy(ctx->serial_graph.output_state, ctx->serial_graph.input_state);
++    rwkv_get_outputs(ctx->serial_graph, NULL, logits_out);
++    return true;
++}
++
+ // API function.
+ bool rwkv_eval_sequence(
+     struct rwkv_context * ctx,
