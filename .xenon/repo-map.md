@@ -28,7 +28,6 @@ a coding API that a VS Code extension uses. RWKV is a recurrent model with no co
 - src-tauri/src/ffi.rs: Rust declarations for the C engine in inference-engine/.
 - src-tauri/src/code_api.rs: local OpenAI-compatible HTTP API on 127.0.0.1:47811 with a bearer
   token (chat completions, feedback, folder agent).
-
 - src-tauri/src/code_search.rs: finds the project lines that best match a question, added to
   coding prompts that name a workspace folder.
 - src-tauri/src/folder_agent.rs: autonomous loop that edits files in a folder, checks them
