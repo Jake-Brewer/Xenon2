@@ -325,10 +325,19 @@ fn check_for(root: &Path, edited: &str, files: &[String]) -> Option<Check> {
     let ext = edited.rsplit('.').next().unwrap_or("");
     match ext {
         "py" => {
+            // The edited file's own test beside it, else a test among the files, else the file.
+            let (dir, name) = edited.rsplit_once('/').map_or(("", edited), |(d, n)| (d, n));
+            let stem = name.trim_end_matches(".py");
+            let beside = [format!("test_{stem}.py"), format!("{stem}_test.py")]
+                .into_iter()
+                .map(|n| if dir.is_empty() { n } else { format!("{dir}/{n}") })
+                .find(|p| root.join(p).is_file());
             let target = if is_python_test(edited) {
                 edited.to_string()
             } else {
-                files.iter().find(|f| is_python_test(f)).cloned().unwrap_or_else(|| edited.to_string())
+                beside
+                    .or_else(|| files.iter().find(|f| is_python_test(f)).cloned())
+                    .unwrap_or_else(|| edited.to_string())
             };
             let args = if is_python_test(&target) { vec!["-m".into(), "pytest".into(), target] } else { vec![target] };
             Some(Check { program: "python", args, dir: String::new() })
@@ -609,7 +618,8 @@ pub fn run(
         .iter()
         .map(|f| crate::code_search::snap_path(root, f).unwrap_or_else(|| f.clone()))
         .collect();
-    if files.is_empty() {
+    let searched = files.is_empty();
+    if searched {
         files = crate::code_search::best_files(root, goal, FILES_FROM_SEARCH).into_iter().map(|h| h.path).collect();
         if files.is_empty() {
             report.stopped_reason = "no files were given, and searching the folder for the goal found none".to_string();
@@ -668,7 +678,16 @@ pub fn run(
             report.stopped_reason = "finished".to_string();
             break;
         }
-        let Some(relative_path) = snap_to_list(&written, files) else {
+        // Files named by the caller are the limit. Files picked by search are only a guess, so
+        // Xenon may name another real file in the folder (search had missed walker.py where
+        // other files repeated the goal's words; Xenon named it anyway).
+        let named = snap_to_list(&written, files).or_else(|| {
+            searched
+                .then(|| crate::code_search::snap_path(root, &written))
+                .flatten()
+                .filter(|p| contained(root, &root.join(p)).is_ok())
+        });
+        let Some(relative_path) = named else {
             report.narration.push(format!("Xenon's reply began: {}", excerpt(&path_reply)));
             report.stopped_reason = format!("the model named {written}, which wasn't in the given file list");
             break;
@@ -691,16 +710,17 @@ pub fn run(
         let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
         let lang = fence(&relative_path);
         // A short question of its own, without the file listing: with three large files read
-        // first, Xenon dropped entries from a line it was asked to add one to; with only the
-        // lines in front of it, it got the same edit right.
+        // first, Xenon dropped entries from a line it was asked to add one to. But the lines to
+        // change stay in the reply's start, right before "become:": with them in the question
+        // instead, Xenon passed 2 of 7 edit tasks rather than 6 of 6.
         let edit_question = format!(
-            "Goal: {goal}\n\n{last_failure}In `{relative_path}`, just before the lines to change:\n```{lang}\n{before}\n```\n\
-             Lines {first}-{to}, the lines to change:\n```{lang}\n{target}\n```\n\
-             Just after them:\n```{lang}\n{after}\n```\n\
-             Goal: {goal}\nWrite lines {first}-{to} with the goal done.",
+            "Goal: {goal}\n\n{last_failure}In `{relative_path}`, the lines just before the ones to change:\n```{lang}\n{before}\n```\n\
+             and just after them:\n```{lang}\n{after}\n```\nGoal: {goal}"
+        );
+        let start = format!(
+            "Lines {first}-{to} of `{relative_path}` are:\n```{lang}\n{target}\n```\nWith the goal done, they become:\n```{lang}\n",
             first = from + 1
         );
-        let start = format!("```{lang}\n");
         let start_len = start.len();
         let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
         let reply = ask(engine, model_name, &edit_question, &start, &closed, deadline, cancel)?;
