@@ -4,3 +4,7 @@
 models/*.bin.part* filter=lfs diff=lfs merge=lfs -text
 # Weights we train ourselves (state tunes, LoRA), under 2 GB each.
 models/tuned/** filter=lfs diff=lfs merge=lfs -text
+
+# Shell scripts and hooks must keep LF endings, or sh fails on Windows checkouts with autocrlf.
+.githooks/* text eol=lf
+*.sh text eol=lf
