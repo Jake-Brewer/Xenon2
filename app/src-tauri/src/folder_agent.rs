@@ -35,6 +35,8 @@ use crate::inference::{self, EngineState};
 pub const MAX_EDITS: u32 = 5;
 pub const MAX_RUNS: u32 = 3;
 pub const MAX_SECONDS: u64 = 10 * 60;
+/// Files to work on when none are named: few, since each is read whole into every prompt.
+const FILES_FROM_SEARCH: usize = 3;
 
 const SNAPSHOT_MESSAGE: &str = "xenon-agent: snapshot before run";
 
@@ -519,10 +521,19 @@ pub fn run(
     let mut last_failure = String::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
-    let files: Vec<String> = files
+    // With no names at all, search the folder for the goal and work on the best matches.
+    let mut files: Vec<String> = files
         .iter()
         .map(|f| crate::code_search::snap_path(root, f).unwrap_or_else(|| f.clone()))
         .collect();
+    if files.is_empty() {
+        files = crate::code_search::best_files(root, goal, FILES_FROM_SEARCH).into_iter().map(|h| h.path).collect();
+        if files.is_empty() {
+            report.stopped_reason = "no files were given, and searching the folder for the goal found none".to_string();
+            return Ok(report);
+        }
+        report.narration.push(format!("Searched the folder for the goal and picked {}", files.join(", ")));
+    }
     let files = files.as_slice();
     let mut listing = String::new();
     for file in files {

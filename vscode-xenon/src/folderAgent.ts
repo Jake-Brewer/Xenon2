@@ -64,16 +64,15 @@ export async function runFolderAgentCommand(connection: () => Connection): Promi
   }
   const open = vscode.window.activeTextEditor?.document.uri;
   const relativeFiles = await vscode.window.showInputBox({
-    prompt: "Which files should Xenon work on? (comma-separated, relative to the workspace root)",
+    prompt: "Which files should Xenon work on? (comma-separated; leave empty to let Xenon search for them)",
     placeHolder: "e.g. src/util.py, tests/test_util.py",
     value: open?.scheme === "file" ? vscode.workspace.asRelativePath(open, false) : undefined,
   });
-  if (!relativeFiles) return;
+  if (relativeFiles === undefined) return;
   const files = relativeFiles
     .split(",")
     .map((f) => f.trim())
     .filter(Boolean);
-  if (files.length === 0) return;
 
   const goal = await vscode.window.showInputBox({
     prompt: "What should Xenon try to do?",

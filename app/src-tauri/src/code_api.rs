@@ -497,6 +497,8 @@ pub struct FolderAgentRequest {
     /// The English goal for this run, e.g. "add type hints and fix any failing tests".
     pub goal: String,
     /// Paths, relative to `folder`, the agent may read and edit. Nothing outside this list.
+    /// Empty or left out: the agent searches the folder for the goal and picks a few files.
+    #[serde(default)]
     pub files: Vec<String>,
 }
 

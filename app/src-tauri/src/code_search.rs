@@ -137,12 +137,35 @@ pub fn snap_path(root: &Path, written: &str) -> Option<String> {
     found.next().is_none().then_some(first)
 }
 
+/// One file's match: its path and best lines (1-based number, text), in file order.
+pub struct Hit {
+    pub path: String,
+    pub lines: Vec<(usize, String)>,
+}
+
 /// The best-matching lines of `root` for `question`, formatted for the prompt, or "" when nothing
 /// matches well enough to help.
 pub fn search(root: &Path, question: &str) -> String {
+    let hits = best_files(root, question, MAX_FILES);
+    if hits.is_empty() {
+        return String::new();
+    }
+    // grep's `path:line: text`, with the whole path on every line: the model copies paths it sees
+    // whole, and shortens ones it has to piece together from a heading.
+    let mut out = String::from("Matching lines from the project (path:line: text):\n");
+    for hit in hits {
+        for (n, line) in hit.lines {
+            out.push_str(&format!("{}:{n}: {line}\n", hit.path));
+        }
+    }
+    out
+}
+
+/// Up to `limit` files of `root` that best match `question`, best first.
+pub fn best_files(root: &Path, question: &str, limit: usize) -> Vec<Hit> {
     let words = keywords(question);
     if words.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     let files = source_files(root);
     let lowered: Vec<String> = files.iter().map(|(_, text)| text.to_lowercase()).collect();
@@ -196,22 +219,17 @@ pub fn search(root: &Path, question: &str) -> String {
         ranked.push((file_score + best, rel, lines));
     }
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(b.1)));
-    ranked.truncate(MAX_FILES);
-    if ranked.is_empty() {
-        return String::new();
-    }
-
-    // grep's `path:line: text`, with the whole path on every line: the model copies paths it sees
-    // whole, and shortens ones it has to piece together from a heading.
-    let mut out = String::from("Matching lines from the project (path:line: text):\n");
-    for (_, rel, mut lines) in ranked {
-        lines.sort_by_key(|l| l.1);
-        for (_, n, line) in lines {
-            let line: String = line.trim().chars().take(MAX_LINE_CHARS).collect();
-            out.push_str(&format!("{rel}:{n}: {line}\n"));
-        }
-    }
-    out
+    ranked.truncate(limit);
+    ranked
+        .into_iter()
+        .map(|(_, rel, mut lines)| {
+            lines.sort_by_key(|l| l.1);
+            Hit {
+                path: rel.clone(),
+                lines: lines.into_iter().map(|(_, n, line)| (n, line.trim().chars().take(MAX_LINE_CHARS).collect())).collect(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
