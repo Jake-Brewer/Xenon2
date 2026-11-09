@@ -151,6 +151,30 @@ fn command(program: &str) -> Command {
     cmd
 }
 
+/// cargo, from PATH or else rustup's toolchains: on Windows rustup often leaves it off PATH, and an
+/// app started from the desktop doesn't get a shell's PATH anyway.
+fn find_cargo() -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    let on_path = std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(exe)).find(|p| p.is_file());
+    on_path.or_else(|| {
+        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+        let home = PathBuf::from(home);
+        let cargo_bin = home.join(".cargo").join("bin").join(exe);
+        if cargo_bin.is_file() {
+            return Some(cargo_bin);
+        }
+        let mut toolchains: Vec<PathBuf> = std::fs::read_dir(home.join(".rustup").join("toolchains"))
+            .ok()?
+            .flatten()
+            .map(|e| e.path().join("bin").join(exe))
+            .filter(|p| p.is_file())
+            .collect();
+        // Prefer stable when several toolchains are installed.
+        toolchains.sort_by_key(|p| !p.to_string_lossy().contains("stable"));
+        toolchains.into_iter().next()
+    })
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let output = command("git")
         .args(args)
@@ -375,9 +399,27 @@ fn run_check(root: &Path, check: &Check, deadline: Instant, cancel: &AtomicBool)
     use std::process::Stdio;
 
     let display = check.display();
-    let mut child = command(check.program)
+    let dir = root.join(&check.dir);
+    let mut cmd = match (check.program, find_cargo()) {
+        ("cargo", Some(cargo)) => Command::new(cargo),
+        _ => command(check.program),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW, as in `command`
+    }
+    if check.program == "cargo" {
+        // Crates that load DLLs at test time (this app's engine) find them in target/debug.
+        let mut path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
+        path.insert(0, dir.join("target").join("debug"));
+        if let Ok(joined) = std::env::join_paths(path) {
+            cmd.env("PATH", joined);
+        }
+    }
+    let mut child = cmd
         .args(&check.args)
-        .current_dir(root.join(&check.dir))
+        .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
