@@ -524,6 +524,37 @@ before/after for each file, test output, and an **Undo all of this** button. New
 - Tests: 43 Rust (containment, snapshot/undo, dirty-tree skip, budget, reply parsing, stopping
   generation early, unknown runs), 10 Node (including the start → poll → report client).
 
+**No reply cap, and Stop instead (2026-11-08) [x]** — reply length is meant to be unbounded like
+the context. Chat replies used to be cut at 200 tokens and coding replies at 800 (2048 max).
+Now every path uses `MAX_REPLY_TOKENS` = 262,144 in `inference.rs`, a backstop only; the plan is
+to raise it to 1M once long replies prove trustworthy. Replies end on their own at a stop
+sequence. A long one is ended with **Stop**: a button under the chat (or Esc) calls the
+`stop_generation` command, and the token callback stops at the next token, keeping the text so
+far. VS Code's Stop hangs up, which already stopped generation. The folder agent's replies also
+stop at its time budget or on cancel. Stop sequences now include "User:" after a *single*
+newline: G1 sometimes writes that, and without a cap it would have run on. A coding reply that
+comes back empty logs what the model actually wrote.
+
+**VS Code chats know the open folder (2026-11-08) [x]** — asked "tell me about this repo", Xenon
+described one of Claude Code's read-only command panels, because the extension only sent the
+code around the cursor in whatever tab was active. Now code context comes only from real files
+(`file:`/`untitled:` tabs), and each chat starts with a system message describing the workspace:
+its path, its top two levels of files and folders (skipping `node_modules`, `target`, `.git`
+and the like), and `.xenon/repo-map.md` if present, else the README. It is built once per chat,
+so the server's prefix cache reads it only once. `.xenon/repo-map.md` is a hand-checked
+one-line description of each folder and key file in this repo, also the reference for scoring
+Xenon's own descriptions. Measured: "tell me about this repo" now gets a mostly right answer
+(it misstated the model as 7B and `main.ts` as the Tauri entry), but took 246 s, almost all of
+it reading the 6.7k-character overview cold. A follow-up took 3 s (cached), though its answer
+was wrong (it named `persistence.ts` for the Stop button). Feedback examples now go in the
+uncached tail of coding prompts, so they no longer break the cache for the next follow-up.
+
+**Next: GPU prefill for RWKV-7.** Reading (prefill) runs at ~35 tok/s at best because the
+vendored ggml has no GPU kernel for RWKV-7's WKV op (rwkv.cpp runs its own CPU version through
+`ggml_map_custom1`). Upstream ggml has `GGML_OP_RWKV_WKV7` with a CUDA kernel. Plan: carry it as
+a patch applied at build time (not a fork of the submodule), build into a separate folder,
+check that logits match the current engine, measure, and only then switch the app.
+
 ## Future work (not yet scheduled)
 
 - Mamba backend as an alternative to RWKV, once `mamba.cpp` tooling matures.
