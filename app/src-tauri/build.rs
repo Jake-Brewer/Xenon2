@@ -124,6 +124,9 @@ fn main() {
                 if is_native_lib(&path) {
                     let dest = target_dir.join(path.file_name().unwrap());
                     let _ = fs::copy(&path, &dest);
+                    // Rebuilding the engine rewrites these without touching the folder or the
+                    // .lib, so without this the app kept running the old engine DLLs.
+                    println!("cargo:rerun-if-changed={}", path.display());
                 }
             }
         }

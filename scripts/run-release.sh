@@ -19,7 +19,7 @@ exe=src-tauri/target/release/app.exe
 
 # The running exe is locked on Windows, so stop it before the build replaces it.
 if command -v powershell >/dev/null; then
-  powershell -NoProfile -Command "Get-Process app -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '*target\\release\\app.exe' } | Stop-Process -Force"
+  powershell -NoProfile -Command "Get-Process app -ErrorAction SilentlyContinue | Where-Object { \$_.Path -like '*target\\release\\app.exe' } | Stop-Process -Force" || true  # exits 1 when no app is running
 else
   pkill -f "target/release/app" || true
 fi
