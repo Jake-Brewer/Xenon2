@@ -4,7 +4,7 @@
 import * as vscode from "vscode";
 import { ChatViewProvider, Host } from "./chatView";
 import { ChatMessage, health, resolveConnection, streamChat } from "./client";
-import { CodeContext, pickCode, withContext } from "./context";
+import { CodeContext, SKIP_DIRS, formatOverview, pickCode, withContext } from "./context";
 import { acceptPendingEdit, discardPendingEdit, hasPendingEdit, proposeFileEdit } from "./edit";
 import { runFolderAgentCommand } from "./folderAgent";
 
@@ -30,8 +30,56 @@ function settings() {
   };
 }
 
+/** Real files only: output panels and read-only views (a terminal command, a log) are not the
+ * user's code, and answering about them reads as answering about the project. */
+function isCode(editor: vscode.TextEditor | undefined): editor is vscode.TextEditor {
+  return !!editor && (editor.document.uri.scheme === "file" || editor.document.uri.scheme === "untitled");
+}
+
+/** Notes worth sending with the file list: a hand-written repo map first, else the README. */
+const NOTE_FILES = [".xenon/repo-map.md", "README.md", "readme.md", "README.txt"];
+
+/** The editor a command applies to: the active one if it holds code, else the last one that did. */
+function codeEditor(): vscode.TextEditor | undefined {
+  const active = vscode.window.activeTextEditor;
+  return isCode(active) ? active : lastEditor;
+}
+
+async function workspaceOverview(): Promise<string | undefined> {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (!folder) return undefined;
+  const entries: string[] = [];
+  const list = async (dir: vscode.Uri, prefix: string, depth: number): Promise<void> => {
+    let children: [string, vscode.FileType][];
+    try {
+      children = await vscode.workspace.fs.readDirectory(dir);
+    } catch {
+      return;
+    }
+    children.sort(([a, at], [b, bt]) => (bt & vscode.FileType.Directory) - (at & vscode.FileType.Directory) || a.localeCompare(b));
+    for (const [name, type] of children) {
+      const isDir = (type & vscode.FileType.Directory) !== 0;
+      if (isDir && SKIP_DIRS.has(name)) continue;
+      entries.push(prefix + name + (isDir ? "/" : ""));
+      if (isDir && depth > 1) await list(vscode.Uri.joinPath(dir, name), `${prefix}${name}/`, depth - 1);
+    }
+  };
+  await list(folder.uri, "", 2);
+  let notes: { file: string; text: string } | undefined;
+  for (const file of NOTE_FILES) {
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folder.uri, file));
+      notes = { file, text: Buffer.from(bytes).toString("utf8") };
+      break;
+    } catch {
+      // Not there; try the next one.
+    }
+  }
+  return formatOverview({ name: folder.name, root: folder.uri.fsPath }, entries, notes);
+}
+
 function contextFrom(editor: vscode.TextEditor | undefined): CodeContext | undefined {
-  if (!editor) return undefined;
+  if (!isCode(editor)) return undefined;
   const document = editor.document;
   const selection = editor.selection;
   const lines = Array.from({ length: document.lineCount }, (_, i) => document.lineAt(i).text);
@@ -50,11 +98,11 @@ function contextFrom(editor: vscode.TextEditor | undefined): CodeContext | undef
 }
 
 export function activate(extension: vscode.ExtensionContext): void {
-  lastEditor = vscode.window.activeTextEditor;
+  lastEditor = isCode(vscode.window.activeTextEditor) ? vscode.window.activeTextEditor : undefined;
   extension.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
       // Focus moving to the chat leaves no active editor; keep the one the user came from.
-      if (editor) lastEditor = editor;
+      if (isCode(editor)) lastEditor = editor;
     }),
   );
 
@@ -90,6 +138,7 @@ export function activate(extension: vscode.ExtensionContext): void {
   const host: Host = {
     settings,
     currentContext: () => contextFrom(lastEditor),
+    overview: workspaceOverview,
     lastTarget: () => lastTarget,
     setBusy: (value) => {
       busy = value;
@@ -107,7 +156,7 @@ export function activate(extension: vscode.ExtensionContext): void {
   );
 
   const askAbout = (prompt: string) => () => {
-    const editor = vscode.window.activeTextEditor ?? lastEditor;
+    const editor = codeEditor();
     if (!editor) {
       vscode.window.showWarningMessage("Open a file first, then ask Xenon about it.");
       return;
@@ -117,7 +166,7 @@ export function activate(extension: vscode.ExtensionContext): void {
 
   extension.subscriptions.push(
     vscode.commands.registerCommand("xenon.ask", async () => {
-      const editor = vscode.window.activeTextEditor ?? lastEditor;
+      const editor = codeEditor();
       const question = await vscode.window.showInputBox({
         prompt: editor ? "Ask Xenon about this code" : "Ask Xenon",
         placeHolder: "e.g. Why does this loop never end?",
@@ -135,7 +184,7 @@ export function activate(extension: vscode.ExtensionContext): void {
       vscode.window.showInformationMessage(online ? `Connected to Xenon (${online}).` : "The Xenon2 app isn't running.");
     }),
     vscode.commands.registerCommand("xenon.editFile", async () => {
-      const editor = vscode.window.activeTextEditor ?? lastEditor;
+      const editor = codeEditor();
       if (!editor) {
         vscode.window.showWarningMessage("Open a file first, then ask Xenon to edit it.");
         return;
@@ -207,7 +256,9 @@ function registerParticipant(extension: vscode.ExtensionContext): void {
         if (text.trim()) messages.push({ role: "assistant", content: text });
       }
     }
-    const editor = vscode.window.activeTextEditor ?? lastEditor;
+    const overview = await workspaceOverview();
+    if (overview) messages.unshift({ role: "system", content: overview });
+    const editor = codeEditor();
     const withCode = editor && !editor.selection.isEmpty ? contextFrom(editor) : undefined;
     messages.push({ role: "user", content: withContext(request.prompt, withCode) });
 

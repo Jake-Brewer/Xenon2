@@ -8,6 +8,8 @@ export interface Host {
   settings(): { serverUrl: string; token: string; maxTokens: number; temperature: number };
   /** Code from the editor the user last worked in, or undefined when there is none. */
   currentContext(): CodeContext | undefined;
+  /** What the open workspace is, sent ahead of each chat. */
+  overview(): Promise<string | undefined>;
   /** The editor and range a "replace" applies to. */
   lastTarget(): { editor: vscode.TextEditor; range: vscode.Range } | undefined;
   setBusy(busy: boolean): void;
@@ -34,6 +36,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   /** History and reply text for each rateable assistant message, by the id given to the webview. */
   private rateable = new Map<string, { history: ChatMessage[]; reply: string }>();
   private nextMessageId = 0;
+  /** Built once per chat so the server's prompt cache keeps reusing it. */
+  private overview?: string;
 
   constructor(private readonly extensionUri: vscode.Uri, private readonly host: Host) {}
 
@@ -64,6 +68,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.messages = [];
     this.rateable.clear();
     this.lastSentCode = undefined;
+    this.overview = undefined;
     this.post({ type: "reset" });
   }
 
@@ -166,9 +171,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     try {
       const settings = this.host.settings();
       const connection = resolveConnection(settings);
+      this.overview ??= (await this.host.overview()) ?? "";
+      const system: ChatMessage[] = this.overview ? [{ role: "system", content: this.overview }] : [];
       finish = await streamChat(
         connection,
-        this.messages,
+        [...system, ...this.messages],
         settings,
         (piece) => {
           reply += piece;

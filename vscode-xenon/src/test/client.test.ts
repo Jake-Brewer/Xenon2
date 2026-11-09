@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SseParser, discoveryPath, resolveConnection, runFolderAgent, sendFeedback } from "../client";
-import { firstCodeBlock, pickCode, withContext } from "../context";
+import { firstCodeBlock, formatOverview, pickCode, withContext } from "../context";
 
 test("SSE events split across chunks are joined", () => {
   const parser = new SseParser();
@@ -117,4 +117,22 @@ test("the folder agent is started, polled for progress, then its report returned
   }
   assert.deepEqual(routes, ["POST http://h/v1/folder-agent", "GET http://h/v1/folder-agent/run-1", "GET http://h/v1/folder-agent/run-1"]);
   assert.deepEqual(steps, ["Edited a.py: fix", "Stopped: done"]);
+});
+
+test("the workspace overview names the project, lists its files, and adds its notes", () => {
+  const text = formatOverview(
+    { name: "Xenon2", root: "/home/me/Xenon2" },
+    ["app/", "app/src/", "PLAN.md"],
+    { file: "README.md", text: "An offline assistant." },
+  );
+  assert.match(text, /`Xenon2` open, at \/home\/me\/Xenon2/);
+  assert.match(text, /app\/src\/\nPLAN\.md\n/);
+  assert.match(text, /From `README\.md`:\nAn offline assistant\./);
+});
+
+test("a long file list is cut and says how much was left out", () => {
+  const entries = Array.from({ length: 100 }, (_, i) => `file${i}.py`);
+  const text = formatOverview({ name: "p", root: "/p" }, entries, undefined, 50);
+  assert.match(text, /\(and \d+ more\)/);
+  assert.ok(!text.includes("file99.py"));
 });

@@ -61,3 +61,36 @@ export function firstCodeBlock(reply: string): string | undefined {
   const match = /```[^\n]*\n([\s\S]*?)```/.exec(reply);
   return match ? match[1].replace(/\n$/, "") : undefined;
 }
+
+/** Directories that never help describe a project. */
+export const SKIP_DIRS = new Set(["node_modules", ".git", "target", "out", "dist", "build", ".venv", "venv", "__pycache__", ".pytest_cache", ".claude"]);
+
+/**
+ * A short description of the open workspace, sent once at the start of each chat (and cached by
+ * the server from then on). `entries` are workspace-relative paths, directories ending in "/".
+ * `notes` is a hand-written map of the repo when there is one, else the start of the README.
+ */
+export function formatOverview(
+  workspace: { name: string; root: string },
+  entries: string[],
+  notes: { file: string; text: string } | undefined,
+  maxListChars = 2500,
+  maxNoteChars = 6000,
+): string {
+  let listing = "";
+  let shown = 0;
+  for (const entry of entries) {
+    if (listing.length + entry.length + 1 > maxListChars) break;
+    listing += entry + "\n";
+    shown++;
+  }
+  const more = entries.length > shown ? `(and ${entries.length - shown} more)\n` : "";
+  let text =
+    `The programmer has the project \`${workspace.name}\` open, at ${workspace.root}. ` +
+    `Questions about "this repo" or "this project" mean this one.\nIts files and folders:\n${listing}${more}`;
+  if (notes && notes.text.trim()) {
+    const body = notes.text.length > maxNoteChars ? notes.text.slice(0, maxNoteChars) + "\n(cut short)" : notes.text;
+    text += `\nFrom \`${notes.file}\`:\n${body.trim()}\n`;
+  }
+  return text;
+}
