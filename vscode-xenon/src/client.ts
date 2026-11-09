@@ -192,12 +192,13 @@ export async function health(connection: Connection, signal?: AbortSignal): Prom
 
 /**
  * Streams a reply, calling onText with each new piece. Resolves with why it ended; aborting
- * `signal` stops the model and resolves "cancelled".
+ * `signal` stops the model and resolves "cancelled". With `workspace` (a folder path), the app
+ * searches that folder and shows the model the lines that best match the question.
  */
 export async function streamChat(
   connection: Connection,
   messages: ChatMessage[],
-  settings: Pick<Settings, "maxTokens" | "temperature">,
+  settings: Pick<Settings, "maxTokens" | "temperature"> & { workspace?: string },
   onText: (text: string) => void,
   signal?: AbortSignal,
 ): Promise<Finish> {
@@ -212,6 +213,7 @@ export async function streamChat(
         stream: true,
         max_tokens: settings.maxTokens,
         temperature: settings.temperature,
+        workspace: settings.workspace,
       }),
       signal,
     });

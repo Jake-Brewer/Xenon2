@@ -4,6 +4,12 @@ Xenon2 is an offline voice and text assistant: a Tauri desktop app (Rust + Vue) 
 model locally, a Python voice sidecar, and a VS Code extension that uses the app's coding API.
 `.xenon/repo-map.md` describes every folder and key file; `PLAN.md` has the history and decisions.
 
+**Scope (2026-11-09):** Xenon specializes in maintaining and improving its own code base, this
+repo. Judge model and feature work by whether it makes Xenon better at that: answering questions
+about this repo, editing it, and running its checks. `training/make_self_data.py` builds the exam
+and training set from the repo itself (where things are defined, commit diffs and messages, the
+repo map); score changes against it.
+
 ## First run on a new checkout
 
 1. Install: Git with Git LFS, Python 3.11, Node.js 20+, Rust (rustup), CMake, and a C++ compiler

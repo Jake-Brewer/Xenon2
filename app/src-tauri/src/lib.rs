@@ -1,4 +1,5 @@
 mod code_api;
+mod code_search;
 mod example_bank;
 mod feedback;
 mod ffi;

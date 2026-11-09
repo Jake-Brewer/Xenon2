@@ -1,5 +1,6 @@
-//! Project-folder agent: point Xenon at a folder and an English goal, and it edits, runs, and
-//! fixes the Python in that folder on its own, batch style, stopping on a hard budget and
+//! Project-folder agent: point Xenon at a folder and an English goal, and it edits, checks, and
+//! fixes the code in that folder on its own (Python, Rust, TypeScript, Vue; see `check_for`;
+//! Xenon2 itself is the main target), batch style, stopping on a hard budget and
 //! reporting what it did. This is a different shape from `code_api.rs`'s single question/answer:
 //! a loop that owns a working directory for a while, writes files, and runs code it chose to run.
 //!
@@ -13,7 +14,7 @@
 //!   work). `undo()` resets straight back to that commit.
 //! - *Budget*: a run stops itself after `MAX_EDITS` file writes, `MAX_RUNS` test/script
 //!   executions, or `MAX_SECONDS` of wall time, whichever comes first.
-//! - *Execution*: `python` runs with its working directory pinned to the target folder. This is
+//! - *Execution*: checks run with their working directory inside the target folder. This is
 //!   not a hard OS sandbox (Windows has no cheap equivalent of a container here) — it relies on
 //!   the containment check plus the rollback point, not on stopping the subprocess from reading
 //!   elsewhere on disk.
@@ -123,8 +124,30 @@ fn contained(root: &Path, candidate: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// A subprocess with no console window (the app has none, so Windows would flash one up per
+/// command). npm and npx are `.cmd` scripts on Windows, which only `cmd /C` can start.
+fn command(program: &str) -> Command {
+    #[cfg(windows)]
+    let mut cmd = if matches!(program, "npm" | "npx") {
+        let mut c = Command::new("cmd");
+        c.args(["/C", program]);
+        c
+    } else {
+        Command::new(program)
+    };
+    #[cfg(not(windows))]
+    let cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let output = command("git")
         .args(args)
         .current_dir(root)
         .output()
@@ -138,8 +161,10 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
 /// Snapshots `root` with a throwaway commit if its tree is clean, so a run has a rollback point
 /// that survives a crash (unlike a stash). Returns `None`, not an error, when the tree already
 /// has changes in progress — snapshotting over those would make them look like part of the run.
+/// Untracked files and changes inside submodules don't count: `undo`'s `reset --hard` leaves both
+/// alone. (This repo always has both: `.claude/` and the patched `rwkv.cpp` checkout.)
 fn snapshot(root: &Path) -> Result<Option<String>, String> {
-    let status = git(root, &["status", "--porcelain"])?;
+    let status = git(root, &["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=dirty"])?;
     if !status.is_empty() {
         return Ok(None);
     }
@@ -190,6 +215,7 @@ fn ask(engine: &EngineState, model_name: &str, question: &str, deadline: Instant
         temperature: Some(0.2),
         top_p: None,
         repeat_penalty: None,
+        workspace: None,
     };
     let prompt = code_api::build_prompt(&request, style)?;
     let mut text = String::new();
@@ -206,44 +232,174 @@ fn ask(engine: &EngineState, model_name: &str, question: &str, deadline: Instant
 /// the working directory pinned to `root`, so relative imports and relative file access the
 /// script makes stay inside the sandboxed folder by construction, not by special-casing its own
 /// I/O.
-fn run_python(root: &Path, relative_target: &str) -> Result<RunStep, String> {
-    let target = contained(root, &root.join(relative_target))?;
-    let file_name = target.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let is_test = target.is_dir() || file_name.starts_with("test_") || file_name.ends_with("_test.py");
-    let command = if is_test {
-        if target.is_dir() {
-            "python -m pytest".to_string()
+/// A command that checks an edit: tests where the project has them, else a typecheck or a run.
+#[derive(Debug, PartialEq)]
+struct Check {
+    program: &'static str,
+    args: Vec<String>,
+    /// Relative to the run's root; "" is the root itself.
+    dir: String,
+}
+
+impl Check {
+    fn display(&self) -> String {
+        let command = std::iter::once(self.program.to_string()).chain(self.args.iter().cloned()).collect::<Vec<_>>().join(" ");
+        if self.dir.is_empty() {
+            command
         } else {
-            format!("python -m pytest {relative_target}")
+            format!("{command} (in {})", self.dir)
         }
-    } else {
-        format!("python {relative_target}")
-    };
-    let mut cmd = Command::new("python");
-    if is_test {
-        cmd.args(["-m", "pytest"]);
-        if !target.is_dir() {
-            cmd.arg(&target);
-        }
-    } else {
-        cmd.arg(&target);
     }
-    let output = cmd
-        .current_dir(root)
-        .output()
-        .map_err(|e| format!("couldn't run {command}: {e}"))?;
+}
+
+fn is_python_test(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.starts_with("test_") || name.ends_with("_test.py")
+}
+
+/// The nearest folder at or above `relative`'s folder, inside `root`, that holds `marker`.
+fn nearest_with(root: &Path, relative: &str, marker: &str) -> Option<String> {
+    let mut dir = Path::new(relative).parent();
+    while let Some(d) = dir {
+        if root.join(d).join(marker).is_file() {
+            return Some(d.to_string_lossy().replace('\\', "/"));
+        }
+        dir = d.parent();
+    }
+    None
+}
+
+/// Picks the check for an edit to `edited`: pytest (or the script itself) for Python, `cargo
+/// test` for Rust, and the package's `test` script or a typecheck for TypeScript and Vue.
+fn check_for(root: &Path, edited: &str, files: &[String]) -> Option<Check> {
+    let ext = edited.rsplit('.').next().unwrap_or("");
+    match ext {
+        "py" => {
+            let target = if is_python_test(edited) {
+                edited.to_string()
+            } else {
+                files.iter().find(|f| is_python_test(f)).cloned().unwrap_or_else(|| edited.to_string())
+            };
+            let args = if is_python_test(&target) { vec!["-m".into(), "pytest".into(), target] } else { vec![target] };
+            Some(Check { program: "python", args, dir: String::new() })
+        }
+        "rs" => {
+            let dir = nearest_with(root, edited, "Cargo.toml")?;
+            let mut args = vec!["test".to_string()];
+            if root.join(&dir).join("src/lib.rs").is_file() {
+                args.push("--lib".into());
+            }
+            Some(Check { program: "cargo", args, dir })
+        }
+        "ts" | "tsx" | "js" | "mjs" | "vue" => {
+            let dir = nearest_with(root, edited, "package.json")?;
+            let package = std::fs::read_to_string(root.join(&dir).join("package.json")).unwrap_or_default();
+            let package: serde_json::Value = serde_json::from_str(&package).unwrap_or_default();
+            let args: Vec<String> = if package["scripts"]["test"].is_string() {
+                vec!["test".into()]
+            } else if package["devDependencies"]["vue-tsc"].is_string() || package["dependencies"]["vue-tsc"].is_string() {
+                vec!["vue-tsc".into(), "--noEmit".into()]
+            } else {
+                vec!["tsc".into(), "--noEmit".into()]
+            };
+            let program = if args[0] == "test" { "npm" } else { "npx" };
+            Some(Check { program, args, dir })
+        }
+        _ => None,
+    }
+}
+
+/// Runs `check`, killing it at `deadline` or on cancel. Output is read on its own threads so a
+/// chatty command can't fill the pipe and stall.
+fn run_check(root: &Path, check: &Check, deadline: Instant, cancel: &AtomicBool) -> Result<RunStep, String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let display = check.display();
+    let mut child = command(check.program)
+        .args(&check.args)
+        .current_dir(root.join(&check.dir))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't run {display}: {e}"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let mut stopped = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+            break Some(status);
+        }
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            stopped = Some(if cancel.load(Ordering::Relaxed) { "cancelled" } else { "out of time" });
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let mut stderr = stderr.join().unwrap_or_default();
+    if let Some(why) = stopped {
+        stderr.push_str(&format!("\n(stopped: {why})"));
+    }
     Ok(RunStep {
-        command,
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        exit_code: output.status.code(),
+        command: display,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr,
+        exit_code: status.and_then(|s| s.code()),
     })
+}
+
+/// The language name for a file's code fence.
+fn fence(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "py" => "python",
+        "rs" => "rust",
+        "ts" | "tsx" => "typescript",
+        "js" | "mjs" => "javascript",
+        "vue" => "vue",
+        "c" | "h" => "c",
+        "cpp" | "hpp" | "cu" | "cuh" => "cpp",
+        "sh" => "bash",
+        "md" => "markdown",
+        "toml" => "toml",
+        "json" => "json",
+        _ => "",
+    }
+}
+
+/// Under `tauri dev`, writing to the app's own Rust source restarts the app, and the run with it.
+/// Debug builds therefore leave that folder alone; an installed (release) app can edit it.
+fn restarts_this_app(path: &Path) -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
+    let own = Path::new(env!("CARGO_MANIFEST_DIR"));
+    match (path.canonicalize().or_else(|_| path.parent().map_or(Err(std::io::ErrorKind::NotFound.into()), Path::canonicalize)), own.canonicalize()) {
+        (Ok(p), Ok(own)) => p.starts_with(own),
+        _ => false,
+    }
 }
 
 /// Writes `new_text` to `relative_path` inside `root`, after confirming the path stays
 /// contained, and returns the before/after pair for the report.
 fn write_file(root: &Path, relative_path: &str, new_text: &str) -> Result<FileChange, String> {
     let target = contained(root, &root.join(relative_path))?;
+    if restarts_this_app(&target) {
+        return Err(format!(
+            "{relative_path} is this app's own Rust code; editing it under `tauri dev` would restart the app mid-run. Use a release build for that."
+        ));
+    }
     let before = std::fs::read_to_string(&target).unwrap_or_default();
     std::fs::write(&target, new_text).map_err(|e| format!("couldn't write {}: {e}", target.display()))?;
     Ok(FileChange { path: relative_path.to_string(), before, after: new_text.to_string() })
@@ -357,7 +513,7 @@ pub fn run(
             }
         };
         let text = std::fs::read_to_string(&path).map_err(|e| format!("couldn't read {file}: {e}"))?;
-        listing.push_str(&format!("File `{file}`:\n```python\n{text}\n```\n\n"));
+        listing.push_str(&format!("File `{file}`:\n```{}\n{text}\n```\n\n", fence(file)));
     }
 
     loop {
@@ -426,15 +582,12 @@ pub fn run(
         report.edits.push(change.clone());
         progress(&report.narration);
 
-        let run_target = if relative_path.ends_with("_test.py") || relative_path.starts_with("test_") {
-            relative_path.clone()
-        } else {
-            match files.iter().find(|f| f.ends_with("_test.py") || f.starts_with("test_")) {
-                Some(t) => t.clone(),
-                None => relative_path.clone(),
-            }
+        let Some(check) = check_for(root, &relative_path, files) else {
+            report.narration.push(format!("No check runs for {relative_path}'s file type, so stopping after the edit"));
+            report.stopped_reason = "finished: edited, nothing to check it with".to_string();
+            break;
         };
-        let step = match run_python(root, &run_target) {
+        let step = match run_check(root, &check, deadline, cancel) {
             Ok(s) => s,
             Err(e) => {
                 report.stopped_reason = e;
@@ -455,11 +608,12 @@ pub fn run(
             break;
         }
         let tail: String = output.chars().rev().take(2000).collect::<Vec<_>>().into_iter().rev().collect();
-        last_failure = format!("After your last edit, `{run_target}` failed with:\n```\n{}\n```\n\n", tail.trim());
+        last_failure = format!("After your last edit, `{}` failed with:\n```\n{}\n```\n\n", check.display(), tail.trim());
 
+        let lang = fence(&relative_path);
         listing = listing.replace(
-            &format!("File `{relative_path}`:\n```python\n{}", change.before),
-            &format!("File `{relative_path}`:\n```python\n{}", change.after),
+            &format!("File `{relative_path}`:\n```{lang}\n{}", change.before),
+            &format!("File `{relative_path}`:\n```{lang}\n{}", change.after),
         );
     }
 
@@ -601,5 +755,57 @@ mod tests {
         let result = write_file(&dir, "../escape.py", "evil = 1\n");
         assert!(result.is_err());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_ignores_untracked_files() {
+        let dir = temp_repo();
+        fs::write(dir.join("scratch.txt"), "notes\n").unwrap();
+        assert!(snapshot(&dir).unwrap().is_some());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn picks_a_check_for_each_language() {
+        let dir = temp_repo();
+        fs::create_dir_all(dir.join("crate/src")).unwrap();
+        fs::write(dir.join("crate/Cargo.toml"), "[package]\n").unwrap();
+        fs::write(dir.join("crate/src/lib.rs"), "").unwrap();
+        fs::create_dir_all(dir.join("ext/src")).unwrap();
+        fs::write(dir.join("ext/package.json"), r#"{"scripts":{"test":"node --test"}}"#).unwrap();
+        fs::create_dir_all(dir.join("ui/src")).unwrap();
+        fs::write(dir.join("ui/package.json"), r#"{"devDependencies":{"vue-tsc":"^2"}}"#).unwrap();
+        let files = vec!["a.py".to_string(), "test_a.py".to_string()];
+
+        let check = |path: &str| check_for(&dir, path, &files).map(|c| c.display());
+        assert_eq!(check("a.py").as_deref(), Some("python -m pytest test_a.py"));
+        assert_eq!(check("crate/src/lib.rs").as_deref(), Some("cargo test --lib (in crate)"));
+        assert_eq!(check("ext/src/client.ts").as_deref(), Some("npm test (in ext)"));
+        assert_eq!(check("ui/src/App.vue").as_deref(), Some("npx vue-tsc --noEmit (in ui)"));
+        assert_eq!(check("README.md"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_check_reports_failure_and_output() {
+        let dir = temp_repo();
+        let check = Check { program: "git", args: vec!["no-such-command".into()], dir: String::new() };
+        let step = run_check(&dir, &check, Instant::now() + Duration::from_secs(30), &AtomicBool::new(false)).unwrap();
+        assert_ne!(step.exit_code, Some(0));
+        assert!(step.stderr.contains("no-such-command"), "{}", step.stderr);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn listings_fence_code_in_its_own_language() {
+        assert_eq!(fence("app/src-tauri/src/lib.rs"), "rust");
+        assert_eq!(fence("vscode-xenon/src/client.ts"), "typescript");
+        assert_eq!(fence("training/eval_code.py"), "python");
+    }
+
+    #[test]
+    fn debug_builds_leave_their_own_rust_code_alone() {
+        assert!(restarts_this_app(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")));
+        assert!(!restarts_this_app(&std::env::temp_dir().join("elsewhere.rs")));
     }
 }

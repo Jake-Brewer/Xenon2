@@ -45,6 +45,11 @@ function codeEditor(): vscode.TextEditor | undefined {
   return isCode(active) ? active : lastEditor;
 }
 
+function workspaceFolder(): string | undefined {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  return folder?.uri.scheme === "file" ? folder.uri.fsPath : undefined;
+}
+
 async function workspaceOverview(): Promise<string | undefined> {
   const folder = vscode.workspace.workspaceFolders?.[0];
   if (!folder) return undefined;
@@ -139,6 +144,7 @@ export function activate(extension: vscode.ExtensionContext): void {
     settings,
     currentContext: () => contextFrom(lastEditor),
     overview: workspaceOverview,
+    workspace: workspaceFolder,
     lastTarget: () => lastTarget,
     setBusy: (value) => {
       busy = value;
@@ -266,7 +272,13 @@ function registerParticipant(extension: vscode.ExtensionContext): void {
     token.onCancellationRequested(() => abort.abort());
     try {
       stream.progress(withCode ? "Reading your selection…" : "Thinking…");
-      const finish = await streamChat(resolveConnection(settings()), messages, settings(), (text) => stream.markdown(text), abort.signal);
+      const finish = await streamChat(
+        resolveConnection(settings()),
+        messages,
+        { ...settings(), workspace: workspaceFolder() },
+        (text) => stream.markdown(text),
+        abort.signal,
+      );
       if (finish === "length") stream.markdown("\n\n*(Stopped at the reply length limit.)*");
     } catch (err) {
       stream.markdown(`**Xenon:** ${err instanceof Error ? err.message : String(err)}`);

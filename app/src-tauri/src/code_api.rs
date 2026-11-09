@@ -256,6 +256,14 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                         .last()
                         .map(|m| message_text(&m.content))
                         .unwrap_or_default();
+                    if let Some(root) = chat.workspace.as_deref().map(std::path::Path::new).filter(|p| p.is_dir()) {
+                        let started = std::time::Instant::now();
+                        let found = crate::code_search::search(root, &last_question);
+                        eprintln!("xenon2: code search took {} ms, found {} chars", started.elapsed().as_millis(), found.len());
+                        if !found.is_empty() {
+                            prompt.last = with_found_lines(&prompt.last, &found);
+                        }
+                    }
                     let examples = example_bank::examples_for(app, &last_question, AGENT);
                     if !examples.is_empty() {
                         eprintln!("xenon2: code API using {} rated example(s) in this prompt", examples.len());
@@ -343,6 +351,9 @@ pub struct ChatRequest {
     pub top_p: Option<f32>,
     /// Not part of the OpenAI format; the extension may send it.
     pub repeat_penalty: Option<f32>,
+    /// Not part of the OpenAI format: the project folder the question is about. When given, the
+    /// lines of it that best match the question go in front of it (see `code_search.rs`).
+    pub workspace: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -438,6 +449,15 @@ Xenon: ", &format!("
         repeat_penalty: request.repeat_penalty.unwrap_or(1.2).clamp(1.0, 2.0),
     };
     Ok(Prompt { prior, last: format!("User: {question}\n\n{}:{}", style.label, style.opener), params })
+}
+
+/// Puts search results inside the new user turn, ahead of the question, so the model reads them
+/// as part of what was asked. Like rated examples, they stay out of the cached `prior`.
+fn with_found_lines(last: &str, found: &str) -> String {
+    match last.strip_prefix("User: ") {
+        Some(rest) => format!("User: {}\n{rest}", clean(found)),
+        None => last.to_string(),
+    }
 }
 
 /// Appends rated examples to `text` as "User: ... / <label>: ..." turns, the same shape as the

@@ -10,6 +10,8 @@ export interface Host {
   currentContext(): CodeContext | undefined;
   /** What the open workspace is, sent ahead of each chat. */
   overview(): Promise<string | undefined>;
+  /** The open project folder, which the app searches for lines that match each question. */
+  workspace(): string | undefined;
   /** The editor and range a "replace" applies to. */
   lastTarget(): { editor: vscode.TextEditor; range: vscode.Range } | undefined;
   setBusy(busy: boolean): void;
@@ -176,7 +178,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       finish = await streamChat(
         connection,
         [...system, ...this.messages],
-        settings,
+        { ...settings, workspace: this.host.workspace() },
         (piece) => {
           reply += piece;
           this.post({ type: "token", text: piece });
