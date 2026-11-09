@@ -36,6 +36,8 @@ pub const MAX_RUNS: u32 = 3;
 pub const MAX_SECONDS: u64 = 10 * 60;
 /// Lines shown on each side of the lines Xenon rewrites, as context it can't change.
 const CONTEXT_LINES: usize = 3;
+/// Tries at one place in a file before moving on to the next-best place.
+const TRIES_PER_PLACE: usize = 2;
 /// Lines Xenon rewrites from a definition down (its signature and the start of its body).
 const EDIT_LINES: usize = 4;
 /// Files to work on when none are named: few, since each is read whole into every prompt.
@@ -683,6 +685,8 @@ pub fn run(
     let mut last_failure = String::new();
     // Per check command: the compiler warnings it gave before any edit.
     let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
+    // Per file: the line ranges already rewritten without success.
+    let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
 
     // Names typed as `inference.rs` or `src/inference.rs` mean the one real file ending that way.
     // With no names at all, search the folder for the goal and work on the best matches.
@@ -772,11 +776,19 @@ pub fn run(
         // two neighbours. A few lines on either side are shown as context but never replaced:
         // when they were part of the rewrite, Xenon dropped one of them.
         let file_lines: Vec<&str> = current.lines().collect();
-        let Some(best) = crate::code_search::best_line(&current, goal) else {
-            report.stopped_reason = format!("couldn't find where in {relative_path} the goal applies");
+        // Each place gets two tries, then the next-best place: retrying the same lines got the
+        // same wrong edit three times running, but a second try with the failure in front of it
+        // often fixes the first.
+        let tried_here = tried.entry(relative_path.clone()).or_default();
+        let Some((from, to)) = crate::code_search::ranked_lines(&current, goal)
+            .into_iter()
+            .map(|line| edit_range(&file_lines, line))
+            .find(|range| tried_here.iter().filter(|r| *r == range).count() < TRIES_PER_PLACE)
+        else {
+            report.stopped_reason = format!("tried every place in {relative_path} that matches the goal");
             break;
         };
-        let (from, to) = edit_range(&file_lines, best);
+        tried_here.push((from, to));
         let target = file_lines[from..to].join("\n");
         let before = file_lines[from.saturating_sub(CONTEXT_LINES)..from].join("\n");
         let after = file_lines[to..(to + CONTEXT_LINES).min(file_lines.len())].join("\n");
@@ -834,11 +846,10 @@ pub fn run(
                         break;
                     }
                 };
+                // Failing already is often the point ("make the failing test pass"); the run
+                // succeeds only once the whole check passes, so it just goes in the report.
                 if step.exit_code != Some(0) {
-                    report.narration.push(format!("`{key}` already fails before any edit"));
-                    report.stopped_reason = format!("`{key}` fails before any edit; fix that first");
-                    report.runs.push(step);
-                    break;
+                    report.narration.push(format!("`{key}` fails before any edit"));
                 }
                 baselines.insert(key, warnings(&format!("{}{}", step.stdout, step.stderr)));
             }

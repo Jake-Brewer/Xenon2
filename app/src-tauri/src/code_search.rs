@@ -137,9 +137,10 @@ pub fn snap_path(root: &Path, written: &str) -> Option<String> {
     found.next().is_none().then_some(first)
 }
 
-/// The line of `text` (0-based) that best matches `question`, weighted as `search` weighs files:
-/// common words count for nothing, rare ones and identifiers for more, a definition for most.
-pub fn best_line(text: &str, question: &str) -> Option<usize> {
+/// Every line of `text` that matches `question` at all (0-based), best first, weighted as
+/// `search` weighs files: common words count for nothing, rare ones and identifiers for more, a
+/// definition for most. Ties go to the earlier line.
+pub fn ranked_lines(text: &str, question: &str) -> Vec<usize> {
     let words = keywords(question);
     let lowered: Vec<String> = text.lines().map(str::to_lowercase).collect();
     let weights: Vec<f32> = words
@@ -153,7 +154,7 @@ pub fn best_line(text: &str, question: &str) -> Option<usize> {
             }
         })
         .collect();
-    let (best, score) = text
+    let mut scored: Vec<(usize, f32)> = text
         .lines()
         .zip(&lowered)
         .enumerate()
@@ -166,8 +167,10 @@ pub fn best_line(text: &str, question: &str) -> Option<usize> {
                 .sum();
             (i, score)
         })
-        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))?;
-    (score > 0.0).then_some(best)
+        .filter(|&(_, score)| score > 0.0)
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    scored.into_iter().map(|(i, _)| i).collect()
 }
 
 /// One file's match: its path and best lines (1-based number, text), in file order.
@@ -330,8 +333,8 @@ mod tests {
                     export const SKIP_DIRS = new Set([\"node_modules\", \".git\"]);\n\
                     export function formatOverview(workspace) {}\n";
         let goal = "Add \"models\" to SKIP_DIRS in the extension's context.ts, so the workspace overview stops listing the model files.";
-        assert_eq!(best_line(text, goal), Some(2));
-        assert_eq!(best_line(text, "what is the weather"), None);
+        assert_eq!(ranked_lines(text, goal).first(), Some(&2));
+        assert!(ranked_lines(text, "what is the weather").is_empty());
     }
 
     #[test]
