@@ -144,12 +144,30 @@ pub fn start(app: AppHandle, engine: EngineState, model_name: String) {
             let model_name = model_name.clone();
             std::thread::spawn(move || {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let closer = stream.try_clone();
                 if let Err(e) = handle(stream, &app, &engine, &token, &model_name) {
                     eprintln!("xenon2: code API request failed: {e}");
+                }
+                if let Ok(closer) = closer {
+                    close_gracefully(closer);
                 }
             });
         }
     });
+}
+
+/// Ends a connection so the client gets every byte. Dropping the socket right after the last
+/// write let Windows turn the close into a reset that discarded what was still in flight: about
+/// one streamed reply in three lost its last piece and `[DONE]`, and the client saw "connection
+/// forcibly closed". Sending FIN first and waiting briefly for the client to close its side is the
+/// usual graceful close.
+fn close_gracefully(mut stream: TcpStream) {
+    use std::io::Read;
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut sink = [0u8; 512];
+    while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
 }
 
 #[derive(Debug, PartialEq)]
