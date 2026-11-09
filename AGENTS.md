@@ -8,7 +8,8 @@ model locally, a Python voice sidecar, and a VS Code extension that uses the app
 repo. Judge model and feature work by whether it makes Xenon better at that: answering questions
 about this repo, editing it, and running its checks. `training/make_self_data.py` builds the exam
 and training set from the repo itself (where things are defined, commit diffs and messages, the
-repo map); score changes against it.
+repo map); score changes against it. `CODING_STRATEGIES.md` lists what works for a small model on
+a large code base, with sources, and what is done here.
 
 ## First run on a new checkout
 

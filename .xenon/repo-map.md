@@ -9,8 +9,10 @@ a coding API that a VS Code extension uses. RWKV is a recurrent model with no co
 - SCHEMA.md: the JSON format of saved conversations.
 - EXPORT_FORMAT.md: the layout of a memory export (models, voice models, conversations).
 - ONLINE_LEARNING.md: research notes on learning from good/bad ratings of replies.
+- CODING_STRATEGIES.md: what helps a small model work on a large code base, with sources.
+- AGENTS.md: setup and rules for coding agents working on this repo (CLAUDE.md points to it).
 - prompts/phase1..8_prompt.md: the original task brief for each build phase.
-- models/ (not in git): the RWKV model files the app loads.
+- models/: the RWKV models, stored in Git LFS as parts and joined on first use.
 
 ## app/ (the desktop app)
 - src/App.vue: main window; wires chat, voice, menus, and the Stop button to the backend.

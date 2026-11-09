@@ -1,0 +1,42 @@
+# Coding strategies for a small local model
+
+How to get useful work on a large code base out of Xenon (RWKV-7 G1l 2.9B, ~23 tok/s writing,
+~900 tok/s reading, recurrent state that can be cached and copied). Collected 2026-11-09 from the
+sources linked below; numbers are theirs unless marked as ours.
+
+The short version: a small model does well when it is asked one narrow question at a time, sees
+only the few lines that matter, writes short output in a fixed shape, and has its work checked by
+running code. Training helps its habits, not its knowledge of the repo.
+
+## Ranked, with status
+
+| # | Technique | Evidence | Status here |
+|---|---|---|---|
+| 1 | **Snap paths to real files.** Map a written path to the one repo file ending with it, or constrain decoding to real paths. | Ours: 87/100 answers name the right file, 37/100 the exact path. Grammar-constrained output didn't cost accuracy ([JSONSchemaBench](https://arxiv.org/html/2501.10868v3)). | Done for the folder agent (`snap_path`, `snap_to_list`). |
+| 2 | **Read twice.** Recurrent models read once, front to back: state the question before the material, and again after it. | +11 points on average across 16 recurrent models, RWKV among them ([Just Read Twice](https://arxiv.org/abs/2407.05483)); [RWKV prompt guide](https://wiki.rwkv.com/RWKV-Prompts/prompt-guidelines.html). | Done for code search results. The cached repo-map preamble comes before any question, so it is only for orientation. |
+| 3 | **Short edits, applied leniently.** SEARCH/REPLACE blocks instead of whole-file rewrites; apply with whitespace-tolerant matching. | Strict patch application gave 9x more edit errors ([aider](https://aider.chat/2023/12/21/unified-diffs.html)). Small models gain little accuracy from any format ([Diff-XYZ](https://arxiv.org/abs/2510.12487v2)), so the win is speed: a 300-line rewrite is ~130 s here, an edit block ~7 s. | Next. |
+| 4 | **Sample several, let tests choose.** N candidate edits from copies of one state; prefer those that pass regression and reproduction tests. | 15.9% → 56% on SWE-bench Lite from 1 to 250 samples ([Large Language Monkeys](https://arxiv.org/abs/2407.21787)); test selection +6.3 points in Agentless; a 3B model beat GPT-4o-mini with sampling plus test-based selection ([S*](https://arxiv.org/abs/2502.14382)). RWKV state copies make each extra sample cost only its own tokens. | After 3. |
+| 5 | **Fixed pipeline, not an open agent.** Localize files (map + search), then functions (signature skeletons), then lines (±10 lines), then edit, then validate. | Agentless beat the agent systems of its time at $0.70/issue; skeletons beat whole files for localization, 58.3% vs 53.7% ([Agentless](https://arxiv.org/html/2407.01489v2)). | Partly: search localizes files. Skeletons to do. |
+| 6 | **Interface rules.** Reject edits that don't parse, with a one-line reason; show code in ~100-line windows; give search results as one list; feed back only the last few failures. | Without the edit linter, 18.0% → 15.0%; full-file view 12.7% vs 100-line window 18.0%; full history 15.0% vs last five 18.0%; one-at-a-time search 12.0%, worse than none ([SWE-agent](https://arxiv.org/html/2405.15793v3)). | Failures are already cut to the last 2,000 characters. |
+| 7 | **Keyword search, plus definitions and references.** Keep BM25-style search; add a symbol index; re-search with the model's own draft. | BM25 matched the best embeddings on repo-level completion (93.2 vs 94.3 NDCG@10); LLM reranking hurt (27.4 → 9.1) ([CodeRAG-Bench](https://arxiv.org/html/2406.14497)); re-search with a draft gave >10% ([RepoCoder](https://arxiv.org/abs/2303.12570)). | Keyword search with definition boost done (`code_search.rs`). |
+| 8 | **Few-shot from this repo in the cached preamble.** 2–3 worked examples in the exact output format. | Removing the demonstration cost SWE-agent 1.7 points; the RWKV guide recommends few-shot. | The example bank does this per question; a fixed set is to do. |
+| 9 | **Fine-tune for format and behavior, not facts.** State-tune or QLoRA on question → exact path and diff → edit pairs. | Fine-tuning facts in loses to retrieval ([Ovadia et al.](https://arxiv.org/abs/2312.05934)); training on agent trajectories gave up to +19 points ([SWE-Gym](https://arxiv.org/abs/2412.21139)). | Data ready (`training/make_self_data.py --sft`); run after 3 and 4. |
+| 10 | **Think freely, constrain only the edit.** No grammar on the plan; grammar only from the edit marker on. | Strict formats hurt reasoning ([Let Me Speak Freely](https://arxiv.org/abs/2408.02442)). | With 3. |
+
+## Known not to work for small models
+
+- Search that returns one result at a time (worse than no search), whole files or full history in
+  the prompt, line-number edit formats, exact-match patch application.
+- Reranking retrieved chunks with the model; embedding-only retrieval.
+- Majority vote without running anything: it plateaus. Tests are what make sampling pay.
+- Training on raw repo code to teach it the code base.
+- Open-ended agent loops: every free choice is another place for a 2.9B model to go wrong.
+
+## Measurements here
+
+"Which file defines X", 100 held-out questions from `training/make_self_data.py`:
+
+| Setup | exact path | right file |
+|---|---|---|
+| no search | 0 | 1 |
+| search, results before the question | 37 | 87 |
