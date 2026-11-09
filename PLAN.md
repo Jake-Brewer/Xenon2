@@ -639,6 +639,17 @@ re-indented a test function, the warning it was asked to remove stayed, and all 
 the train split, code corrections from ratings, the agent's fixed mistakes) as the prompt Xenon saw
 plus a known-right answer, never a failed attempt. One in five new items goes to a held-out set.
 
+**Harder edit tasks and a step fallback [partly] (2026-11-09)** — three multi-place tasks added
+(rename across two files, a behavior change whose test must change with it, two uses of one new
+constant). The folder agent can break a goal into numbered steps, but doing so for *every* goal was
+a regression (a small model over-decomposes; 7/7 → 2/9), so step-planning is now a fallback used
+only when the one-edit loop hits its budget without finishing (`0ead092`). Benchmark now 7/10: all
+seven single-place tasks pass; the three multi-place ones fail. `two-places-one-file` exposed that
+"the project's tests pass" ≠ "goal met": Xenon added the constant, the repo's weak test passed, and
+it never changed the two call sites — the one-edit loop can't tell the goal is unmet when the test
+is lenient. This is the case for item 1 below (mutation testing / stronger checks); the step
+fallback also needs to carry forward which sub-goals are already done.
+
 Next, in order:
 1. Stronger checks: Rust edits must not add warnings; mutation testing (`cargo-mutants`,
    `mutmut`, Stryker) to find what the tests miss, starting with code search, the folder agent and
