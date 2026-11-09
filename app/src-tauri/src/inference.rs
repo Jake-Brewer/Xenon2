@@ -159,16 +159,55 @@ pub fn get_inference_device(device_info: tauri::State<'_, DeviceInfo>) -> String
     device_info.0.clone()
 }
 
-/// One ggml worker per physical core. Hyperthreads share a core's execution units, and this
-/// model gets slower when two workers are pinned to the same core. Dementia and Sloth both use
-/// the single engine loaded below, so they both get this count.
+/// One ggml worker per physical core, less one core kept free so typing and the rest of the
+/// desktop stay responsive. Hyperthreads share a core's execution units, and this model gets
+/// slower when two workers are pinned to the same core. Dementia and Sloth both use the single
+/// engine loaded below, so they both get this count.
 fn inference_threads() -> u32 {
     let logical = std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1)
         .max(1);
     let physical = physical_cpus().unwrap_or(logical);
-    physical.clamp(1, logical)
+    physical.saturating_sub(1).clamp(1, logical)
+}
+
+/// With every layer on the GPU the CPU workers only wait on it, spinning a core each. Measured on
+/// the RTX 2060 laptop: 6 workers gave 19.8 tok/s for 60 s of CPU time over a 14 s run and made
+/// the keyboard lag; 1 worker gave 23.1 tok/s for 10 s of CPU time.
+fn threads_for(gpu_layers: u32) -> u32 {
+    if gpu_layers >= FULL_GPU_LAYERS {
+        1
+    } else {
+        inference_threads()
+    }
+}
+
+/// Asks rwkv.cpp for more layers than any model has, which offloads all of them plus the head.
+const FULL_GPU_LAYERS: u32 = 999;
+
+/// Runs the app below normal priority, so the OS serves keyboard and mouse input before inference.
+#[cfg(windows)]
+fn yield_to_the_desktop() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32;
+    }
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x4000;
+    unsafe {
+        SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
+    }
+}
+
+#[cfg(not(windows))]
+fn yield_to_the_desktop() {
+    extern "C" {
+        fn nice(inc: i32) -> i32;
+    }
+    unsafe {
+        nice(5);
+    }
 }
 
 fn logical_cpus() -> u32 {
@@ -260,7 +299,7 @@ fn preferred_gpu_layers(free_mib: Option<u32>) -> u32 {
     match free_mib {
         Some(free) if free < 1200 => 0,
         Some(free) if free < 3400 => 16,
-        _ => 999,
+        _ => FULL_GPU_LAYERS,
     }
 }
 
@@ -300,10 +339,10 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     let vocab_path_c = CString::new(vocab_path.to_string_lossy().as_bytes())
         .expect("vocab path contains NUL byte");
 
-    // Dementia and Sloth share this one engine. Thread count follows the physical cores.
-    // rwkv.cpp clamps n_gpu_layers to n_layer+1, and that clamped value offloads every block
-    // plus the output head. A CPU-only library ignores the layer count.
-    let threads = inference_threads();
+    // Dementia and Sloth share this one engine. Thread count depends on how much runs on the GPU
+    // (see `threads_for`). rwkv.cpp clamps n_gpu_layers to n_layer+1, and that clamped value
+    // offloads every block plus the output head. A CPU-only library ignores the layer count.
+    yield_to_the_desktop();
     let gpu_compiled = unsafe { ffi::xenon_has_gpu_support() } != 0;
     if gpu_compiled {
         crate::gpu_temp::start_monitor();
@@ -325,7 +364,9 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
 
     let mut engine = std::ptr::null_mut();
     let mut used_layers = 0u32;
+    let mut threads = threads_for(0);
     for (attempt, &layers) in layer_plan.iter().enumerate() {
+        threads = if gpu_compiled { threads_for(layers) } else { threads_for(0) };
         if attempt > 0 {
             eprintln!(
                 "xenon2: model load with the previous GPU plan failed ({}). Retrying with {layers} GPU layers.",
