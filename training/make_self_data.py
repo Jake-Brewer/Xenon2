@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from eval_repo_map import ROOT, map_entries, post, question as file_question  # noqa: E402
 
 OUT = ROOT / "training" / "out" / "self_data.jsonl"
+MISSES = ROOT / "training" / "out" / "exam_misses.jsonl"
 SOURCE_DIRS = ["app/src", "app/src-tauri/src", "vscode-xenon/src", "voice-pipeline", "training", "scripts",
                "inference-engine/src"]
 DEFINITIONS = {
@@ -114,13 +115,19 @@ def ask(question, search=True):
     return reply["choices"][0]["message"]["content"].strip()
 
 
-def score(kind, search):
+def score(kind, search, split="eval"):
+    """Asks the running app the items of one kind and split. On the train split, the misses go to
+    MISSES for the next training batch; the eval split is never trained on, so its score stays
+    honest."""
     items = [json.loads(line) for line in OUT.read_text(encoding="utf-8").splitlines()]
-    items = [i for i in items if i["kind"] == kind and i["split"] == "eval"]
+    items = [i for i in items if i["kind"] == kind and i["split"] == split]
     right = right_file = 0
+    misses = []
     for item in items:
         reply = ask(item["question"], search)
         ok = item["answer"] in reply if kind == "where" else None
+        if ok is False:
+            misses.append({**item, "reply": reply, "workspace": str(ROOT) if search else None})
         # Right file, path shortened (e.g. "src/inference.rs"): useful, but not the full answer.
         near = kind == "where" and not ok and re.search(r"\b" + re.escape(item["answer"].rsplit("/", 1)[-1]) + r"\b", reply)
         right += bool(ok)
@@ -129,6 +136,12 @@ def score(kind, search):
         print(f"{mark}{item['answer'][:60]!r} <- {reply[:100]!r}")
     if kind == "where":
         print(f"{right}/{len(items)} exact path, {right_file}/{len(items)} right file")
+    if split == "train":
+        MISSES.parent.mkdir(parents=True, exist_ok=True)
+        with MISSES.open("a", encoding="utf-8") as out:
+            for miss in misses:
+                out.write(json.dumps(miss) + "\n")
+        print(f"Added {len(misses)} misses to {MISSES}")
 
 
 def write_sft(path):
@@ -143,7 +156,8 @@ def write_sft(path):
             if item["kind"] == "where":
                 body["workspace"] = str(ROOT)
             prompt = post("/v1/prompt", body)
-            out.write(json.dumps({"text": prompt["prior"] + prompt["last"] + " " + item["answer"].strip() + "\n\n"}) + "\n")
+            # No space: replies start right after the prompt's "<think></think>".
+            out.write(json.dumps({"text": prompt["prior"] + prompt["last"] + item["answer"].strip() + "\n\n"}) + "\n")
     print(f"Wrote {len(items)} training texts to {path}")
 
 
@@ -152,11 +166,13 @@ def main():
     parser.add_argument("--score", choices=["where", "commit", "file"], help="ask the running app the held-out items")
     parser.add_argument("--no-search", action="store_true", help="don't let the app search the repo (baseline)")
     parser.add_argument("--sft", metavar="PATH", help="write the train items as RWKV-PEFT training text")
+    parser.add_argument("--split", choices=["eval", "train"], default="eval",
+                        help="which items --score asks; train-split misses are saved for training")
     args = parser.parse_args()
     if args.sft:
         write_sft(args.sft)
     elif args.score:
-        score(args.score, not args.no_search)
+        score(args.score, not args.no_search, args.split)
     else:
         build()
     return 0
