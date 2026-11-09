@@ -24,7 +24,9 @@ a large code base, with sources, and what is done here.
    - CPU only: `cd inference-engine && ./build_cpu.sh`
    Machines without a GPU are supported. The app uses the CPU build when there is no CUDA build
    and falls back to the CPU if CUDA fails. Only training needs a GPU.
-4. Desktop app: `cd app && npm install && npm run tauri dev`.
+4. Desktop app: `cd app && npm install && npm run tauri dev`. When Xenon is to edit its own Rust
+   (folder agent), run the release build instead: `bash scripts/run-release.sh`. Dev mode
+   restarts the app on every Rust edit, which would stop the run.
 5. Voice (optional): follow `voice-pipeline/README.md` (a venv in `voice-pipeline/.venv` and a
    piper voice in `voice-pipeline/models/`). Without it, typed chat still works.
 6. VS Code extension (optional): `cd vscode-xenon && npm install && npm run package`, then

@@ -70,6 +70,7 @@ a coding API that a VS Code extension uses. RWKV is a recurrent model with no co
   commit messages, the repo map); `--score where` asks the running app.
 - eval_repo_map.py: asks Xenon to describe each file in this map and sends corrections.
 - run_edit_tasks.py, edit_tasks/: scores the folder agent on small edit tasks with hidden checks.
+- build_batch.py: collects corrected mistakes into the next training batch, one in five held out.
 - make_python_sft.py, make_python_data.py: build Python coding training sets.
 - eval_code.py: scores Xenon's Python answers by running their tests (pass@1).
 - export_feedback.py: turns app ratings into a training set.

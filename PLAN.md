@@ -630,9 +630,28 @@ files, has the model pick a file and then rewrite a few lines that the agent pic
 started for it), and undoes failed edits. `training/run_edit_tasks.py`: 7 of 7 small tasks with
 hidden checks, 6–30 s each. First edit of its own repo from a goal alone: `b15c9c1` (36 s).
 
-Next: harder edit tasks (Rust and TypeScript, edits spanning places, goals that need reading
-more than one file); sampling several edits and letting the tests choose; then training on the
-"where" and commit items (state tuning or LoRA) and re-scoring.
+**Release build for self-edits [x]** — `scripts/run-release.sh` builds and restarts the release
+app, which has no file watcher, so Xenon can edit and test its own Rust (first try: 40 s with
+`cargo test` inside the run). That try also showed the checks are too weak: Xenon only
+re-indented a test function, the warning it was asked to remove stayed, and all tests passed.
+
+**Training batch [x]** — `training/build_batch.py` collects corrected mistakes (exam misses from
+the train split, code corrections from ratings, the agent's fixed mistakes) as the prompt Xenon saw
+plus a known-right answer, never a failed attempt. One in five new items goes to a held-out set.
+
+Next, in order:
+1. Stronger checks: Rust edits must not add warnings; mutation testing (`cargo-mutants`,
+   `mutmut`, Stryker) to find what the tests miss, starting with code search, the folder agent and
+   the API; a protected set of tests the agent may not edit.
+2. Code and test changed together as one unit when a goal changes behavior, never a loosened test.
+3. The folder agent writes its fixed mistakes (failed prompt + the change that later passed) for
+   the batch.
+4. Training close to the mistakes without getting in the way: small batches (about 20 items, or
+   one that matters), run only while the user is idle (no input or requests for ~10 minutes, no
+   game, GPU free and cool), stopped the moment they return, kept only if the held-out set and
+   the edit tasks don't get worse, loaded as a tuned state.
+5. Harder edit tasks (Rust, TypeScript, several places, several files), breaking big goals into
+   smaller ones until each is small enough, and sampling several edits for the tests to choose.
 
 ## Future work (not yet scheduled)
 
