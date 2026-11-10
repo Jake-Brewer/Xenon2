@@ -90,6 +90,23 @@ pub fn pace_for(temp_c: u32) -> Duration {
     Duration::from_millis(pace_ms_per_c() * u64::from(temp_c + 1 - from))
 }
 
+/// One prompt chunk (128 tokens) takes about as long to read as four tokens take to write.
+const CHUNK_IN_TOKENS: u32 = 4;
+
+/// `throttle` for reading a prompt, called between chunks: the same hard pause at `HOT_C`, and
+/// below it the pacing wait of the `CHUNK_IN_TOKENS` tokens a chunk takes as long as.
+pub fn throttle_reading() -> Duration {
+    let now = current();
+    if now >= HOT_C {
+        return throttle();
+    }
+    let wait = pace_for(now) * CHUNK_IN_TOKENS;
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
+    wait
+}
+
 /// Paces or pauses while the GPU is hot. Returns how long it waited.
 pub fn throttle() -> Duration {
     let now = current();

@@ -22,6 +22,9 @@ namespace {
 
 thread_local std::string g_last_error;
 
+xenon_prefill_hook g_prefill_hook = nullptr;
+void * g_prefill_hook_data = nullptr;
+
 void set_last_error(const std::string & msg) {
     g_last_error = msg;
 }
@@ -251,18 +254,29 @@ bool eval_text_into_state(
         return true;
     }
 
-    bool ok = rwkv_eval_sequence_in_chunks(
-        engine->ctx,
-        tokens.data(),
-        tokens.size(),
-        /* chunk_size */ prefill_chunk_size(),
-        /* state_in */ state->state.data(),
-        /* state_out */ state->state.data(),
-        /* logits_out */ state->logits.data()
-    );
-    if (!ok) {
-        set_last_error("xenon_inference: rwkv_eval_sequence_in_chunks failed");
-        return false;
+    // The same chunks rwkv_eval_sequence_in_chunks would read, with the host's hook between them:
+    // reading runs the GPU flat out (~900 tok/s on an RTX 2060), and long prompts back to back
+    // took it to 85 C with nothing pacing them, as writing is paced between tokens.
+    const size_t chunk = prefill_chunk_size();
+    for (size_t start = 0; start < tokens.size(); start += chunk) {
+        const size_t n = std::min(chunk, tokens.size() - start);
+        const bool last = start + n == tokens.size();
+        if (start > 0 && g_prefill_hook) {
+            g_prefill_hook(g_prefill_hook_data);
+        }
+        bool ok = rwkv_eval_sequence(
+            engine->ctx,
+            tokens.data() + start,
+            n,
+            /* state_in */ state->state.data(),
+            /* state_out */ state->state.data(),
+            // Logits only matter after the last chunk; skipping them elsewhere saves time.
+            /* logits_out */ last ? state->logits.data() : nullptr
+        );
+        if (!ok) {
+            set_last_error("xenon_inference: rwkv_eval_sequence failed");
+            return false;
+        }
     }
 
     push_recent_tokens(state, tokens.data(), tokens.size());
@@ -557,6 +571,11 @@ XENON_API int xenon_has_gpu_support(void) {
 
 XENON_API const char * xenon_get_last_error(void) {
     return g_last_error.c_str();
+}
+
+XENON_API void xenon_set_prefill_hook(xenon_prefill_hook hook, void * user_data) {
+    g_prefill_hook = hook;
+    g_prefill_hook_data = user_data;
 }
 
 } // extern "C"

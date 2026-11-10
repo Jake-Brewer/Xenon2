@@ -89,5 +89,8 @@ extern "C" {
 
     pub fn xenon_has_gpu_support() -> c_int;
 
+    /// Called between chunks while a prompt is read; see `gpu_temp::throttle_reading`.
+    pub fn xenon_set_prefill_hook(hook: Option<extern "C" fn(*mut std::ffi::c_void)>, user_data: *mut std::ffi::c_void);
+
     pub fn xenon_get_last_error() -> *const c_char;
 }

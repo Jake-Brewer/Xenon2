@@ -346,6 +346,12 @@ pub fn load_engine(repo_root: &PathBuf) -> (EngineState, ModelInfo, DeviceInfo) 
     let gpu_compiled = unsafe { ffi::xenon_has_gpu_support() } != 0;
     if gpu_compiled {
         crate::gpu_temp::start_monitor();
+        // Reading a prompt runs the GPU flat out; pace it between chunks as writing is paced
+        // between tokens (long prompts back to back reached 85 C without this).
+        extern "C" fn between_prompt_chunks(_: *mut std::ffi::c_void) {
+            crate::gpu_temp::throttle_reading();
+        }
+        unsafe { ffi::xenon_set_prefill_hook(Some(between_prompt_chunks), std::ptr::null_mut()) };
     }
     let free_mib = gpu_memory_free_mib();
     let mut layer_plan = Vec::new();

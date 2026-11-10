@@ -203,6 +203,12 @@ XENON_API size_t xenon_get_n_layer(xenon_engine * engine);
 // 0 otherwise. Lets callers know whether --gpu-layers will actually do anything.
 XENON_API int xenon_has_gpu_support(void);
 
+// Called between chunks while a prompt is read (xenon_prefill, and the prompt part of
+// xenon_generate_with_state), on the calling thread. A host can wait in it, e.g. to let a hot GPU
+// cool: reading runs the GPU flat out and isn't otherwise paused. NULL (the default) disables it.
+typedef void (*xenon_prefill_hook)(void * user_data);
+XENON_API void xenon_set_prefill_hook(xenon_prefill_hook hook, void * user_data);
+
 // Human-readable string for the last error that occurred on this thread. May be empty.
 XENON_API const char * xenon_get_last_error(void);
 
