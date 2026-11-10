@@ -1432,7 +1432,25 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         let mut changes: Vec<FileChange> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let step_goal = format!("{step} (step {} of {}; the whole goal: {goal})", i + 1, steps.len());
-            match attempt(ctx, &step_goal, step, &last_failure, &mut tried, &protected, report)? {
+            // Each step is told what earlier steps of this round already changed: not told, the
+            // fetch step added MAX_RETRIES = 5 again after step 1 had.
+            let done_so_far: String = changes
+                .iter()
+                .map(|c| format!("An earlier step already changed `{}`:\n```diff\n{}\n```\n", c.path, short_diff(&c.before, &c.after)))
+                .collect();
+            let mut feedback = format!("{last_failure}{done_so_far}");
+            let mut outcome = attempt(ctx, &step_goal, step, &feedback, &mut tried, &protected, report)?;
+            // A step that defines a name twice is caught as it's made, and tried once more with
+            // the reason in front of it, rather than failing the whole round at the end.
+            if let Attempt::Edit { path, current, code, .. } = &outcome {
+                let change = FileChange { path: path.clone(), before: current.clone(), after: code.clone() };
+                if let Some(reason) = duplicate_definitions(&[change]) {
+                    report.narration.push(format!("Step {}: {reason}; asking again", i + 1));
+                    feedback = format!("{feedback}Your last try at this step was rejected: {reason}.\n\n");
+                    outcome = attempt(ctx, &step_goal, step, &feedback, &mut tried, &protected, report)?;
+                }
+            }
+            match outcome {
                 Attempt::Edit { path, from, to, written, code, .. } => {
                     protect(&mut protected, &path, from, to, written.lines().count());
                     let change = write_file(ctx.root, &path, &code)?;
