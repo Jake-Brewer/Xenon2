@@ -1,3 +1,6 @@
+import pathlib
+source = pathlib.Path('client.py').read_text()
+assert source.count('MAX_RETRIES =') == 1, 'MAX_RETRIES is defined more than once'
 import client
 assert client.MAX_RETRIES == 5
 def flaky(n):
