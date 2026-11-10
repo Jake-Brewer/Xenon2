@@ -1389,6 +1389,92 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
     }
 }
 
+/// What a round of steps shares as its steps (and their sub-steps) are made: the places tried,
+/// the lines already rewritten, the changes made so far, and how many edits that took.
+struct Round {
+    tried: HashMap<String, Vec<(usize, usize)>>,
+    protected: Vec<(String, usize, usize)>,
+    changes: Vec<FileChange>,
+    edits: u32,
+}
+
+/// How many levels of sub-steps a step may be broken into.
+const MAX_STEP_DEPTH: usize = 2;
+
+/// One step of a round: the Locator and Editor make its edit, told what earlier steps changed. A
+/// step they can't do (no place for it, or the lines written back unchanged) is handed back to the
+/// Planner, and its sub-steps are made the same way, one level deeper, at most `MAX_STEP_DEPTH`.
+#[allow(clippy::too_many_arguments)]
+fn do_step(
+    ctx: &RunContext,
+    goal: &str,
+    step: &str,
+    label: &str,
+    of: usize,
+    depth: usize,
+    last_failure: &str,
+    round: &mut Round,
+    report: &mut Report,
+) -> Result<(), String> {
+    let step_goal = format!("{step} (step {label} of {of}; the whole goal: {goal})");
+    // Each step is told what earlier steps of this round already changed: not told, the fetch
+    // step added MAX_RETRIES = 5 again after step 1 had.
+    let done_so_far: String = round
+        .changes
+        .iter()
+        .map(|c| format!("An earlier step already changed `{}`:
+```diff
+{}
+```
+", c.path, short_diff(&c.before, &c.after)))
+        .collect();
+    let mut feedback = format!("{last_failure}{done_so_far}");
+    let mut outcome = attempt(ctx, &step_goal, step, &feedback, &mut round.tried, &round.protected, report)?;
+    // A step that defines a name twice is caught as it's made, and tried once more with the
+    // reason in front of it, rather than failing the whole round at the end.
+    if let Attempt::Edit { path, current, code, .. } = &outcome {
+        let change = FileChange { path: path.clone(), before: current.clone(), after: code.clone() };
+        if let Some(reason) = duplicate_definitions(&[change]) {
+            report.narration.push(format!("Step {label}: {reason}; asking again"));
+            feedback = format!("{feedback}Your last try at this step was rejected: {reason}.
+
+");
+            outcome = attempt(ctx, &step_goal, step, &feedback, &mut round.tried, &round.protected, report)?;
+        }
+    }
+    let gave_up = match outcome {
+        Attempt::Edit { path, from, to, written, code, .. } => {
+            protect(&mut round.protected, &path, from, to, written.lines().count());
+            let change = write_file(ctx.root, &path, &code)?;
+            round.edits += 1;
+            report.narration.push(format!("Step {label}: edited {path}, lines {}-{to}", from + 1));
+            round.changes.push(change);
+            return Ok(());
+        }
+        Attempt::Done(reason) => {
+            report.narration.push(format!("Step {label}: nothing to change ({reason})"));
+            return Ok(());
+        }
+        Attempt::Unchanged { path, .. } => format!("Xenon left {path} unchanged"),
+        Attempt::Stop(reason) => reason,
+    };
+    if depth >= MAX_STEP_DEPTH {
+        report.narration.push(format!("Step {label}: skipped ({gave_up})"));
+        return Ok(());
+    }
+    // Too big for one edit: break it down, and make each smaller part the same way.
+    let parts = plan(ctx, step, "")?;
+    if parts.len() < 2 {
+        report.narration.push(format!("Step {label}: skipped ({gave_up}; it couldn't be broken down)"));
+        return Ok(());
+    }
+    report.narration.push(format!("Step {label}: {gave_up}, so broke it into {} parts: {}", parts.len(), parts.join(" / ")));
+    for (i, part) in parts.iter().enumerate() {
+        do_step(ctx, goal, part, &format!("{label}.{}", i + 1), parts.len(), depth + 1, last_failure, round, report)?;
+    }
+    Ok(())
+}
+
 /// Several steps: make every step's edit, then check once. Checking after each step would undo
 /// every partial change (a renamed function breaks its callers until the next step). On a
 /// failure all of the steps are undone and the goal is planned again with the failure shown.
@@ -1426,44 +1512,16 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         // A failed round undoes every step, so each round starts from the original files and
         // every place is fresh again. Kept across rounds, the record skipped nearly every step
         // of rounds 2 and 3 as "tried every place".
-        tried.clear();
-        // The lines this round's steps have rewritten, in the files as they are now.
-        let mut protected: Vec<(String, usize, usize)> = Vec::new();
-        let mut changes: Vec<FileChange> = Vec::new();
+        let mut round = Round { tried: std::mem::take(&mut tried), protected: Vec::new(), changes: Vec::new(), edits: 0 };
+        round.tried.clear();
         for (i, step) in steps.iter().enumerate() {
-            let step_goal = format!("{step} (step {} of {}; the whole goal: {goal})", i + 1, steps.len());
-            // Each step is told what earlier steps of this round already changed: not told, the
-            // fetch step added MAX_RETRIES = 5 again after step 1 had.
-            let done_so_far: String = changes
-                .iter()
-                .map(|c| format!("An earlier step already changed `{}`:\n```diff\n{}\n```\n", c.path, short_diff(&c.before, &c.after)))
-                .collect();
-            let mut feedback = format!("{last_failure}{done_so_far}");
-            let mut outcome = attempt(ctx, &step_goal, step, &feedback, &mut tried, &protected, report)?;
-            // A step that defines a name twice is caught as it's made, and tried once more with
-            // the reason in front of it, rather than failing the whole round at the end.
-            if let Attempt::Edit { path, current, code, .. } = &outcome {
-                let change = FileChange { path: path.clone(), before: current.clone(), after: code.clone() };
-                if let Some(reason) = duplicate_definitions(&[change]) {
-                    report.narration.push(format!("Step {}: {reason}; asking again", i + 1));
-                    feedback = format!("{feedback}Your last try at this step was rejected: {reason}.\n\n");
-                    outcome = attempt(ctx, &step_goal, step, &feedback, &mut tried, &protected, report)?;
-                }
-            }
-            match outcome {
-                Attempt::Edit { path, from, to, written, code, .. } => {
-                    protect(&mut protected, &path, from, to, written.lines().count());
-                    let change = write_file(ctx.root, &path, &code)?;
-                    budget.edits += 1;
-                    report.narration.push(format!("Step {}: edited {path}, lines {}-{to}", i + 1, from + 1));
-                    changes.push(change);
-                }
-                Attempt::Unchanged { path, .. } => report.narration.push(format!("Step {}: Xenon left {path} unchanged", i + 1)),
-                Attempt::Done(reason) => report.narration.push(format!("Step {}: nothing to change ({reason})", i + 1)),
-                Attempt::Stop(reason) => report.narration.push(format!("Step {}: skipped ({reason})", i + 1)),
-            }
+            let label = format!("{}", i + 1);
+            do_step(ctx, goal, step, &label, steps.len(), 0, &last_failure, &mut round, report)?;
             progress(&report.narration);
         }
+        budget.edits += round.edits;
+        tried = std::mem::take(&mut round.tried);
+        let changes = round.changes;
         if changes.is_empty() {
             report.stopped_reason = "no step changed anything".to_string();
             return Ok(());
@@ -2141,6 +2199,37 @@ mod tests {
         assert!(duplicate_definitions(&[change(once, twice)]).unwrap().contains("`MAX_RETRIES` more than once"));
         // A name the file already defined twice isn't the edit's doing.
         assert_eq!(duplicate_definitions(&[change(twice, &format!("{twice}# note\n"))]), None);
+    }
+
+    #[test]
+    fn a_step_too_vague_to_place_is_broken_into_parts_that_do_the_work() {
+        let dir = repo_with(&[("a.py", "ALPHA = 1\nBETA = 1\nassert ALPHA == 2 and BETA == 2\n")]);
+        let model = scripted(editing("a.py", "", |_, lines| lines.replace("= 1", "= 2")));
+        let planner = |question: &str, start: &str| -> String {
+            if start != "1." {
+                return model_reply(&model, question, start);
+            }
+            if question.contains("Goal: Do the setup") {
+                " Set ALPHA to 2 in a.py\n2. Set BETA to 2 in a.py\n".into()
+            } else {
+                " Do the setup\n2. Finish up\n".into()
+            }
+        };
+        let model = scripted(planner);
+        let report = run_scripted(&model, &dir, "Set both ALPHA and BETA to 2", &["a.py"]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
+        assert!(report.narration.iter().any(|n| n.contains("Step 1:") && n.contains("broke it into 2 parts")), "{:?}", report.narration);
+        assert!(report.narration.iter().any(|n| n.starts_with("Step 1.1: edited")), "{:?}", report.narration);
+        let text = fs::read_to_string(dir.join("a.py")).unwrap();
+        assert!(text.contains("ALPHA = 2") && text.contains("BETA = 2"), "{text}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// What a scripted model writes after `start`, for building one stand-in from another.
+    fn model_reply(model: &dyn Model, question: &str, start: &str) -> String {
+        let text = model.ask(question, start, &|_| false, Instant::now(), &AtomicBool::new(false)).unwrap();
+        format!("{}\n", text.strip_prefix(start.trim()).unwrap_or(&text).trim_end())
     }
 
     #[test]
