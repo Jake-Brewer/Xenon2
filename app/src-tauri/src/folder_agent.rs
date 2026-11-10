@@ -1455,7 +1455,11 @@ fn do_step(
             report.narration.push(format!("Step {label}: nothing to change ({reason})"));
             return Ok(());
         }
-        Attempt::Unchanged { path, .. } => format!("Xenon left {path} unchanged"),
+        // Lines written back unchanged means the step is already satisfied; don't recurse.
+        Attempt::Unchanged { path, .. } => {
+            report.narration.push(format!("Step {label}: already done ({path} unchanged)"));
+            return Ok(());
+        }
         Attempt::Stop(reason) => reason,
     };
     if depth >= MAX_STEP_DEPTH {
