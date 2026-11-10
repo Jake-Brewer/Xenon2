@@ -578,6 +578,53 @@ fn run_rename(ctx: &RunContext, goal: &str, old: &str, new: &str, report: &mut R
     Ok(false)
 }
 
+/// The names a file defines at the top level (unindented `NAME =`, `def`, `class`, `fn`, `const`,
+/// `static`, `let`, `function`, with `pub`/`export`/`async` in front), one entry per definition.
+fn top_level_definitions(text: &str) -> Vec<String> {
+    const DEFINERS: &[&str] = &["def ", "class ", "fn ", "const ", "static ", "let ", "function ", "struct ", "enum "];
+    const MODIFIERS: &[&str] = &["pub ", "pub(crate) ", "export ", "async ", "default "];
+    let name = |s: &str| -> Option<String> {
+        let n: String = s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        (!n.is_empty() && !n.starts_with(|c: char| c.is_ascii_digit())).then_some(n)
+    };
+    text.lines()
+        .filter(|l| !l.starts_with([' ', '\t']))
+        .filter_map(|line| {
+            let mut rest = line;
+            while let Some(m) = MODIFIERS.iter().find(|m| rest.starts_with(**m)) {
+                rest = &rest[m.len()..];
+            }
+            if let Some(d) = DEFINERS.iter().find(|d| rest.starts_with(**d)) {
+                return name(&rest[d.len()..]);
+            }
+            // NAME = value (not ==, not a keyword such as `if`)
+            let n = name(rest)?;
+            let after = rest[n.len()..].trim_start();
+            (after.starts_with('=') && !after.starts_with("==") && !["if", "for", "while", "return", "else", "elif"].contains(&n.as_str()))
+                .then_some(n)
+        })
+        .collect()
+}
+
+/// A reason to reject the changes when any of them defines a name a second time (two-places
+/// added `MAX_RETRIES = 5` above both functions, and the repo's tests passed), or `None`.
+fn duplicate_definitions(changes: &[FileChange]) -> Option<String> {
+    let count = |text: &str, name: &str| top_level_definitions(text).iter().filter(|n| *n == name).count();
+    for change in changes {
+        let mut seen = Vec::new();
+        for name in top_level_definitions(&change.after) {
+            if seen.contains(&name) {
+                continue;
+            }
+            if count(&change.after, &name) > 1 && count(&change.after, &name) > count(&change.before, &name) {
+                return Some(format!("the edit defines `{name}` more than once in `{}`; define it once and use it", change.path));
+            }
+            seen.push(name);
+        }
+    }
+    None
+}
+
 /// Records that lines `from..to` of `path` were rewritten as `written` lines, shifting the
 /// records of later lines in that file by the change in length.
 fn protect(protected: &mut Vec<(String, usize, usize)>, path: &str, from: usize, to: usize, written: usize) {
@@ -1282,6 +1329,20 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
         report.edits.push(change.clone());
         progress(&report.narration);
 
+        // The Checker's own rule, before any test: a name defined twice is wrong even when the
+        // repo's tests can't tell.
+        if let Some(reason) = duplicate_definitions(std::slice::from_ref(&change)) {
+            write_file(ctx.root, &path, &change.before)?;
+            report.edits.pop();
+            report.narration.push(format!("Undid the edit: {reason}"));
+            failed_at.entry((path.clone(), from, to)).or_insert(clean_prompt);
+            last_failure = format!(
+                "Your last edit to `{path}` was:\n```diff\n{}\n```\nIt was undone because {reason}.\n\n",
+                short_diff(&change.before, &change.after)
+            );
+            continue;
+        }
+
         let Some(check) = check else {
             report.narration.push(format!("No check runs for {path}'s file type, so stopping after the edit"));
             report.stopped_reason = "finished: edited, nothing to check it with".to_string();
@@ -1390,11 +1451,24 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
             return Ok(());
         }
 
-        // Every check that covers a changed file, once each.
+        // Every check that covers a changed file, once each, after the Checker's own rule that no
+        // name is defined twice. Each step is compared with the file as the round found it.
         let mut failure = String::new();
         let mut all_passed = true;
         let mut ran: Vec<String> = Vec::new();
+        let mut whole: Vec<FileChange> = Vec::new();
         for change in &changes {
+            match whole.iter_mut().find(|c| c.path == change.path) {
+                Some(c) => c.after = change.after.clone(),
+                None => whole.push(change.clone()),
+            }
+        }
+        if let Some(reason) = duplicate_definitions(&whole) {
+            failure = format!("{reason}.");
+            all_passed = false;
+            report.narration.push(format!("The steps {reason}"));
+        }
+        for change in if all_passed { &changes[..] } else { &[] } {
             let Some(check) = check_for(ctx.root, &change.path, ctx.files) else { continue };
             if ran.contains(&check.display()) {
                 continue;
@@ -2028,6 +2102,27 @@ mod tests {
         assert!(!report.stopped_reason.starts_with("finished"), "the old test fails, so the edit is wrong");
         assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn top_level_definitions_are_found_in_each_language() {
+        let py = "import time\nMAX = 5\nVALUE == 2\n\ndef fetch():\n    inner = 1\nclass Client:\n    pass\nif x = 1:\n";
+        assert_eq!(top_level_definitions(py), vec!["MAX", "fetch", "Client"]);
+        let rs = "pub fn run() {}\npub(crate) const LIMIT: u32 = 3;\nstatic NAME: &str = \"x\";\nstruct S;\n    fn nested() {}\n";
+        assert_eq!(top_level_definitions(rs), vec!["run", "LIMIT", "NAME", "S"]);
+        let ts = "export function a() {}\nexport const b = 1;\nasync function c() {}\nlet d = 2;\n";
+        assert_eq!(top_level_definitions(ts), vec!["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn an_edit_that_defines_a_name_twice_is_rejected() {
+        let change = |before: &str, after: &str| FileChange { path: "client.py".into(), before: before.into(), after: after.into() };
+        let once = "import time\nMAX_RETRIES = 5\n\ndef fetch():\n    pass\n";
+        let twice = "import time\nMAX_RETRIES = 5\n\nMAX_RETRIES = 5\ndef fetch():\n    pass\n";
+        assert_eq!(duplicate_definitions(&[change("import time\n", once)]), None);
+        assert!(duplicate_definitions(&[change(once, twice)]).unwrap().contains("`MAX_RETRIES` more than once"));
+        // A name the file already defined twice isn't the edit's doing.
+        assert_eq!(duplicate_definitions(&[change(twice, &format!("{twice}# note\n"))]), None);
     }
 
     #[test]
