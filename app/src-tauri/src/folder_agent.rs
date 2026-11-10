@@ -714,8 +714,24 @@ fn snap_to_list(written: &str, files: &[String]) -> Option<String> {
     }
     let suffix = format!("/{written}");
     let mut found = files.iter().filter(|f| format!("/{f}").ends_with(&suffix));
-    let first = found.next()?;
-    found.next().is_none().then(|| first.clone())
+    if let Some(first) = found.next() {
+        return found.next().is_none().then(|| first.clone());
+    }
+    // The model wrote the name without its extension (e.g. "lib" for "lib.rs"). Try each
+    // known extension and return the unique match.
+    if !written.contains('.') {
+        for ext in &["rs", "py", "ts", "tsx", "js", "vue"] {
+            let with_ext = format!("{written}.{ext}");
+            let suffix_ext = format!("/{with_ext}");
+            let mut found_ext = files.iter().filter(|f| f.as_str() == with_ext || format!("/{f}").ends_with(&suffix_ext));
+            if let Some(m) = found_ext.next() {
+                if found_ext.next().is_none() {
+                    return Some(m.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The lines Xenon rewrites around line `best` (0-based, end exclusive): `best` and its
@@ -1854,6 +1870,10 @@ mod tests {
         assert_eq!(snap_to_list("/x.rs", &files).as_deref(), Some("app/src/x.rs"));
         assert_eq!(snap_to_list("y.py", &files), None, "two files end in y.py");
         assert_eq!(snap_to_list("z.rs", &files), None);
+        // Extension-less names snap to the unique file with that stem.
+        let rs_files = vec!["lib.rs".to_string(), "pager.ts".to_string()];
+        assert_eq!(snap_to_list("lib", &rs_files).as_deref(), Some("lib.rs"), "lib -> lib.rs");
+        assert_eq!(snap_to_list("pager", &rs_files).as_deref(), Some("pager.ts"), "pager -> pager.ts");
     }
 
     #[test]
@@ -2333,7 +2353,7 @@ mod tests {
         }
         first.sort();
         // The rename goal says "everywhere" too, but the Renamer takes it before any planning.
-        assert_eq!(first, vec!["rename-across-files", "two-places-one-file"]);
+        assert_eq!(first, vec!["rename-across-files", "rust-two-places", "ts-two-places", "two-places-one-file"]);
         assert!(covers_several_places("Fix the typo in each docstring"));
         assert!(!covers_several_places("Make the failing test pass"));
         assert!(!covers_several_places("Use the eachTime helper"), "a whole word, not part of a name");
