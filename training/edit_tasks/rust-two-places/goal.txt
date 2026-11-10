@@ -1,0 +1,1 @@
+Add a MAX_ITEMS: usize = 10 constant at the top of lib.rs and use it in both truncate and validate instead of the number 10.

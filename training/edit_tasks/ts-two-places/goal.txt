@@ -1,0 +1,1 @@
+Add a PAGE_SIZE = 20 constant at the top of pager.ts and use it in both paginate and pageCount instead of the number 20.
