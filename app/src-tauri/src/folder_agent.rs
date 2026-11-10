@@ -1102,14 +1102,21 @@ fn parse_steps(reply: &str) -> Vec<String> {
         .collect()
 }
 
-/// Returns true for planner steps that describe checking or verification rather than an edit.
-/// The model sometimes adds a "verify" or "run the tests" step; these have nothing to edit and
-/// cause the step runner to spiral when it can't find lines to change.
+/// Returns true for planner steps that describe checking, verification, or navigation rather than
+/// an edit. The model sometimes adds these; they have nothing to edit and cause the step runner to
+/// spiral when it can't find lines to change.
 fn is_verification_step(step: &str) -> bool {
     let lower = step.to_lowercase();
-    let verify_words = ["verify that", "verify the", "run the test", "run the check",
-                        "confirm that", "ensure that", "check that", "make sure that"];
-    verify_words.iter().any(|w| lower.starts_with(w))
+    // Steps that start with a verification verb.
+    let verify_starts = ["verify that", "verify the", "run the test", "run the check",
+                         "confirm that", "ensure that", "check that", "make sure that",
+                         "open ", "locate "];
+    if verify_starts.iter().any(|w| lower.starts_with(w)) {
+        return true;
+    }
+    // Steps that explicitly say no change is needed anywhere in the text.
+    lower.contains("no change needed") || lower.contains("no changes needed")
+        || lower.contains("already correct") || lower.contains("already done")
 }
 
 /// Runs `check` once on the untouched code if it hasn't been yet, recording its warnings.
@@ -2501,10 +2508,14 @@ mod tests {
         // Numbered lines only; a list can run past nine.
         assert_eq!(parse_steps("x. not a step\n10. tenth\n"), vec!["tenth"]);
         assert!(parse_steps("1.\n2. \n").is_empty(), "numbers with nothing after them");
-        // Verification steps are dropped; real edit steps are kept.
+        // Verification, navigation, and no-op steps are dropped; real edit steps are kept.
         assert_eq!(
             parse_steps("1. Add MAX_RETRIES constant.\n2. Verify that the tests pass.\n3. Run the tests.\n4. Update the loop.\n"),
             vec!["Add MAX_RETRIES constant.", "Update the loop."]
+        );
+        assert_eq!(
+            parse_steps("1. Open client.py and locate fetch.\n2. Replace range(3) with range(MAX_RETRIES).\n3. Replace x with x (no change needed).\n"),
+            vec!["Replace range(3) with range(MAX_RETRIES)."]
         );
         // Only two lines of context after a change near the top of a long file.
         assert_eq!(short_diff("a\nb\nc\nd\ne\nf\ng\n", "a\nB\nc\nd\ne\nf\ng\n"), " a\n-b\n+B\n c\n d");
