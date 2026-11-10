@@ -59,7 +59,7 @@ specialists under an orchestrator, each a fix for a failure seen in the edit tas
 | Specialist | Job | Why it exists |
 |---|---|---|
 | Orchestrator | One edit at a time first; plans first only when the goal says "both", "everywhere", "each" or "all of" | Planning every goal was a regression (7/7 to 2/9): a small model over-decomposes |
-| Planner | Numbered steps, one change in one place each; a step that can't be done is planned again into parts, two levels deep | Steps were dropped when the Locator found no place for a vague one |
+| Planner | Numbered steps, one change in one place each; verification steps ("Verify that…", "Run the tests") are stripped before running; a step that can't be done is planned again into parts, two levels deep | Steps were dropped when the Locator found no place for a vague one; verification steps caused spirals when the model added them |
 | Locator | A goal or step naming one file goes straight to it; lines picked by search; never lines another step of the round rewrote | Asked, Xenon named shop.py for "update the import in report.py"; overlapping steps duplicated lines |
 | Editor | Rewrites the picked lines (as above), told what earlier steps changed | Not told, the fetch step added a constant step 1 had already added |
 | Test-writer | When the goal says its test changes, rewrites the failing assertion; never drops one | A behavior change failed the old test, and the code edit was undone |
@@ -67,9 +67,11 @@ specialists under an orchestrator, each a fix for a failure seen in the edit tas
 | Checker | Tests; no new compiler warnings; a "remove the warning" goal must remove one; no name defined twice | Weak tests passed a re-indent that removed nothing and a constant defined twice |
 
 Edit tasks (ten, hidden checks): 7/10 before this (all multi-place tasks failed), 10/10 after,
-with two-places-one-file's check tightened to one definition. Every specialist is unit-tested
-end to end with a scripted stand-in for the model (`Model` trait), and mutation testing covers the
-loop (see PLAN.md).
+with two-places-one-file's check tightened to one definition. Two follow-up fixes (commits
+`b544c2f`, `5962bee`) kept it at 10/10 when recursion was added: a step whose lines come back
+unchanged is treated as already done (not recursed into), and verification steps are stripped from
+plans before they run. Every specialist is unit-tested end to end with a scripted stand-in for the
+model (`Model` trait), and mutation testing covers the loop (see PLAN.md).
 
 ## Known not to work for small models
 
