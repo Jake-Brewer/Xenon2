@@ -578,6 +578,19 @@ fn run_rename(ctx: &RunContext, goal: &str, old: &str, new: &str, report: &mut R
     Ok(false)
 }
 
+/// Records that lines `from..to` of `path` were rewritten as `written` lines, shifting the
+/// records of later lines in that file by the change in length.
+fn protect(protected: &mut Vec<(String, usize, usize)>, path: &str, from: usize, to: usize, written: usize) {
+    let shift = written as isize - (to - from) as isize;
+    for (p, start, end) in protected.iter_mut() {
+        if p == path && *start >= to {
+            *start = (*start as isize + shift) as usize;
+            *end = (*end as isize + shift) as usize;
+        }
+    }
+    protected.push((path.to_string(), from, from + written));
+}
+
 /// True when a goal says outright that it covers several places.
 fn covers_several_places(goal: &str) -> bool {
     let words: Vec<String> = goal.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
@@ -615,7 +628,7 @@ fn update_failing_test(ctx: &RunContext, goal: &str, failure: &str, report: &mut
     let test_goal = format!("{goal} The code is already changed; update this test in {test_path} so it expects the new behavior.");
     let focus = format!("{test_path} {line}");
     let mut tried = HashMap::new();
-    let Attempt::Edit { path, current, code, .. } = attempt(&test_ctx, &test_goal, &focus, failure, &mut tried, report)? else {
+    let Attempt::Edit { path, current, code, .. } = attempt(&test_ctx, &test_goal, &focus, failure, &mut tried, &[], report)? else {
         return Ok(None);
     };
     if code.matches("assert").count() < current.matches("assert").count() {
@@ -910,6 +923,7 @@ fn attempt(
     focus: &str,
     last_failure: &str,
     tried: &mut HashMap<String, Vec<(usize, usize)>>,
+    protected: &[(String, usize, usize)],
     report: &mut Report,
 ) -> Result<Attempt, String> {
     let RunContext { model, root, files, searched, listing, deadline, cancel } = *ctx;
@@ -966,6 +980,9 @@ fn attempt(
     let Some((from, to)) = crate::code_search::ranked_lines(&current, focus)
         .into_iter()
         .map(|line| edit_range(&file_lines, line))
+        // Never lines an earlier step of this round already rewrote: two steps on overlapping
+        // lines duplicated fetch's retry loop, and the repo's tests still passed.
+        .filter(|&(from, to)| !protected.iter().any(|(p, start, end)| *p == path && from < *end && *start < to))
         .find(|range| tried_here.iter().filter(|r| *r == range).count() < TRIES_PER_PLACE)
     else {
         return Ok(Attempt::Stop(format!("tried every place in {path} that matches the goal")));
@@ -1222,7 +1239,7 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
             report.narration.push(line);
         }
 
-        let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, goal, &last_failure, &mut tried, report)? {
+        let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, goal, &last_failure, &mut tried, &[], report)? {
             Attempt::Edit { path, from, to, written, current, code, clean_prompt } => (path, from, to, written, current, code, clean_prompt),
             Attempt::Unchanged { path, from, to, target, clean_prompt } => {
                 // Small models often copy the lines back unchanged while meaning to change them.
@@ -1349,11 +1366,14 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         // every place is fresh again. Kept across rounds, the record skipped nearly every step
         // of rounds 2 and 3 as "tried every place".
         tried.clear();
+        // The lines this round's steps have rewritten, in the files as they are now.
+        let mut protected: Vec<(String, usize, usize)> = Vec::new();
         let mut changes: Vec<FileChange> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let step_goal = format!("{step} (step {} of {}; the whole goal: {goal})", i + 1, steps.len());
-            match attempt(ctx, &step_goal, step, &last_failure, &mut tried, report)? {
-                Attempt::Edit { path, from, to, code, .. } => {
+            match attempt(ctx, &step_goal, step, &last_failure, &mut tried, &protected, report)? {
+                Attempt::Edit { path, from, to, written, code, .. } => {
+                    protect(&mut protected, &path, from, to, written.lines().count());
                     let change = write_file(ctx.root, &path, &code)?;
                     budget.edits += 1;
                     report.narration.push(format!("Step {}: edited {path}, lines {}-{to}", i + 1, from + 1));
@@ -2007,6 +2027,41 @@ mod tests {
 
         assert!(!report.stopped_reason.starts_with("finished"), "the old test fails, so the edit is wrong");
         assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rewritten_lines_are_tracked_as_lines_above_them_change() {
+        let mut protected = Vec::new();
+        protect(&mut protected, "a.py", 10, 13, 3);
+        assert_eq!(protected, vec![("a.py".to_string(), 10, 13)]);
+        // Two lines become five above it: it moves down by three.
+        protect(&mut protected, "a.py", 2, 4, 5);
+        assert_eq!(protected, vec![("a.py".to_string(), 13, 16), ("a.py".to_string(), 2, 7)]);
+        // Another file's edit leaves it alone.
+        protect(&mut protected, "b.py", 0, 9, 1);
+        assert_eq!(protected[0], ("a.py".to_string(), 13, 16));
+    }
+
+    #[test]
+    fn a_step_never_rewrites_lines_an_earlier_step_just_did() {
+        // Step 1 rewrites ALPHA and BETA (lines 1-2). Step 2's best place, BETA's line, overlaps
+        // them, so it must move to its next-best place (the assert near the end).
+        let dir = repo_with(&[("a.py", "ALPHA = 1\nBETA = 1\nGAMMA = 1\nDELTA = 1\nassert ALPHA == 2 and BETA == 2\n")]);
+        let ranges = RefCell::new(Vec::new());
+        let model = scripted(editing("a.py", " Set ALPHA to 2 in a.py\n2. Set BETA to 2 in a.py\n", |question, lines| {
+            if question.contains("(step ") {
+                ranges.borrow_mut().push(lines.to_string());
+                lines.replace("= 1", "= 2")
+            } else {
+                lines.replace("= 1", "= 3")
+            }
+        }));
+        run_scripted(&model, &dir, "Set ALPHA and DELTA to 2", &["a.py"]);
+        let ranges = ranges.borrow();
+        assert!(ranges.len() >= 2, "{ranges:?}");
+        assert!(ranges[0].contains("ALPHA = ") && ranges[0].contains("BETA = "), "{ranges:?}");
+        assert!(!ranges[1].contains("ALPHA = ") && !ranges[1].contains("BETA = "), "the second step stays off the first step's lines: {ranges:?}");
         fs::remove_dir_all(&dir).ok();
     }
 
