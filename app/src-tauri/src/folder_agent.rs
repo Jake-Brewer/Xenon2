@@ -100,7 +100,7 @@ pub struct RunStep {
     pub exit_code: Option<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
     /// Whether the run stopped because it finished, or hit a budget limit.
     pub stopped_reason: String,
@@ -769,9 +769,15 @@ enum Attempt {
 }
 
 /// One edit for `goal`: Xenon picks the file, the agent picks the lines, Xenon rewrites them.
+///
+/// `focus` is what the agent searches the file for to pick the lines; `goal` is what Xenon is
+/// told. They differ for a step, whose prompt carries the whole goal for context but whose lines
+/// must be found by the step alone: searching for the whole goal's words put the step on another
+/// step's lines.
 fn attempt(
     ctx: &RunContext,
     goal: &str,
+    focus: &str,
     last_failure: &str,
     tried: &mut HashMap<String, Vec<(usize, usize)>>,
     report: &mut Report,
@@ -820,7 +826,7 @@ fn attempt(
     // same wrong edit three times running, but a second try with the failure in front of it
     // often fixes the first.
     let tried_here = tried.entry(path.clone()).or_default();
-    let Some((from, to)) = crate::code_search::ranked_lines(&current, goal)
+    let Some((from, to)) = crate::code_search::ranked_lines(&current, focus)
         .into_iter()
         .map(|line| edit_range(&file_lines, line))
         .find(|range| tried_here.iter().filter(|r| *r == range).count() < TRIES_PER_PLACE)
@@ -1057,7 +1063,7 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
             report.narration.push(line);
         }
 
-        let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, &last_failure, &mut tried, report)? {
+        let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, goal, &last_failure, &mut tried, report)? {
             Attempt::Edit { path, from, to, written, current, code, clean_prompt } => (path, from, to, written, current, code, clean_prompt),
             Attempt::Unchanged { path, from, to, target, clean_prompt } => {
                 // Small models often copy the lines back unchanged while meaning to change them.
@@ -1165,7 +1171,7 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         let mut changes: Vec<FileChange> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let step_goal = format!("{step} (step {} of {}; the whole goal: {goal})", i + 1, steps.len());
-            match attempt(ctx, &step_goal, &last_failure, &mut tried, report)? {
+            match attempt(ctx, &step_goal, step, &last_failure, &mut tried, report)? {
                 Attempt::Edit { path, from, to, code, .. } => {
                     let change = write_file(ctx.root, &path, &code)?;
                     budget.edits += 1;
@@ -1471,5 +1477,304 @@ mod tests {
     fn debug_builds_leave_their_own_rust_code_alone() {
         assert!(restarts_this_app(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs")));
         assert!(!restarts_this_app(&std::env::temp_dir().join("elsewhere.rs")));
+    }
+    // ---- The loop, with a scripted model --------------------------------------------------
+    // Mutation testing found none of the loop was tested: run_one could be replaced with "do
+    // nothing" and every test still passed. These run it end to end against a stand-in model
+    // and real files, checked with `python`.
+
+    use std::cell::{Cell, RefCell};
+
+    /// A stand-in for the model: `reply(question, start)` is what it writes after `start`.
+    struct Scripted<F: Fn(&str, &str) -> String> {
+        reply: F,
+        temps: RefCell<Vec<u32>>,
+    }
+
+    fn scripted<F: Fn(&str, &str) -> String>(reply: F) -> Scripted<F> {
+        Scripted { reply, temps: RefCell::new(Vec::new()) }
+    }
+
+    impl<F: Fn(&str, &str) -> String> Model for Scripted<F> {
+        fn ask(&self, question: &str, start: &str, _done: &dyn Fn(&str) -> bool, _deadline: Instant, _cancel: &AtomicBool) -> Result<String, String> {
+            Ok(format!("{start}{}", (self.reply)(question, start)).trim().to_string())
+        }
+        fn prompt_text(&self, question: &str, start: &str) -> String {
+            format!("{question}|{start}")
+        }
+        fn gpu_temp(&self) -> Option<u32> {
+            let mut temps = self.temps.borrow_mut();
+            (!temps.is_empty()).then(|| temps.remove(0))
+        }
+    }
+
+    /// The lines an edit step's reply start quotes: the ones Xenon is asked to rewrite.
+    fn quoted_lines(start: &str) -> String {
+        let after = start.split_once("are:\n```").map(|(_, r)| r).unwrap_or("");
+        let after = after.split_once('\n').map(|(_, r)| r).unwrap_or("");
+        after.split("\n```").next().unwrap_or("").to_string()
+    }
+
+    /// Replies as Xenon would to an edit run: names `file`, rewrites the quoted lines with `edit`,
+    /// and plans one step unless `steps` says otherwise.
+    fn editing(file: &'static str, steps: &'static str, edit: impl Fn(&str, &str) -> String) -> impl Fn(&str, &str) -> String {
+        move |question, start| {
+            if start == "FILE:" {
+                format!(" {file}\n")
+            } else if start.starts_with("Lines ") {
+                format!("{}\n```", edit(question, &quoted_lines(start)))
+            } else if start == "1." {
+                steps.to_string()
+            } else {
+                String::new()
+            }
+        }
+    }
+
+    fn repo_with(files: &[(&str, &str)]) -> PathBuf {
+        let dir = temp_repo();
+        for (rel, text) in files {
+            fs::write(dir.join(rel), text).unwrap();
+        }
+        git(&dir, &["add", "."]).unwrap();
+        git(&dir, &["commit", "-q", "-m", "task"]).unwrap();
+        dir
+    }
+
+    fn run_scripted(model: &dyn Model, dir: &Path, goal: &str, files: &[&str]) -> Report {
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        run_with(model, dir, goal, &files, &|_| {}, &AtomicBool::new(false)).unwrap()
+    }
+
+    const VALUE_PY: &str = "VALUE = 1\nassert VALUE == 2, VALUE\n";
+
+    #[test]
+    fn a_failed_edit_is_undone_and_the_one_that_passes_is_kept_and_learned() {
+        let dir = repo_with(&[("a.py", VALUE_PY)]);
+        let tries = Cell::new(0);
+        let model = scripted(editing("a.py", " One step\n", |_, lines| {
+            tries.set(tries.get() + 1);
+            lines.replace("VALUE = 1", if tries.get() == 1 { "VALUE = 3" } else { "VALUE = 2" })
+        }));
+        let report = run_scripted(&model, &dir, "Set VALUE to 2", &["a.py"]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
+        assert!(fs::read_to_string(dir.join("a.py")).unwrap().contains("VALUE = 2"));
+        assert!(report.narration.iter().any(|n| n == "Undid the edit"), "{:?}", report.narration);
+        assert_eq!(report.edits.len(), 1, "only the kept edit is reported");
+        assert_eq!(report.lessons.len(), 1, "a fail then a pass at the same lines is a lesson");
+        assert!(report.lessons[0].answer.starts_with("VALUE = 2"), "{}", report.lessons[0].answer);
+        assert!(!report.lessons[0].prompt.contains("undone"), "the lesson's prompt has no failure feedback");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edits_that_keep_failing_leave_the_file_as_it_was() {
+        let dir = repo_with(&[("a.py", VALUE_PY)]);
+        let model = scripted(editing("a.py", " One step\n", |_, lines| lines.replace("VALUE = 1", "VALUE = 3")));
+        let report = run_scripted(&model, &dir, "Set VALUE to 2", &["a.py"]);
+
+        assert!(!report.stopped_reason.starts_with("finished"), "{}", report.stopped_reason);
+        assert_eq!(fs::read_to_string(dir.join("a.py")).unwrap().replace("\r\n", "\n"), VALUE_PY);
+        assert!(report.edits.is_empty() && report.lessons.is_empty());
+        assert!(report.runs.len() >= 2, "each edit was checked");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lines_written_back_unchanged_are_noted_and_never_written() {
+        let dir = repo_with(&[("a.py", VALUE_PY)]);
+        let model = scripted(editing("a.py", " One step\n", |_, lines| lines.to_string()));
+        let report = run_scripted(&model, &dir, "Set VALUE to 2", &["a.py"]);
+
+        let unchanged = report.narration.iter().filter(|n| n.contains("changed nothing")).count();
+        assert_eq!(unchanged, TRIES_PER_PLACE, "two tries at the one place: {:?}", report.narration);
+        assert!(report.stopped_reason.contains("tried every place"), "{}", report.stopped_reason);
+        assert!(report.edits.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn nothing_to_change_ends_the_run_without_an_edit() {
+        let dir = repo_with(&[("a.py", VALUE_PY)]);
+        let model = scripted(|_: &str, start: &str| match start {
+            "FILE:" => " none\n".to_string(),
+            s if s.starts_with("FILE: none") => " already done\n".to_string(),
+            _ => String::new(),
+        });
+        let report = run_scripted(&model, &dir, "Set VALUE to 2", &["a.py"]);
+
+        assert_eq!(report.stopped_reason, "finished");
+        assert!(report.narration.iter().any(|n| n == "Stopped: already done"), "{:?}", report.narration);
+        assert!(report.edits.is_empty() && report.runs.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_outside_the_given_list_is_refused() {
+        let dir = repo_with(&[("a.py", VALUE_PY), ("b.py", "x = 1\n")]);
+        let model = scripted(editing("b.py", " One step\n", |_, lines| lines.to_string()));
+        let report = run_scripted(&model, &dir, "Set VALUE to 2", &["a.py"]);
+
+        assert!(report.stopped_reason.contains("wasn't in the given file list"), "{}", report.stopped_reason);
+        assert_eq!(fs::read_to_string(dir.join("b.py")).unwrap().replace("\r\n", "\n"), "x = 1\n");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn steps_are_tried_only_after_one_edit_at_a_time_gives_up() {
+        let dir = repo_with(&[("a.py", "ALPHA = 1\nBETA = 1\nassert ALPHA == 2 and BETA == 2\n")]);
+        // One edit at a time sets a wrong value every time; each planned step sets the right one.
+        let model = scripted(editing(
+            "a.py",
+            " Set ALPHA to 2 in a.py\n2. Set BETA to 2 in a.py\n",
+            |question, lines| lines.replace("= 1", if question.contains("(step ") { "= 2" } else { "= 3" }),
+        ));
+        let report = run_scripted(&model, &dir, "Set ALPHA and BETA to 2", &["a.py"]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
+        assert!(report.narration.iter().any(|n| n.contains("broke the goal into 2 steps")), "{:?}", report.narration);
+        let text = fs::read_to_string(dir.join("a.py")).unwrap();
+        assert!(text.contains("ALPHA = 2") && text.contains("BETA = 2"), "{text}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_goal_finished_in_one_edit_is_never_broken_into_steps() {
+        let dir = repo_with(&[("a.py", VALUE_PY)]);
+        let planned = Cell::new(false);
+        let edit = editing("a.py", " A\n2. B\n", |_, lines| lines.replace("VALUE = 1", "VALUE = 2"));
+        let model = scripted(|question: &str, start: &str| {
+            if start == "1." {
+                planned.set(true);
+            }
+            edit(question, start)
+        });
+        let report = run_scripted(&model, &dir, "Set VALUE to 2", &["a.py"]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass");
+        assert!(!planned.get(), "no plan was asked for");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_hot_gpu_is_waited_out_and_a_cool_one_is_not() {
+        let model = scripted(|_: &str, _: &str| String::new());
+        let cancel = AtomicBool::new(false);
+        assert_eq!(cool_down(&model, &cancel), None, "no GPU");
+        *model.temps.borrow_mut() = vec![HOT_C - 1];
+        assert_eq!(cool_down(&model, &cancel), None, "below HOT_C");
+        *model.temps.borrow_mut() = vec![HOT_C + 5, COOL_C + 3, COOL_C];
+        let line = cool_down(&model, &cancel).expect("waited");
+        assert!(line.contains(&format!("{}°C", HOT_C + 5)), "{line}");
+        assert!(model.temps.borrow().is_empty(), "read until it was cool");
+    }
+
+    #[test]
+    fn the_budget_stops_at_each_limit() {
+        let mut budget = Budget::new();
+        assert_eq!(budget.exhausted(), None);
+        budget.edits = MAX_EDITS - 1;
+        budget.runs = MAX_RUNS - 1;
+        assert_eq!(budget.exhausted(), None, "one short of each limit");
+        budget.edits = MAX_EDITS;
+        assert!(budget.exhausted().unwrap().contains("edit budget"));
+        let mut budget = Budget::new();
+        budget.runs = MAX_RUNS;
+        assert!(budget.exhausted().unwrap().contains("run budget"));
+        // Windows counts Instant from boot, so "11 minutes ago" doesn't exist in a fresh boot's
+        // first minutes; the time limit is then checked on the next run instead.
+        if let Some(started) = Instant::now().checked_sub(Duration::from_secs(MAX_SECONDS + 1)) {
+            let budget = Budget { started, edits: 0, runs: 0 };
+            assert!(budget.exhausted().unwrap().contains("time budget"));
+        }
+    }
+
+    #[test]
+    fn checks_fail_on_new_warnings_and_on_a_warning_the_goal_wanted_gone() {
+        let dir = temp_repo();
+        let model = scripted(|_: &str, _: &str| String::new());
+        let cancel = AtomicBool::new(false);
+        let files: Vec<String> = Vec::new();
+        let ctx = RunContext {
+            model: &model,
+            root: &dir,
+            files: &files,
+            searched: false,
+            listing: "",
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+        };
+        let printing = |text: &str| Check { program: "python", args: vec!["-c".into(), format!("print({text:?})")], dir: String::new() };
+        let old = "warning: old\n  --> src/a.rs:1:1";
+        let check = printing(old);
+        let mut baselines = HashMap::new();
+        baselines.insert(check.display(), warnings(old));
+        let mut report = Report::default();
+        let mut failure = String::new();
+
+        assert!(passes(&ctx, &check, "Add a flag", &baselines, &mut report, &mut failure).unwrap(), "same warnings as before");
+        assert!(!passes(&ctx, &check, "Silence the old warning", &baselines, &mut report, &mut failure).unwrap());
+        assert!(failure.contains("still there"), "{failure}");
+
+        let added = printing("warning: old\n  --> src/a.rs:1:1\nwarning: new\n  --> src/a.rs:9:1");
+        let mut baselines = HashMap::new();
+        baselines.insert(added.display(), warnings(old));
+        assert!(!passes(&ctx, &added, "Add a flag", &baselines, &mut report, &mut failure).unwrap());
+        assert!(failure.contains("added compiler warnings") && failure.contains("new"), "{failure}");
+
+        let failing = Check { program: "python", args: vec!["-c".into(), "raise SystemExit(1)".into()], dir: String::new() };
+        assert!(!passes(&ctx, &failing, "Add a flag", &HashMap::new(), &mut report, &mut failure).unwrap());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn job_status_and_cancel_follow_the_job() {
+        let id = "run-test-status".to_string();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let status = JobStatus { state: "running".into(), narration: Vec::new(), report: None, error: None };
+        jobs().lock().unwrap().insert(id.clone(), Job { status, cancel: cancel.clone() });
+        update(&id, |s| s.narration.push("a step".into()));
+        assert_eq!(job_status(&id).unwrap().narration, vec!["a step".to_string()]);
+        assert!(cancel_job(&id));
+        assert!(cancel.load(Ordering::Relaxed), "cancelling reaches the running loop");
+        jobs().lock().unwrap().remove(&id);
+    }
+
+    #[test]
+    fn cargo_is_found_when_tests_run_under_it() {
+        let cargo = find_cargo().expect("cargo is running these tests");
+        assert!(cargo.file_stem().is_some_and(|s| s == "cargo"), "{}", cargo.display());
+        assert!(cargo.is_file());
+    }
+
+    #[test]
+    fn every_language_gets_its_fence() {
+        let cases = [
+            ("a.py", "python"), ("a.rs", "rust"), ("a.ts", "typescript"), ("a.tsx", "typescript"),
+            ("a.js", "javascript"), ("a.mjs", "javascript"), ("a.vue", "vue"), ("a.c", "c"), ("a.h", "c"),
+            ("a.cpp", "cpp"), ("a.cu", "cpp"), ("a.cuh", "cpp"), ("a.hpp", "cpp"), ("a.sh", "bash"),
+            ("a.md", "markdown"), ("a.toml", "toml"), ("a.json", "json"), ("a.txt", ""),
+        ];
+        for (file, lang) in cases {
+            assert_eq!(fence(file), lang, "{file}");
+        }
+    }
+
+    #[test]
+    fn small_helpers_at_their_edges() {
+        // The path step ends on a long line even without a newline.
+        assert!(first_line_done(&format!("FILE: {}", "x".repeat(301))));
+        assert!(!first_line_done(&format!("FILE: {}", "x".repeat(299))));
+        // Numbered lines only; a list can run past nine.
+        assert_eq!(parse_steps("x. not a step\n10. tenth\n"), vec!["tenth"]);
+        assert!(parse_steps("1.\n2. \n").is_empty(), "numbers with nothing after them");
+        // Only two lines of context after a change near the top of a long file.
+        assert_eq!(short_diff("a\nb\nc\nd\ne\nf\ng\n", "a\nB\nc\nd\ne\nf\ng\n"), " a\n-b\n+B\n c\n d");
+        // A reply the loop couldn't use is quoted, or named as empty.
+        assert_eq!(excerpt("  "), "(nothing)");
+        assert_eq!(excerpt(" hi\n"), "\"hi\"");
+        // A warning that merely mentions "generated" is still a warning.
+        assert_eq!(warnings("warning: field `generated` is never read\n --> src/a.rs:3:5\n").len(), 1);
     }
 }
