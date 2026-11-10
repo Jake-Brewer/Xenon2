@@ -1298,7 +1298,19 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
         }
 
         let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, goal, &last_failure, &mut tried, &[], report)? {
-            Attempt::Edit { path, from, to, written, current, code, clean_prompt } => (path, from, to, written, current, code, clean_prompt),
+            Attempt::Edit { path, from, to, written, current, code, clean_prompt } => {
+                // A test file is protected: the model must fix the code, not loosen the test.
+                if is_python_test(&path) && !wants_test_update(goal) {
+                    budget.edits += 1;
+                    report.narration.push(format!("Rejected edit to test file {path}: fix the code, not the test"));
+                    last_failure = format!(
+                        "Your last edit was to `{path}`, a test file. The goal does not ask to change \
+                         tests. Edit the source code so the tests pass instead.\n\n"
+                    );
+                    continue;
+                }
+                (path, from, to, written, current, code, clean_prompt)
+            }
             Attempt::Unchanged { path, from, to, target, clean_prompt } => {
                 // Small models often copy the lines back unchanged while meaning to change them.
                 budget.edits += 1;
@@ -1455,6 +1467,11 @@ fn do_step(
     }
     let gave_up = match outcome {
         Attempt::Edit { path, from, to, written, code, .. } => {
+            // A test file is protected unless the goal explicitly asks to change tests.
+            if is_python_test(&path) && !wants_test_update(goal) {
+                report.narration.push(format!("Step {label}: rejected edit to test file {path}"));
+                return Ok(());
+            }
             protect(&mut round.protected, &path, from, to, written.lines().count());
             let change = write_file(ctx.root, &path, &code)?;
             round.edits += 1;
@@ -2192,6 +2209,21 @@ mod tests {
 
         assert!(!report.stopped_reason.starts_with("finished"), "the old test fails, so the edit is wrong");
         assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_edit_to_a_test_file_is_rejected_when_the_goal_does_not_mention_tests() {
+        // Model always tries to edit test_text.py directly — guard must block it and leave the
+        // file unchanged.
+        let dir = repo_with(&[("text.py", TEXT_PY), ("test_text.py", TEST_TEXT_PY)]);
+        let model = scripted(editing("test_text.py", " One step\n", |_, lines| {
+            lines.replace("== 'room'", "== 'room-101'")
+        }));
+        let report = run_scripted(&model, &dir, "slugify should keep digits.", &["text.py", "test_text.py"]);
+
+        assert!(report.narration.iter().any(|n| n.contains("Rejected edit to test file")), "{:?}", report.narration);
+        assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY, "test file must not be touched");
         fs::remove_dir_all(&dir).ok();
     }
 
