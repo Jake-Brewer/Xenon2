@@ -650,6 +650,11 @@ it never changed the two call sites — the one-edit loop can't tell the goal is
 is lenient. This is the case for item 1 below (mutation testing / stronger checks); the step
 fallback also needs to carry forward which sub-goals are already done.
 
+**Nested specialists [x] (2026-11-10)** — the folder agent is now an orchestrator over narrow
+specialists (Planner, Locator, Editor, Test-writer, Renamer, Checker), each added for a failure
+seen in the edit tasks; `CODING_STRATEGIES.md` has the table. Edit tasks: 7/10 to 10/10, with the
+stricter two-places check. A step that can't be done is planned again into parts, two levels deep.
+
 **GPU heat on this laptop [x] (2026-11-10)** — the dev machine is an ASUS ROG Zephyrus M15
 (GU502LV). Xenon's own throttle is compiled into the app, so it survives reboots: writing is paced
 from 76 C and paused at 80 C, and prompt reading (which runs the GPU flat out and wasn't paced at

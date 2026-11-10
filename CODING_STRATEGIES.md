@@ -46,10 +46,30 @@ The folder agent's steps, each a fix for a failure seen on Xenon2 itself:
 5. **Check, and undo on failure**: run the tests; a failure undoes the edit and goes back to
    Xenon with its diff and the output, so a run out of budget never leaves a broken file.
 
-`training/run_edit_tasks.py` scores this on seven small tasks, each with a hidden check of the
-goal and of everything around it (tests passing isn't enough: one edit fixed `average` and deleted
-the line above it, and its tests passed). Now 7/7, 6–30 s each. On Xenon2 itself, "add models to
-SKIP_DIRS in the extension's context.ts" took 36 s from the goal alone (commit `b15c9c1`).
+`training/run_edit_tasks.py` scores this on small tasks, each with a hidden check of the goal and
+of everything around it (tests passing isn't enough: one edit fixed `average` and deleted the line
+above it, and its tests passed). On Xenon2 itself, "add models to SKIP_DIRS in the extension's
+context.ts" took 36 s from the goal alone (commit `b15c9c1`).
+
+## Nested specialists (2026-11-10)
+
+The steps above handle one change in one place. Goals that need more are handled by narrow
+specialists under an orchestrator, each a fix for a failure seen in the edit tasks:
+
+| Specialist | Job | Why it exists |
+|---|---|---|
+| Orchestrator | One edit at a time first; plans first only when the goal says "both", "everywhere", "each" or "all of" | Planning every goal was a regression (7/7 to 2/9): a small model over-decomposes |
+| Planner | Numbered steps, one change in one place each; a step that can't be done is planned again into parts, two levels deep | Steps were dropped when the Locator found no place for a vague one |
+| Locator | A goal or step naming one file goes straight to it; lines picked by search; never lines another step of the round rewrote | Asked, Xenon named shop.py for "update the import in report.py"; overlapping steps duplicated lines |
+| Editor | Rewrites the picked lines (as above), told what earlier steps changed | Not told, the fetch step added a constant step 1 had already added |
+| Test-writer | When the goal says its test changes, rewrites the failing assertion; never drops one | A behavior change failed the old test, and the code edit was undone |
+| Renamer | "Rename X to Y": whole-word replace in every file using X, checked once, kept or undone together | One-place steps renamed an import and left the call beside it |
+| Checker | Tests; no new compiler warnings; a "remove the warning" goal must remove one; no name defined twice | Weak tests passed a re-indent that removed nothing and a constant defined twice |
+
+Edit tasks (ten, hidden checks): 7/10 before this (all multi-place tasks failed), 10/10 after,
+with two-places-one-file's check tightened to one definition. Every specialist is unit-tested
+end to end with a scripted stand-in for the model (`Model` trait), and mutation testing covers the
+loop (see PLAN.md).
 
 ## Known not to work for small models
 
