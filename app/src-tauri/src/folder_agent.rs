@@ -1097,8 +1097,19 @@ fn parse_steps(reply: &str) -> Vec<String> {
             (digits > 0 && (rest.starts_with('.') || rest.starts_with(')'))).then(|| rest[1..].trim().to_string())
         })
         .filter(|s| !s.is_empty())
+        .filter(|s| !is_verification_step(s))
         .take(MAX_STEPS)
         .collect()
+}
+
+/// Returns true for planner steps that describe checking or verification rather than an edit.
+/// The model sometimes adds a "verify" or "run the tests" step; these have nothing to edit and
+/// cause the step runner to spiral when it can't find lines to change.
+fn is_verification_step(step: &str) -> bool {
+    let lower = step.to_lowercase();
+    let verify_words = ["verify that", "verify the", "run the test", "run the check",
+                        "confirm that", "ensure that", "check that", "make sure that"];
+    verify_words.iter().any(|w| lower.starts_with(w))
 }
 
 /// Runs `check` once on the untouched code if it hasn't been yet, recording its warnings.
@@ -2458,6 +2469,11 @@ mod tests {
         // Numbered lines only; a list can run past nine.
         assert_eq!(parse_steps("x. not a step\n10. tenth\n"), vec!["tenth"]);
         assert!(parse_steps("1.\n2. \n").is_empty(), "numbers with nothing after them");
+        // Verification steps are dropped; real edit steps are kept.
+        assert_eq!(
+            parse_steps("1. Add MAX_RETRIES constant.\n2. Verify that the tests pass.\n3. Run the tests.\n4. Update the loop.\n"),
+            vec!["Add MAX_RETRIES constant.", "Update the loop."]
+        );
         // Only two lines of context after a change near the top of a long file.
         assert_eq!(short_diff("a\nb\nc\nd\ne\nf\ng\n", "a\nB\nc\nd\ne\nf\ng\n"), " a\n-b\n+B\n c\n d");
         // A reply the loop couldn't use is quoted, or named as empty.
