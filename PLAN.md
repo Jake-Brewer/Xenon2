@@ -650,10 +650,24 @@ it never changed the two call sites — the one-edit loop can't tell the goal is
 is lenient. This is the case for item 1 below (mutation testing / stronger checks); the step
 fallback also needs to carry forward which sub-goals are already done.
 
+**Mutation testing of the Rust core [x] (2026-11-10)** — `cargo mutants --in-place` (the crate
+finds the engine relative to the repo, so it can't be copied; run at below-normal priority with 4
+build jobs so typing stays smooth). Share of compiling deliberate breaks some test catches:
+
+| file | before | after | what was added |
+|---|---|---|---|
+| `code_search.rs` | 63/96 | 83/96 | keyword and file filters, whole-word matching, rare-word and file ranking |
+| `folder_agent.rs` | 99/243 | 187/233 | the model behind a `Model` trait; the whole loop tested with a scripted model (undo, budget, lessons, steps as a fallback, stop rules) |
+| `code_api.rs` | 41/92 | 75/92 | engine-free routes split into `simple_route`; every route but `/health` needs the token; size limits at their edges; a reply over a real socket |
+
+What survives is mostly code that only runs with the real model or app (`ask`, `run`, `start`,
+the chat route) and weights whose size doesn't change any ranking. The tests also found a real
+bug: a step searched for the whole goal's words and landed on another step's lines.
+
 Next, in order:
-1. Stronger checks: Rust edits must not add warnings; mutation testing (`cargo-mutants`,
-   `mutmut`, Stryker) to find what the tests miss, starting with code search, the folder agent and
-   the API; a protected set of tests the agent may not edit.
+1. Stronger checks: done for Rust edits (no new warnings; a "remove the warning" goal must remove
+   one) and for the Rust core's tests (above). Still to do: mutation testing of the Python
+   (`mutmut`) and the extension (Stryker), and a protected set of tests the agent may not edit.
 2. Code and test changed together as one unit when a goal changes behavior, never a loosened test.
 3. The folder agent writes its fixed mistakes (failed prompt + the change that later passed) for
    the batch.
