@@ -578,6 +578,13 @@ fn run_rename(ctx: &RunContext, goal: &str, old: &str, new: &str, report: &mut R
     Ok(false)
 }
 
+/// True when a goal says outright that it covers several places.
+fn covers_several_places(goal: &str) -> bool {
+    let words: Vec<String> = goal.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
+    let has = |w: &str| words.iter().any(|x| x == w);
+    has("both") || has("everywhere") || has("each") || goal.to_lowercase().contains("all of")
+}
+
 /// True when the goal says a test changes along with the code ("Update the code and its test").
 /// Only then may a failing test be rewritten; otherwise a failing test means the code is wrong.
 fn wants_test_update(goal: &str) -> bool {
@@ -1159,6 +1166,19 @@ fn run_with(
     if let Some((old, new)) = rename_in(goal) {
         if run_rename(&ctx, goal, &old, &new, &mut report)? {
             return Ok(report);
+        }
+    }
+    // A goal that says it covers several places ("use it in both fetch and upload") is planned
+    // first: done one edit at a time, its first edit passed the repo's tests and the run stopped
+    // with the other places unchanged, since nothing failed to say the goal was unmet.
+    if covers_several_places(goal) {
+        let steps = plan(&ctx, goal, "")?;
+        if steps.len() > 1 {
+            report.narration.push(format!("The goal covers several places; broke it into {} steps: {}", steps.len(), steps.join(" / ")));
+            run_steps(&ctx, goal, steps, &mut report, progress)?;
+            if report.stopped_reason.starts_with("finished") || ctx.cancel.load(Ordering::Relaxed) || ctx.deadline <= Instant::now() {
+                return Ok(report);
+            }
         }
     }
     run_one(&ctx, goal, &mut report, progress)?;
@@ -1988,6 +2008,24 @@ mod tests {
         assert!(!report.stopped_reason.starts_with("finished"), "the old test fails, so the edit is wrong");
         assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_goals_that_say_several_places_are_planned_first() {
+        let tasks = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../training/edit_tasks");
+        let mut first = Vec::new();
+        for task in fs::read_dir(&tasks).unwrap().flatten() {
+            let goal = fs::read_to_string(task.path().join("goal.txt")).unwrap();
+            if covers_several_places(&goal) {
+                first.push(task.file_name().to_string_lossy().into_owned());
+            }
+        }
+        first.sort();
+        // The rename goal says "everywhere" too, but the Renamer takes it before any planning.
+        assert_eq!(first, vec!["rename-across-files", "two-places-one-file"]);
+        assert!(covers_several_places("Fix the typo in each docstring"));
+        assert!(!covers_several_places("Make the failing test pass"));
+        assert!(!covers_several_places("Use the eachTime helper"), "a whole word, not part of a name");
     }
 
     #[test]
