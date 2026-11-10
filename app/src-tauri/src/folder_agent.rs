@@ -514,6 +514,25 @@ fn run_check(root: &Path, check: &Check, deadline: Instant, cancel: &AtomicBool)
     })
 }
 
+/// The one file in `files` that `text` names, by path or file name, as a whole word (so
+/// `shop.py` isn't found in `test_shop.py`). `None` when it names none of them, or several.
+fn file_named_in(text: &str, files: &[String]) -> Option<String> {
+    let names = |file: &str| -> bool {
+        let base = file.rsplit('/').next().unwrap_or(file);
+        [file, base].iter().any(|name| {
+            text.match_indices(name).any(|(at, _)| {
+                let before = text[..at].chars().next_back();
+                let after = text[at + name.len()..].chars().next();
+                let edge = |c: Option<char>| c.map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '/'));
+                edge(before) && edge(after)
+            })
+        })
+    };
+    let mut found = files.iter().filter(|f| names(f));
+    let first = found.next()?;
+    found.next().is_none().then(|| first.clone())
+}
+
 /// The file in `files` that a model-written name means: an exact match, else the one entry ending
 /// in it at a folder boundary (small models shorten paths, e.g. `src/x.rs` for `app/src/x.rs`).
 fn snap_to_list(written: &str, files: &[String]) -> Option<String> {
@@ -794,25 +813,32 @@ fn attempt(
 
     // The reply is started as `FILE:` so it can only be a path (G1 otherwise answers long code
     // prompts with a <tool_call>).
-    let path_reply = model.ask(&question, "FILE:", &first_line_done, deadline, cancel)?;
-    let written = path_reply["FILE:".len()..].lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_matches('`').to_string();
-    if written.is_empty() || written.eq_ignore_ascii_case("none") {
-        let done = model.ask(&question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
-        let reason = reason_after(&done, "DONE:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
-        return Ok(Attempt::Done(reason));
-    }
-    // Files named by the caller are the limit. Files picked by search are only a guess, so
-    // Xenon may name another real file in the folder (search had missed walker.py where
-    // other files repeated the goal's words; Xenon named it anyway).
-    let named = snap_to_list(&written, files).or_else(|| {
-        searched
-            .then(|| crate::code_search::snap_path(root, &written))
-            .flatten()
-            .filter(|p| contained(root, &root.join(p)).is_ok())
-    });
-    let Some(path) = named else {
-        report.narration.push(format!("Xenon's reply began: {}", excerpt(&path_reply)));
-        return Ok(Attempt::Stop(format!("the model named {written}, which wasn't in the given file list")));
+    // A goal or step that names one of the files outright needs no model call to find it: asked
+    // anyway, Xenon named shop.py for "Update the import in report.py".
+    let path = if let Some(path) = file_named_in(focus, files) {
+        path
+    } else {
+        let path_reply = model.ask(&question, "FILE:", &first_line_done, deadline, cancel)?;
+        let written = path_reply["FILE:".len()..].lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_matches('`').to_string();
+        if written.is_empty() || written.eq_ignore_ascii_case("none") {
+            let done = model.ask(&question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
+            let reason = reason_after(&done, "DONE:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
+            return Ok(Attempt::Done(reason));
+        }
+        // Files named by the caller are the limit. Files picked by search are only a guess, so
+        // Xenon may name another real file in the folder (search had missed walker.py where
+        // other files repeated the goal's words; Xenon named it anyway).
+        let named = snap_to_list(&written, files).or_else(|| {
+            searched
+                .then(|| crate::code_search::snap_path(root, &written))
+                .flatten()
+                .filter(|p| contained(root, &root.join(p)).is_ok())
+        });
+        let Some(path) = named else {
+            report.narration.push(format!("Xenon's reply began: {}", excerpt(&path_reply)));
+            return Ok(Attempt::Stop(format!("the model named {written}, which wasn't in the given file list")));
+        };
+        path
     };
     let current = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
     // Xenon recalls lines it read far back poorly, and given SEARCH/REPLACE it either
@@ -1168,6 +1194,10 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
             report.narration.push(line);
         }
 
+        // A failed round undoes every step, so each round starts from the original files and
+        // every place is fresh again. Kept across rounds, the record skipped nearly every step
+        // of rounds 2 and 3 as "tried every place".
+        tried.clear();
         let mut changes: Vec<FileChange> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let step_goal = format!("{step} (step {} of {}; the whole goal: {goal})", i + 1, steps.len());
@@ -1774,6 +1804,27 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let files: Vec<String> = Vec::new();
         assert_eq!(plan(&context(&model, &dir, &files, &cancel), "goal", "").unwrap(), vec!["A", "B"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_step_naming_a_file_is_located_there() {
+        let files = vec!["shop.py".to_string(), "report.py".to_string(), "test_shop.py".to_string(), "src/util.rs".to_string()];
+        assert_eq!(file_named_in("Update the import in `report.py`.", &files).as_deref(), Some("report.py"));
+        assert_eq!(file_named_in("Rename calc_total in shop.py", &files).as_deref(), Some("shop.py"), "not test_shop.py");
+        assert_eq!(file_named_in("Fix test_shop.py", &files).as_deref(), Some("test_shop.py"));
+        assert_eq!(file_named_in("Tidy util.rs", &files).as_deref(), Some("src/util.rs"), "by its file name");
+        assert_eq!(file_named_in("Rename it in shop.py and report.py", &files), None, "two files: Xenon chooses");
+        assert_eq!(file_named_in("Rename calc_total", &files), None);
+    }
+
+    #[test]
+    fn a_step_names_its_file_and_xenon_is_not_asked() {
+        let dir = repo_with(&[("a.py", VALUE_PY), ("b.py", "x = 1\n")]);
+        // Xenon would name the wrong file if asked; the goal names the right one.
+        let model = scripted(editing("b.py", " One step\n", |_, lines| lines.replace("VALUE = 1", "VALUE = 2")));
+        let report = run_scripted(&model, &dir, "Set VALUE to 2 in a.py", &["a.py", "b.py"]);
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
         fs::remove_dir_all(&dir).ok();
     }
 
