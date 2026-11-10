@@ -514,6 +514,46 @@ fn run_check(root: &Path, check: &Check, deadline: Instant, cancel: &AtomicBool)
     })
 }
 
+/// True when the goal says a test changes along with the code ("Update the code and its test").
+/// Only then may a failing test be rewritten; otherwise a failing test means the code is wrong.
+fn wants_test_update(goal: &str) -> bool {
+    goal.to_lowercase().contains("test")
+}
+
+/// The test file and line a check's failure points at: pytest's `test_x.py:12:` location.
+fn failing_test_line(failure: &str) -> Option<(String, usize)> {
+    failure.lines().rev().find_map(|line| {
+        let line = line.trim().replace('\\', "/");
+        let (path, rest) = line.split_once(".py:")?;
+        let path = format!("{}.py", path.rsplit([' ', '"', '(']).next().unwrap_or(path));
+        let number: usize = rest.split(':').next()?.trim().parse().ok()?;
+        is_python_test(&path).then_some((path, number))
+    })
+}
+
+/// The Test-writer: rewrites the assertion a failing check points at so it expects what `goal`
+/// asks for. Returns the change, already written, or `None` when there's no test line to change,
+/// Xenon wrote nothing new, or the rewrite would drop an assertion (loosening a test until broken
+/// code passes is the classic way to "fix" one).
+fn update_failing_test(ctx: &RunContext, goal: &str, failure: &str, report: &mut Report) -> Result<Option<FileChange>, String> {
+    let Some((test_path, number)) = failing_test_line(failure) else { return Ok(None) };
+    let Ok(text) = std::fs::read_to_string(ctx.root.join(&test_path)) else { return Ok(None) };
+    let Some(line) = text.lines().nth(number.saturating_sub(1)) else { return Ok(None) };
+    let files = vec![test_path.clone()];
+    let test_ctx = RunContext { files: &files, searched: false, ..*ctx };
+    let test_goal = format!("{goal} The code is already changed; update this test in {test_path} so it expects the new behavior.");
+    let focus = format!("{test_path} {line}");
+    let mut tried = HashMap::new();
+    let Attempt::Edit { path, current, code, .. } = attempt(&test_ctx, &test_goal, &focus, failure, &mut tried, report)? else {
+        return Ok(None);
+    };
+    if code.matches("assert").count() < current.matches("assert").count() {
+        report.narration.push(format!("Refused a change to {path} that removed an assertion"));
+        return Ok(None);
+    }
+    write_file(ctx.root, &path, &code).map(Some)
+}
+
 /// The one file in `files` that `text` names, by path or file name, as a whole word (so
 /// `shop.py` isn't found in `test_shop.py`). `None` when it names none of them, or several.
 fn file_named_in(text: &str, files: &[String]) -> Option<String> {
@@ -1146,6 +1186,24 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
             }
             report.stopped_reason = "finished: the tests pass".to_string();
             return Ok(());
+        }
+        // A goal that changes behavior and says its test changes too can fail only because a test
+        // still asserts the old behavior. Then the Test-writer updates that assertion, and the
+        // code and test edits are checked as one change, instead of the code edit being undone.
+        if wants_test_update(goal) && !budget.exhausted().is_some() {
+            if let Some(test_change) = update_failing_test(ctx, goal, &failure, report)? {
+                budget.edits += 1;
+                budget.runs += 1;
+                let mut test_failure = String::new();
+                if passes(ctx, &check, goal, &baselines, report, &mut test_failure)? {
+                    report.narration.push(format!("Updated {} to expect the new behavior", test_change.path));
+                    report.edits.push(test_change);
+                    report.stopped_reason = "finished: the tests pass".to_string();
+                    return Ok(());
+                }
+                write_file(ctx.root, &test_change.path, &test_change.before)?;
+                failure = test_failure;
+            }
         }
         // A failed edit is undone, so the next try starts from the original file and a run that
         // runs out of budget never leaves a broken one (one did, before this).
@@ -1805,6 +1863,67 @@ mod tests {
         let files: Vec<String> = Vec::new();
         assert_eq!(plan(&context(&model, &dir, &files, &cancel), "goal", "").unwrap(), vec!["A", "B"]);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    const TEXT_PY: &str = "import re\n\n\ndef slugify(title):\n    return '-'.join(w.lower() for w in re.findall(r'[a-zA-Z]+', title))\n";
+    const TEST_TEXT_PY: &str = "from text import slugify\n\n\ndef test_digits():\n    assert slugify('Room 101') == 'room'\n";
+
+    /// Edits as Xenon would for "keep digits": the code's regex, then (asked by the Test-writer)
+    /// the test's expected value, via `test_edit`.
+    fn keeping_digits(test_edit: fn(&str) -> String) -> impl Fn(&str, &str) -> String {
+        editing("text.py", " One step\n", move |question, lines| {
+            if question.contains("update this test") {
+                test_edit(lines)
+            } else {
+                lines.replace("[a-zA-Z]+", "[a-zA-Z0-9]+")
+            }
+        })
+    }
+
+    #[test]
+    fn a_behavior_change_updates_its_test_and_keeps_both() {
+        let dir = repo_with(&[("text.py", TEXT_PY), ("test_text.py", TEST_TEXT_PY)]);
+        let model = scripted(keeping_digits(|lines| lines.replace("== 'room'", "== 'room-101'")));
+        let report = run_scripted(&model, &dir, "slugify should keep digits. Update the code and its test.", &["text.py", "test_text.py"]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
+        assert!(fs::read_to_string(dir.join("text.py")).unwrap().contains("[a-zA-Z0-9]+"));
+        assert!(fs::read_to_string(dir.join("test_text.py")).unwrap().contains("== 'room-101'"));
+        assert_eq!(report.edits.len(), 2, "the code and its test, kept together");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_test_change_that_drops_the_assertion_is_refused_and_both_are_undone() {
+        let dir = repo_with(&[("text.py", TEXT_PY), ("test_text.py", TEST_TEXT_PY)]);
+        let model = scripted(keeping_digits(|lines| lines.replace("    assert slugify('Room 101') == 'room'", "    pass")));
+        let report = run_scripted(&model, &dir, "slugify should keep digits. Update the code and its test.", &["text.py", "test_text.py"]);
+
+        assert!(report.narration.iter().any(|n| n.contains("removed an assertion")), "{:?}", report.narration);
+        assert!(!report.stopped_reason.starts_with("finished"), "{}", report.stopped_reason);
+        assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
+        assert_eq!(fs::read_to_string(dir.join("text.py")).unwrap().replace("\r\n", "\n"), TEXT_PY);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_goal_that_doesnt_mention_its_test_never_changes_one() {
+        let dir = repo_with(&[("text.py", TEXT_PY), ("test_text.py", TEST_TEXT_PY)]);
+        let model = scripted(keeping_digits(|lines| lines.replace("== 'room'", "== 'room-101'")));
+        let report = run_scripted(&model, &dir, "slugify should keep digits.", &["text.py", "test_text.py"]);
+
+        assert!(!report.stopped_reason.starts_with("finished"), "the old test fails, so the edit is wrong");
+        assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_failing_test_line_is_read_from_pytest_output() {
+        let output = "    def test_digits():\n>       assert slugify('Room 101') == 'room'\nE       AssertionError\n\ntest_text.py:5: AssertionError\n";
+        assert_eq!(failing_test_line(output), Some(("test_text.py".to_string(), 5)));
+        assert_eq!(failing_test_line("C:\\tmp\\repo\\tests\\test_a.py:12: in test_x"), Some(("C:/tmp/repo/tests/test_a.py".to_string(), 12)));
+        assert_eq!(failing_test_line("text.py:3: SyntaxError"), None, "not a test file");
+        assert!(wants_test_update("Update the code and its Test.") && !wants_test_update("Fix the bug"));
     }
 
     #[test]
