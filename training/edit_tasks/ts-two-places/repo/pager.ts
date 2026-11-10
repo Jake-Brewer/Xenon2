@@ -1,3 +1,5 @@
+// constants
+
 /** Returns the items for one page. */
 export function paginate<T>(items: T[], page: number): T[] {
   const start = page * 20;

@@ -1,3 +1,5 @@
+// constants
+
 /// Truncates a list to at most 10 items.
 pub fn truncate(items: Vec<String>) -> Vec<String> {
     items.into_iter().take(10).collect()

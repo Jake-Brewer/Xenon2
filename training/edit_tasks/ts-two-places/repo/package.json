@@ -1,7 +1,7 @@
 {
   "name": "pager",
   "version": "1.0.0",
-  "devDependencies": {
-    "typescript": "^5.0.0"
+  "scripts": {
+    "test": "node -e \"const s=require('fs').readFileSync('pager.ts','utf8');if(!/PAGE_SIZE\\s*=\\s*20/.test(s)||s.split('PAGE_SIZE').length<4){console.error('PAGE_SIZE not fully added');process.exit(1)}console.log('ok')\""
   }
 }
