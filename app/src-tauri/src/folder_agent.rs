@@ -1489,15 +1489,29 @@ mod tests {
     struct Scripted<F: Fn(&str, &str) -> String> {
         reply: F,
         temps: RefCell<Vec<u32>>,
+        /// The first question asked with an edit step's reply start.
+        edit_question: RefCell<String>,
     }
 
     fn scripted<F: Fn(&str, &str) -> String>(reply: F) -> Scripted<F> {
-        Scripted { reply, temps: RefCell::new(Vec::new()) }
+        Scripted { reply, temps: RefCell::new(Vec::new()), edit_question: RefCell::new(String::new()) }
     }
 
     impl<F: Fn(&str, &str) -> String> Model for Scripted<F> {
-        fn ask(&self, question: &str, start: &str, _done: &dyn Fn(&str) -> bool, _deadline: Instant, _cancel: &AtomicBool) -> Result<String, String> {
-            Ok(format!("{start}{}", (self.reply)(question, start)).trim().to_string())
+        /// Writes the scripted reply a character at a time and stops once `done` says so, as the
+        /// engine stops generating, so the loop's stop rules are tested too.
+        fn ask(&self, question: &str, start: &str, done: &dyn Fn(&str) -> bool, _deadline: Instant, _cancel: &AtomicBool) -> Result<String, String> {
+            if start.starts_with("Lines ") && self.edit_question.borrow().is_empty() {
+                *self.edit_question.borrow_mut() = question.to_string();
+            }
+            let mut text = start.to_string();
+            for ch in (self.reply)(question, start).chars() {
+                text.push(ch);
+                if done(&text) {
+                    break;
+                }
+            }
+            Ok(text.trim().to_string())
         }
         fn prompt_text(&self, question: &str, start: &str) -> String {
             format!("{question}|{start}")
@@ -1746,6 +1760,88 @@ mod tests {
         let cargo = find_cargo().expect("cargo is running these tests");
         assert!(cargo.file_stem().is_some_and(|s| s == "cargo"), "{}", cargo.display());
         assert!(cargo.is_file());
+    }
+
+    /// A run context over `root` with `model`, as `run_with` would make one.
+    fn context<'a>(model: &'a dyn Model, root: &'a Path, files: &'a [String], cancel: &'a AtomicBool) -> RunContext<'a> {
+        RunContext { model, root, files, searched: false, listing: "", deadline: Instant::now() + Duration::from_secs(60), cancel }
+    }
+
+    #[test]
+    fn a_plan_ends_at_the_first_blank_line() {
+        let dir = temp_repo();
+        let model = scripted(|_: &str, start: &str| if start == "1." { " A\n2. B\n\n3. not part of the plan\n".to_string() } else { String::new() });
+        let cancel = AtomicBool::new(false);
+        let files: Vec<String> = Vec::new();
+        assert_eq!(plan(&context(&model, &dir, &files, &cancel), "goal", "").unwrap(), vec!["A", "B"]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn only_numbered_lines_are_steps() {
+        assert_eq!(parse_steps(". no number\n3 apples\n1. real step\n"), vec!["real step"]);
+    }
+
+    #[test]
+    fn a_baseline_is_run_once_and_a_failing_one_is_noted() {
+        let dir = temp_repo();
+        let model = scripted(|_: &str, _: &str| String::new());
+        let cancel = AtomicBool::new(false);
+        let files: Vec<String> = Vec::new();
+        let ctx = context(&model, &dir, &files, &cancel);
+        let mut report = Report::default();
+        let mut baselines = HashMap::new();
+
+        let failing = Check { program: "python", args: vec!["-c".into(), "print('warning: w\\n  --> a.rs:1:1'); raise SystemExit(1)".into()], dir: String::new() };
+        ensure_baseline(&ctx, &failing, &mut baselines, &mut report).unwrap();
+        assert_eq!(baselines.get(&failing.display()).map(Vec::len), Some(1), "its warnings are kept");
+        assert!(report.narration.iter().any(|n| n.contains("fails before any edit")), "{:?}", report.narration);
+
+        let passing = Check { program: "python", args: vec!["-c".into(), "pass".into()], dir: String::new() };
+        ensure_baseline(&ctx, &passing, &mut baselines, &mut report).unwrap();
+        assert_eq!(report.narration.len(), 1, "a passing baseline isn't noted");
+
+        // Run again, the stored baseline is used: no new narration even though it still fails.
+        ensure_baseline(&ctx, &failing, &mut baselines, &mut report).unwrap();
+        assert_eq!(report.narration.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_check_is_stopped_at_its_deadline_or_on_cancel() {
+        let dir = temp_repo();
+        let sleeper = Check { program: "python", args: vec!["-c".into(), "import time; time.sleep(30)".into()], dir: String::new() };
+        let started = Instant::now();
+        let step = run_check(&dir, &sleeper, Instant::now() + Duration::from_millis(300), &AtomicBool::new(false)).unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10), "killed, not waited out");
+        assert!(step.stderr.contains("out of time"), "{}", step.stderr);
+        assert_ne!(step.exit_code, Some(0));
+
+        let step = run_check(&dir, &sleeper, Instant::now() + Duration::from_secs(60), &AtomicBool::new(true)).unwrap();
+        assert!(step.stderr.contains("cancelled"), "{}", step.stderr);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cool_down_stops_waiting_when_cancelled() {
+        let model = scripted(|_: &str, _: &str| String::new());
+        *model.temps.borrow_mut() = vec![HOT_C + 5, HOT_C + 5, HOT_C + 5];
+        assert!(cool_down(&model, &AtomicBool::new(true)).is_some(), "it was hot, so it says so");
+        assert_eq!(model.temps.borrow().len(), 2, "only the first reading: cancel ends the wait at once");
+    }
+
+    #[test]
+    fn an_edit_is_shown_three_lines_after_it_and_no_more() {
+        // Names of three or more letters: search ignores shorter words.
+        let lines: Vec<String> = (0..10).map(|i| format!("VALUE{i} = {i}")).collect();
+        let text = lines.join("\n") + "\nassert VALUE2 == 9\n";
+        let dir = repo_with(&[("a.py", &text)]);
+        let model = scripted(editing("a.py", " One step\n", |_, lines| lines.to_string()));
+        run_scripted(&model, &dir, "Set VALUE2 to 9", &["a.py"]);
+        let question = model.edit_question.borrow().clone();
+        // VALUE2 is rewritten with both neighbours (VALUE1..VALUE3); the three after are VALUE4..6.
+        assert!(question.contains("VALUE6 = 6") && !question.contains("VALUE7 = 7"), "{question}");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
