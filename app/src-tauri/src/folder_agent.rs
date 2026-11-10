@@ -51,18 +51,16 @@ const SNAPSHOT_MESSAGE: &str = "xenon-agent: snapshot before run";
 /// `gpu_temp.rs`, which also throttles between tokens).
 use crate::gpu_temp::{COOL_C, HOT_C};
 const MAX_COOL_WAIT: Duration = Duration::from_secs(5 * 60);
-
-fn gpu_temp() -> Option<u32> {
-    crate::gpu_temp::read()
-}
+/// How often a cool-down re-reads the temperature (quick in tests).
+const COOL_POLL: Duration = if cfg!(test) { Duration::from_millis(5) } else { Duration::from_secs(5) };
 
 /// Waits out a hot GPU. Returns a narration line when it had to wait.
-fn cool_down(cancel: &AtomicBool) -> Option<String> {
-    let hot = gpu_temp().filter(|t| *t >= HOT_C)?;
+fn cool_down(model: &dyn Model, cancel: &AtomicBool) -> Option<String> {
+    let hot = model.gpu_temp().filter(|t| *t >= HOT_C)?;
     let started = Instant::now();
     while started.elapsed() < MAX_COOL_WAIT && !cancel.load(Ordering::Relaxed) {
-        std::thread::sleep(Duration::from_secs(5));
-        if gpu_temp().map_or(true, |t| t <= COOL_C) {
+        std::thread::sleep(COOL_POLL);
+        if model.gpu_temp().map_or(true, |t| t <= COOL_C) {
             break;
         }
     }
@@ -302,6 +300,37 @@ fn ask_prompt(model_name: &str, question: &str, start: &str) -> Result<(String, 
     let prior = format!("{}{user_turn}", prompt.prior);
     let last = format!("{reply_start}{start}");
     Ok((prior, last, prompt.params))
+}
+
+/// What the agent's loop asks things of: the model, and the GPU it runs on. The app's engine in
+/// use; a scripted stand-in in tests, so the loop (undoing failed edits, the budget, lessons, the
+/// fall back to steps) can be tested without a GPU. Mutation testing found none of it was.
+trait Model {
+    /// Xenon's reply to `question`, begun with `start` (which comes back at its front), ending
+    /// once `done` says the text is complete. As `ask`.
+    fn ask(&self, question: &str, start: &str, done: &dyn Fn(&str) -> bool, deadline: Instant, cancel: &AtomicBool) -> Result<String, String>;
+    /// Exactly the text the model reads before its reply to `question` begun with `start`.
+    fn prompt_text(&self, question: &str, start: &str) -> String;
+    /// The GPU's temperature now, if there is one to read.
+    fn gpu_temp(&self) -> Option<u32>;
+}
+
+/// The app's loaded model.
+struct Engine<'a> {
+    engine: &'a EngineState,
+    model_name: &'a str,
+}
+
+impl Model for Engine<'_> {
+    fn ask(&self, question: &str, start: &str, done: &dyn Fn(&str) -> bool, deadline: Instant, cancel: &AtomicBool) -> Result<String, String> {
+        ask(self.engine, self.model_name, question, start, done, deadline, cancel)
+    }
+    fn prompt_text(&self, question: &str, start: &str) -> String {
+        ask_prompt(self.model_name, question, start).map(|(a, b, _)| a + &b).unwrap_or_default()
+    }
+    fn gpu_temp(&self) -> Option<u32> {
+        crate::gpu_temp::read()
+    }
 }
 
 /// True once the text after `FILE:` has a complete non-blank line (or has run long).
@@ -717,8 +746,7 @@ pub fn cancel_job(id: &str) -> bool {
 /// on success, a budget limit, cancellation, or the model declining to propose further changes.
 /// What stays the same for every attempt in a run.
 struct RunContext<'a> {
-    engine: &'a EngineState,
-    model_name: &'a str,
+    model: &'a dyn Model,
     root: &'a Path,
     files: &'a [String],
     /// The files came from search, so Xenon may name another real file in the folder.
@@ -748,7 +776,7 @@ fn attempt(
     tried: &mut HashMap<String, Vec<(usize, usize)>>,
     report: &mut Report,
 ) -> Result<Attempt, String> {
-    let RunContext { engine, model_name, root, files, searched, listing, deadline, cancel } = *ctx;
+    let RunContext { model, root, files, searched, listing, deadline, cancel } = *ctx;
     // The goal comes before the files and again after them: a recurrent model reads once, so
     // it should know what it's looking for while it reads (see CODING_STRATEGIES.md). The
     // edit's shape is set by how its reply is started (below), so it isn't described here.
@@ -760,10 +788,10 @@ fn attempt(
 
     // The reply is started as `FILE:` so it can only be a path (G1 otherwise answers long code
     // prompts with a <tool_call>).
-    let path_reply = ask(engine, model_name, &question, "FILE:", &first_line_done, deadline, cancel)?;
+    let path_reply = model.ask(&question, "FILE:", &first_line_done, deadline, cancel)?;
     let written = path_reply["FILE:".len()..].lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().trim_matches('`').to_string();
     if written.is_empty() || written.eq_ignore_ascii_case("none") {
-        let done = ask(engine, model_name, &question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
+        let done = model.ask(&question, "FILE: none\nDONE:", &|t: &str| t.ends_with('\n'), deadline, cancel)?;
         let reason = reason_after(&done, "DONE:").filter(|r| !r.is_empty()).unwrap_or_else(|| "no reason given".to_string());
         return Ok(Attempt::Done(reason));
     }
@@ -820,7 +848,7 @@ fn attempt(
     );
     let start_len = start.len();
     let closed = move |t: &str| t.get(start_len..).is_some_and(|rest| rest.contains("```"));
-    let reply = ask(engine, model_name, &question_with(last_failure), &start, &closed, deadline, cancel)?;
+    let reply = model.ask(&question_with(last_failure), &start, &closed, deadline, cancel)?;
     let Some(written) = reply.get(start_len..).and_then(|rest| rest.split("```").next()) else {
         report.narration.push(format!("Xenon's reply began: {}", excerpt(&reply)));
         return Ok(Attempt::Stop("the model's reply had no new lines".to_string()));
@@ -828,7 +856,7 @@ fn attempt(
     let written = written.trim_end_matches(['\n', '\r']).to_string();
     // The prompt this place gets without any failure feedback: the one a lesson pairs with the
     // edit that finally passes here.
-    let clean_prompt = ask_prompt(model_name, &question_with(""), &start).map(|(a, b, _)| a + &b).unwrap_or_default();
+    let clean_prompt = model.prompt_text(&question_with(""), &start);
     if written.trim() == target.trim() {
         return Ok(Attempt::Unchanged { path, from, to, target, clean_prompt });
     }
@@ -846,7 +874,7 @@ fn plan(ctx: &RunContext, goal: &str, last_failure: &str) -> Result<Vec<String>,
         ctx.listing
     );
     let done = |t: &str| t.len() > 1500 || t.contains("\n\n") || t.contains("User:");
-    let reply = ask(ctx.engine, ctx.model_name, &question, "1.", &done, ctx.deadline, ctx.cancel)?;
+    let reply = ctx.model.ask(&question, "1.", &done, ctx.deadline, ctx.cancel)?;
     Ok(parse_steps(&reply))
 }
 
@@ -921,6 +949,18 @@ pub fn run(
     progress: &dyn Fn(&[String]),
     cancel: &AtomicBool,
 ) -> Result<Report, String> {
+    run_with(&Engine { engine, model_name }, root, goal, files, progress, cancel)
+}
+
+/// `run`, with the model passed in (a scripted stand-in in tests).
+fn run_with(
+    model: &dyn Model,
+    root: &Path,
+    goal: &str,
+    files: &[String],
+    progress: &dyn Fn(&[String]),
+    cancel: &AtomicBool,
+) -> Result<Report, String> {
     if !root.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
     }
@@ -963,8 +1003,7 @@ pub fn run(
     }
     let budget_started = Instant::now();
     let ctx = RunContext {
-        engine,
-        model_name,
+        model,
         root,
         files: &files,
         searched,
@@ -1014,7 +1053,7 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
             report.stopped_reason = reason;
             return Ok(());
         }
-        if let Some(line) = cool_down(ctx.cancel) {
+        if let Some(line) = cool_down(ctx.model, ctx.cancel) {
             report.narration.push(line);
         }
 
@@ -1119,7 +1158,7 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
             report.stopped_reason = reason;
             return Ok(());
         }
-        if let Some(line) = cool_down(ctx.cancel) {
+        if let Some(line) = cool_down(ctx.model, ctx.cancel) {
             report.narration.push(line);
         }
 
