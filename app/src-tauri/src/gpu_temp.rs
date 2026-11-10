@@ -93,12 +93,18 @@ pub fn pace_for(temp_c: u32) -> Duration {
 /// One prompt chunk (128 tokens) takes about as long to read as four tokens take to write.
 const CHUNK_IN_TOKENS: u32 = 4;
 
-/// `throttle` for reading a prompt, called between chunks: the same hard pause at `HOT_C`, and
-/// below it the pacing wait of the `CHUNK_IN_TOKENS` tokens a chunk takes as long as.
+/// Reading heats the GPU faster than the once-a-second temperature reading keeps up with, so its
+/// hard pause starts this many degrees early: paused at `HOT_C` itself, back-to-back long prompts
+/// still peaked at 82 C (14 s at or over 80 C, from 85 C and 30 s with no pacing at all).
+const READING_MARGIN_C: u32 = 2;
+
+/// `throttle` for reading a prompt, called between chunks: a hard pause from `HOT_C -
+/// READING_MARGIN_C` until `COOL_C`, and below it the pacing wait of the `CHUNK_IN_TOKENS` tokens
+/// a chunk takes as long as.
 pub fn throttle_reading() -> Duration {
     let now = current();
-    if now >= HOT_C {
-        return throttle();
+    if now >= HOT_C - READING_MARGIN_C {
+        return pause_until_cool();
     }
     let wait = pace_for(now) * CHUNK_IN_TOKENS;
     if !wait.is_zero() {
@@ -117,6 +123,11 @@ pub fn throttle() -> Duration {
         }
         return wait;
     }
+    pause_until_cool()
+}
+
+/// Waits until the GPU is back down to `COOL_C` (at most `MAX_PAUSE`). Returns how long it waited.
+fn pause_until_cool() -> Duration {
     let started = Instant::now();
     let hot = current();
     while current() > COOL_C && started.elapsed() < MAX_PAUSE {
