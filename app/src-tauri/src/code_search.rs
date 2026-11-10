@@ -84,6 +84,26 @@ fn source_files(root: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// The source files of `root` (as `search` sees them) that use `name` as a whole word.
+pub fn files_using(root: &Path, name: &str) -> Vec<String> {
+    source_files(root).into_iter().filter(|(_, text)| replace_word(text, name, "\u{0}") != *text).map(|(rel, _)| rel).collect()
+}
+
+/// `text` with every whole-word `old` replaced by `new` (so `calc_total` doesn't touch
+/// `calc_totals` or `old_calc_total`).
+pub fn replace_word(text: &str, old: &str, new: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    while let Some(found) = text[from..].find(old) {
+        let at = from + found;
+        out.push_str(&text[from..at]);
+        out.push_str(if is_word_at(text, at, old.len()) { new } else { old });
+        from = at + old.len();
+    }
+    out.push_str(&text[from..]);
+    out
+}
+
 fn is_word_at(line: &str, at: usize, len: usize) -> bool {
     let before = line[..at].chars().next_back();
     let after = line[at + len..].chars().next();
@@ -316,6 +336,14 @@ mod tests {
 
     // The tests below were written against cargo-mutants' misses: each fails if the code it
     // covers is broken in the way named, which the earlier tests didn't notice.
+
+    #[test]
+    fn whole_words_are_replaced_and_found() {
+        assert_eq!(replace_word("calc_total(calc_totals) + x.calc_total", "calc_total", "t"), "t(calc_totals) + x.t");
+        assert_eq!(replace_word("old_calc_total calc_total2", "calc_total", "t"), "old_calc_total calc_total2");
+        let dir = project_with(&[("a.py", "calc_total()\n".into()), ("b.py", "calc_totals()\n".into()), ("c.rs", "// calc_total\n".into())]);
+        assert_eq!(files_using(dir.path(), "calc_total"), vec!["a.py", "c.rs"]);
+    }
 
     #[test]
     fn keywords_skip_short_and_common_words_and_mark_identifiers() {

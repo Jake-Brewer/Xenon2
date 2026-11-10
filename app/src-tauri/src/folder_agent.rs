@@ -514,6 +514,70 @@ fn run_check(root: &Path, check: &Check, deadline: Instant, cancel: &AtomicBool)
     })
 }
 
+/// The (old, new) names of a goal like "Rename the function `calc_total` to order_total", or
+/// `None` when the goal isn't a rename of one identifier to another.
+fn rename_in(goal: &str) -> Option<(String, String)> {
+    let lower = goal.to_lowercase();
+    let after = &goal[lower.find("rename")? + "rename".len()..];
+    let (left, right) = after.split_once(" to ")?;
+    let identifiers = |s: &str| -> Vec<String> {
+        s.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|w| w.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_'))
+            .map(str::to_string)
+            .collect()
+    };
+    let old = identifiers(left).pop()?;
+    let new = identifiers(right).into_iter().next()?;
+    (old != new).then_some((old, new))
+}
+
+/// The Renamer: renames `old` to `new` as a whole word in every file that uses it (only the given
+/// files, when the caller named them), then checks each touched file once. Keeps everything when
+/// the checks pass, else undoes every file. Returns whether it finished the goal.
+fn run_rename(ctx: &RunContext, goal: &str, old: &str, new: &str, report: &mut Report) -> Result<bool, String> {
+    let mut targets = crate::code_search::files_using(ctx.root, old);
+    if !ctx.searched {
+        targets.retain(|t| ctx.files.contains(t));
+    }
+    if targets.is_empty() {
+        return Ok(false);
+    }
+    let mut baselines = HashMap::new();
+    let mut checks: Vec<Check> = Vec::new();
+    for file in &targets {
+        if let Some(check) = check_for(ctx.root, file, &targets) {
+            if !checks.iter().any(|c| c.display() == check.display()) {
+                ensure_baseline(ctx, &check, &mut baselines, report)?;
+                checks.push(check);
+            }
+        }
+    }
+    let mut changes = Vec::new();
+    for file in &targets {
+        let text = std::fs::read_to_string(ctx.root.join(file)).map_err(|e| format!("couldn't read {file}: {e}"))?;
+        changes.push(write_file(ctx.root, file, &crate::code_search::replace_word(&text, old, new))?);
+    }
+    report.narration.push(format!("Renamed {old} to {new} in {}", targets.join(", ")));
+    let mut failure = String::new();
+    let mut passed = true;
+    for check in &checks {
+        if !passes(ctx, check, goal, &baselines, report, &mut failure)? {
+            passed = false;
+            break;
+        }
+    }
+    if passed {
+        report.edits.extend(changes);
+        report.stopped_reason = if checks.is_empty() { "finished: edited, nothing to check it with" } else { "finished: the tests pass" }.to_string();
+        return Ok(true);
+    }
+    for change in changes.iter().rev() {
+        write_file(ctx.root, &change.path, &change.before)?;
+    }
+    report.narration.push("The rename didn't pass its checks; undid it".to_string());
+    Ok(false)
+}
+
 /// True when the goal says a test changes along with the code ("Update the code and its test").
 /// Only then may a failing test be rewritten; otherwise a failing test means the code is wrong.
 fn wants_test_update(goal: &str) -> bool {
@@ -1088,6 +1152,15 @@ fn run_with(
     // than multi-step mode for a small model (which over-decomposes simple goals), so steps are a
     // fallback, used only when one edit at a time can't finish (a rename whose callers break until
     // a later edit, say). A run that finished, was cancelled, or hit the time limit is not retried.
+    //
+    // A rename goes to the Renamer first: a whole-word replace across the folder, checked once.
+    // Done one place at a time, a rename's callers break until a later step, and a step edits only
+    // one place in a file, so the import got renamed and the call next to it didn't.
+    if let Some((old, new)) = rename_in(goal) {
+        if run_rename(&ctx, goal, &old, &new, &mut report)? {
+            return Ok(report);
+        }
+    }
     run_one(&ctx, goal, &mut report, progress)?;
     if report.stopped_reason.starts_with("finished")
         || report.stopped_reason == "cancelled"
@@ -1914,6 +1987,57 @@ mod tests {
 
         assert!(!report.stopped_reason.starts_with("finished"), "the old test fails, so the edit is wrong");
         assert_eq!(fs::read_to_string(dir.join("test_text.py")).unwrap().replace("\r\n", "\n"), TEST_TEXT_PY);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rename_goals_are_read_for_their_two_names() {
+        let pair = |a: &str, b: &str| Some((a.to_string(), b.to_string()));
+        assert_eq!(rename_in("Rename the function calc_total to order_total everywhere it is used."), pair("calc_total", "order_total"));
+        assert_eq!(rename_in("rename `loadModel` to `load_model`"), pair("loadModel", "load_model"));
+        assert_eq!(rename_in("Add a rename button"), None, "no 'to'");
+        assert_eq!(rename_in("Set VALUE to 2"), None, "not a rename");
+        assert_eq!(rename_in("Rename x to x"), None, "nothing changes");
+    }
+
+    const SHOP_PY: &str = "def calc_total(prices):\n    return sum(prices)\n\n\ndef calc_totals_twice(prices):\n    return 2 * calc_total(prices)\n";
+    const REPORT_PY: &str = "from shop import calc_total\n\n\ndef summary(prices):\n    return f\"{calc_total(prices):.2f}\"\n";
+    const TEST_SHOP_PY: &str = "from shop import calc_total\n\n\ndef test_total():\n    assert calc_total([1.0, 2.0]) == 3.0\n";
+
+    #[test]
+    fn a_rename_reaches_every_use_in_every_file_and_nothing_else() {
+        let dir = repo_with(&[("shop.py", SHOP_PY), ("report.py", REPORT_PY), ("test_shop.py", TEST_SHOP_PY)]);
+        let model = scripted(|_: &str, _: &str| panic!("a rename needs no model"));
+        let report = run_scripted(&model, &dir, "Rename calc_total to order_total everywhere.", &[]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
+        assert_eq!(report.edits.len(), 3);
+        let shop = fs::read_to_string(dir.join("shop.py")).unwrap();
+        assert!(shop.contains("def order_total(") && shop.contains("2 * order_total(prices)"), "{shop}");
+        assert!(shop.contains("def calc_totals_twice("), "a longer name that starts the same is left alone");
+        for file in ["report.py", "test_shop.py"] {
+            assert!(!fs::read_to_string(dir.join(file)).unwrap().contains("calc_total"), "{file}");
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_rename_that_breaks_a_check_is_undone_everywhere() {
+        // A test that builds the old name at run time, which no text rename can follow.
+        let test = "import shop\n\n\ndef test_name():\n    assert hasattr(shop, 'calc_' + 'total')\n";
+        let dir = repo_with(&[("shop.py", SHOP_PY), ("test_shop.py", test)]);
+        // After the rename is undone the agent falls back to editing; here Xenon says there's
+        // nothing to change, so the fallback ends at once.
+        let model = scripted(|_: &str, start: &str| match start {
+            "FILE:" => " none\n".to_string(),
+            s if s.starts_with("FILE: none") => " nothing to do\n".to_string(),
+            _ => String::new(),
+        });
+        let report = run_scripted(&model, &dir, "Rename calc_total to order_total", &["shop.py", "test_shop.py"]);
+
+        assert!(report.narration.iter().any(|n| n.contains("undid it")), "{:?}", report.narration);
+        assert_eq!(fs::read_to_string(dir.join("shop.py")).unwrap().replace("\r\n", "\n"), SHOP_PY);
+        assert_eq!(fs::read_to_string(dir.join("test_shop.py")).unwrap().replace("\r\n", "\n"), test);
         fs::remove_dir_all(&dir).ok();
     }
 
