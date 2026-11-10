@@ -16,7 +16,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -240,6 +240,65 @@ fn error_body(message: &str) -> Value {
     json!({ "error": { "message": message, "type": "invalid_request_error" } })
 }
 
+/// The responses that need neither the engine nor the app, as (status, body), checking the token
+/// first; `None` for the routes `handle` serves itself (chat, starting a folder-agent run,
+/// feedback) and for unknown routes. Split out of `handle` so tests can send requests through the
+/// router and the auth check: mutation testing found any route, or the token check itself, could
+/// be removed without a test failing.
+fn simple_route(request: &Request, token: &str, model_name: &str) -> Option<(&'static str, Value)> {
+    let bad = |e: String| ("400 Bad Request", error_body(&e));
+    Some(match (request.method.as_str(), request.path.as_str()) {
+        ("GET", "/health") => ("200 OK", json!({ "ok": true, "name": "xenon2", "model": model_name })),
+        _ if !authorized(request, token) => ("401 Unauthorized", error_body("missing or wrong bearer token")),
+        ("GET", "/v1/models") => ("200 OK", json!({ "object": "list", "data": [{ "id": MODEL_ID, "object": "model", "owned_by": "xenon2" }] })),
+        // The prompt a chat request would get, without generating (and without rated examples,
+        // which change as ratings come in). Training data is built through this, so it always
+        // matches what the model sees in use.
+        ("POST", "/v1/prompt") => {
+            let parsed = serde_json::from_slice::<ChatRequest>(&request.body)
+                .map_err(|e| format!("invalid request JSON: {e}"))
+                .and_then(|r| build_prompt(&r, Style::for_model(model_name)).map(|p| (r, p)));
+            match parsed {
+                Ok((chat, mut prompt)) => {
+                    add_search(&chat, &mut prompt);
+                    ("200 OK", json!({ "prior": prompt.prior, "last": prompt.last }))
+                }
+                Err(e) => bad(e),
+            }
+        }
+        // Code search as a tool: the lines of `workspace` that best match `query`.
+        ("POST", "/v1/search") => match serde_json::from_slice::<SearchRequest>(&request.body) {
+            Ok(req) if Path::new(&req.workspace).is_dir() => {
+                ("200 OK", json!({ "lines": crate::code_search::search(Path::new(&req.workspace), &req.query) }))
+            }
+            Ok(req) => bad(format!("{} is not a folder", req.workspace)),
+            Err(e) => bad(format!("invalid request JSON: {e}")),
+        },
+        ("GET", path) if path.starts_with("/v1/folder-agent/") => {
+            match folder_agent::job_status(path.trim_start_matches("/v1/folder-agent/")) {
+                Some(status) => ("200 OK", json!(status)),
+                None => ("404 Not Found", error_body("no such run")),
+            }
+        }
+        ("POST", path) if path.starts_with("/v1/folder-agent/") && path.ends_with("/cancel") => {
+            let id = path.trim_start_matches("/v1/folder-agent/").trim_end_matches("/cancel");
+            if folder_agent::cancel_job(id) {
+                ("200 OK", json!({ "ok": true }))
+            } else {
+                ("404 Not Found", error_body("no such run"))
+            }
+        }
+        ("POST", "/v1/folder-agent/undo") => match serde_json::from_slice::<FolderAgentUndoRequest>(&request.body) {
+            Ok(req) => match folder_agent::undo(Path::new(&req.folder), &req.snapshot_commit) {
+                Ok(()) => ("200 OK", json!({ "ok": true })),
+                Err(e) => ("500 Internal Server Error", error_body(&e)),
+            },
+            Err(e) => bad(format!("invalid request JSON: {e}")),
+        },
+        _ => return None,
+    })
+}
+
 fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str, model_name: &str) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut stream = stream;
@@ -252,17 +311,10 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
     };
 
     let io = |e: std::io::Error| e.to_string();
+    if let Some((status, body)) = simple_route(&request, token, model_name) {
+        return write_json(&mut stream, status, &body).map_err(io);
+    }
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/health") => write_json(&mut stream, "200 OK", &json!({ "ok": true, "name": "xenon2", "model": model_name })).map_err(io),
-        _ if !authorized(&request, token) => {
-            write_json(&mut stream, "401 Unauthorized", &error_body("missing or wrong bearer token")).map_err(io)
-        }
-        ("GET", "/v1/models") => write_json(
-            &mut stream,
-            "200 OK",
-            &json!({ "object": "list", "data": [{ "id": MODEL_ID, "object": "model", "owned_by": "xenon2" }] }),
-        )
-        .map_err(io),
         ("POST", "/v1/chat/completions") => {
             let parsed = serde_json::from_slice::<ChatRequest>(&request.body)
                 .map_err(|e| format!("invalid request JSON: {e}"))
@@ -278,33 +330,6 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                     }
                     chat_completion(&mut stream, app, engine, &chat, &prompt)
                 }
-                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
-            }
-        }
-        // The prompt a chat request would get, without generating (and without rated examples,
-        // which change as ratings come in). Training data is built through this, so it always
-        // matches what the model sees in use.
-        ("POST", "/v1/prompt") => {
-            let parsed = serde_json::from_slice::<ChatRequest>(&request.body)
-                .map_err(|e| format!("invalid request JSON: {e}"))
-                .and_then(|r| build_prompt(&r, Style::for_model(model_name)).map(|p| (r, p)));
-            match parsed {
-                Ok((chat, mut prompt)) => {
-                    add_search(&chat, &mut prompt);
-                    write_json(&mut stream, "200 OK", &json!({ "prior": prompt.prior, "last": prompt.last })).map_err(io)
-                }
-                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
-            }
-        }
-        // Code search as a tool: the lines of `workspace` that best match `query`.
-        ("POST", "/v1/search") => {
-            let parsed = serde_json::from_slice::<SearchRequest>(&request.body).map_err(|e| format!("invalid request JSON: {e}"));
-            match parsed {
-                Ok(req) if std::path::Path::new(&req.workspace).is_dir() => {
-                    let found = crate::code_search::search(std::path::Path::new(&req.workspace), &req.query);
-                    write_json(&mut stream, "200 OK", &json!({ "lines": found })).map_err(io)
-                }
-                Ok(req) => write_json(&mut stream, "400 Bad Request", &error_body(&format!("{} is not a folder", req.workspace))).map_err(io),
                 Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
             }
         }
@@ -326,35 +351,6 @@ fn handle(stream: TcpStream, app: &AppHandle, engine: &EngineState, token: &str,
                     match started {
                         Ok(()) => write_json(&mut stream, "202 Accepted", &json!({ "id": id })).map_err(io),
                         Err(e) => write_json(&mut stream, "409 Conflict", &error_body(&e)).map_err(io),
-                    }
-                }
-                Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
-            }
-        }
-        ("GET", path) if path.starts_with("/v1/folder-agent/") => {
-            let id = path.trim_start_matches("/v1/folder-agent/");
-            match folder_agent::job_status(id) {
-                Some(status) => write_json(&mut stream, "200 OK", &json!(status)).map_err(io),
-                None => write_json(&mut stream, "404 Not Found", &error_body("no such run")).map_err(io),
-            }
-        }
-        ("POST", path) if path.starts_with("/v1/folder-agent/") && path.ends_with("/cancel") => {
-            let id = path.trim_start_matches("/v1/folder-agent/").trim_end_matches("/cancel");
-            if folder_agent::cancel_job(id) {
-                write_json(&mut stream, "200 OK", &json!({ "ok": true })).map_err(io)
-            } else {
-                write_json(&mut stream, "404 Not Found", &error_body("no such run")).map_err(io)
-            }
-        }
-        ("POST", "/v1/folder-agent/undo") => {
-            let parsed = serde_json::from_slice::<FolderAgentUndoRequest>(&request.body)
-                .map_err(|e| format!("invalid request JSON: {e}"));
-            match parsed {
-                Ok(req) => {
-                    let root = std::path::PathBuf::from(&req.folder);
-                    match folder_agent::undo(&root, &req.snapshot_commit) {
-                        Ok(()) => write_json(&mut stream, "200 OK", &json!({ "ok": true })).map_err(io),
-                        Err(e) => write_json(&mut stream, "500 Internal Server Error", &error_body(&e)).map_err(io),
                     }
                 }
                 Err(e) => write_json(&mut stream, "400 Bad Request", &error_body(&e)).map_err(io),
@@ -844,5 +840,175 @@ Assistant: <think></think>");
         let parsed: Value = serde_json::from_str(chunk.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(parsed["choices"][0]["delta"]["content"], "hi");
         assert_eq!(parsed["object"], "chat.completion.chunk");
+    }
+    // ---- Written against cargo-mutants' misses: routes, the token check, limits, helpers ----
+
+    const TOKEN: &str = "s3cret-token";
+
+    fn req(method: &str, path: &str, token: Option<&str>, body: &str) -> Request {
+        Request {
+            method: method.into(),
+            path: path.into(),
+            authorization: token.map(|t| format!("Bearer {t}")),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn route(request: Request) -> Option<(&'static str, Value)> {
+        simple_route(&request, TOKEN, "rwkv-test")
+    }
+
+    #[test]
+    fn health_answers_without_a_token_and_names_the_model() {
+        let (status, body) = route(req("GET", "/health", None, "")).unwrap();
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["model"], "rwkv-test");
+    }
+
+    #[test]
+    fn every_other_route_needs_the_token() {
+        for (method, path) in [
+            ("GET", "/v1/models"),
+            ("POST", "/v1/chat/completions"),
+            ("POST", "/v1/prompt"),
+            ("POST", "/v1/search"),
+            ("POST", "/v1/folder-agent"),
+            ("GET", "/v1/folder-agent/run-x"),
+            ("POST", "/v1/feedback"),
+            ("GET", "/no/such/route"),
+        ] {
+            for token in [None, Some("wrong")] {
+                let (status, _) = route(req(method, path, token, "{}")).unwrap();
+                assert_eq!(status, "401 Unauthorized", "{method} {path} with {token:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn models_lists_xenon() {
+        let (status, body) = route(req("GET", "/v1/models", Some(TOKEN), "")).unwrap();
+        assert_eq!(status, "200 OK");
+        assert_eq!(body["data"][0]["id"], MODEL_ID);
+    }
+
+    #[test]
+    fn the_prompt_route_builds_the_chat_prompt_with_search_results() {
+        let dir = std::env::temp_dir().join(format!("xenon-api-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("engine.rs"), "fn threads_for(n: u32) -> u32 { n }\n").unwrap();
+        let body = json!({ "messages": [{ "role": "user", "content": "Where is `threads_for`?" }], "workspace": dir });
+        let (status, out) = route(req("POST", "/v1/prompt", Some(TOKEN), &body.to_string())).unwrap();
+        assert_eq!(status, "200 OK");
+        let last = out["last"].as_str().unwrap();
+        assert!(last.contains("Where is `threads_for`?"), "{last}");
+        assert!(last.contains("engine.rs:1: fn threads_for"), "search results are spliced in: {last}");
+        assert!(out["prior"].as_str().unwrap().contains("programming"), "the coding preamble");
+
+        let (status, _) = route(req("POST", "/v1/prompt", Some(TOKEN), "not json")).unwrap();
+        assert_eq!(status, "400 Bad Request");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_search_route_searches_a_folder_and_refuses_anything_else() {
+        let dir = std::env::temp_dir().join(format!("xenon-api-search-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.py"), "def zebra_marker():\n    pass\n").unwrap();
+        let ask = |workspace: &Path| json!({ "workspace": workspace, "query": "zebra_marker" }).to_string();
+
+        let (status, body) = route(req("POST", "/v1/search", Some(TOKEN), &ask(&dir))).unwrap();
+        assert_eq!(status, "200 OK");
+        assert!(body["lines"].as_str().unwrap().contains("a.py:1: def zebra_marker"), "{body}");
+
+        let (status, body) = route(req("POST", "/v1/search", Some(TOKEN), &ask(&dir.join("a.py")))).unwrap();
+        assert_eq!(status, "400 Bad Request");
+        assert!(body["error"]["message"].as_str().unwrap().contains("is not a folder"));
+
+        let (status, _) = route(req("POST", "/v1/search", Some(TOKEN), "{")).unwrap();
+        assert_eq!(status, "400 Bad Request");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn folder_agent_status_cancel_and_undo_answer_for_unknown_runs() {
+        let (status, _) = route(req("GET", "/v1/folder-agent/run-missing", Some(TOKEN), "")).unwrap();
+        assert_eq!(status, "404 Not Found");
+        let (status, _) = route(req("POST", "/v1/folder-agent/run-missing/cancel", Some(TOKEN), "")).unwrap();
+        assert_eq!(status, "404 Not Found");
+        let (status, _) = route(req("POST", "/v1/folder-agent/undo", Some(TOKEN), "{}")).unwrap();
+        assert_eq!(status, "400 Bad Request", "undo needs a folder and a commit");
+        let missing = json!({ "folder": std::env::temp_dir().join("xenon-no-such-folder"), "snapshot_commit": "abc" });
+        let (status, _) = route(req("POST", "/v1/folder-agent/undo", Some(TOKEN), &missing.to_string())).unwrap();
+        assert_eq!(status, "500 Internal Server Error");
+    }
+
+    #[test]
+    fn engine_routes_and_unknown_routes_are_left_to_handle() {
+        for (method, path) in [("POST", "/v1/chat/completions"), ("POST", "/v1/folder-agent"), ("POST", "/v1/feedback"), ("GET", "/nope")] {
+            assert!(route(req(method, path, Some(TOKEN), "{}")).is_none(), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_token_is_refused_even_when_its_differences_cancel_out() {
+        // "ab" and "ba" differ by the same bits in both places; XOR-ing the differences together
+        // would cancel them out and let the wrong token in.
+        let with = |token: &str| req("GET", "/v1/models", Some(token), "");
+        assert!(!authorized(&with("ba"), "ab"));
+        assert!(authorized(&with("ab"), "ab"));
+    }
+
+    #[test]
+    fn a_body_of_exactly_the_limit_is_read() {
+        let body = "x".repeat(MAX_BODY_BYTES);
+        let raw = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", MAX_BODY_BYTES);
+        assert_eq!(read_request(&mut raw.as_bytes()).unwrap().body.len(), MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn headers_up_to_the_limit_are_read_and_one_byte_more_is_not() {
+        // The request line (16 bytes), one filler header, and the blank line (2) make the head.
+        let head = |size: usize| format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(size - 16 - 5 - 2));
+        assert_eq!(head(MAX_HEADER_BYTES).len(), MAX_HEADER_BYTES);
+        assert!(read_request(&mut head(MAX_HEADER_BYTES).as_bytes()).is_ok());
+        assert!(read_request(&mut head(MAX_HEADER_BYTES + 1).as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_json_reply_arrives_whole_over_a_real_socket() {
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            write_json(&mut stream, "200 OK", &json!({ "ok": true, "pad": "x".repeat(100_000) })).unwrap();
+            close_gracefully(stream);
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).unwrap();
+        server.join().unwrap();
+        let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK"), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}", body.len())), "{head}");
+        assert_eq!(serde_json::from_str::<Value>(body).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn small_helpers() {
+        assert_eq!(error_body("boom")["error"]["message"], "boom");
+        let (a, b) = (new_token(), new_token());
+        assert_eq!(a.len(), 48);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "tokens are random");
+        assert_eq!(finish_reason(Finish::Length), "length");
+        assert_eq!(finish_reason(Finish::Stop), "stop");
+        assert_eq!(finish_reason(Finish::Cancelled), "stop");
+        assert!(now_secs() > 1_700_000_000, "a real clock, not zero");
+        let agent: FolderAgentRequest = serde_json::from_str(r#"{"folder": "f", "goal": "g"}"#).unwrap();
+        assert!(agent.learn, "runs learn unless told not to");
+        assert!(agent.files.is_empty());
+        let chat = request(json!([{ "role": "user", "content": "first" }, { "role": "user", "content": "last one" }]));
+        assert_eq!(last_question(&chat), "last one");
     }
 }
