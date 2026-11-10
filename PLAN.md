@@ -650,6 +650,17 @@ it never changed the two call sites — the one-edit loop can't tell the goal is
 is lenient. This is the case for item 1 below (mutation testing / stronger checks); the step
 fallback also needs to carry forward which sub-goals are already done.
 
+**GPU heat on this laptop [x] (2026-11-10)** — the dev machine is an ASUS ROG Zephyrus M15
+(GU502LV). Xenon's own throttle is compiled into the app, so it survives reboots: writing is paced
+from 76 C and paused at 80 C, and prompt reading (which runs the GPU flat out and wasn't paced at
+all) is paced between 128-token chunks through an engine hook and paused at 78 C. Six long prompts
+back to back went from an 85 C peak (30 s at or over 80 C) to 80 C for one half-second sample, at
+about twice the time (`scripts/prefill_heat.py`). A system-wide throttle that also covers games
+and survives reboots is not something the app can set: NVIDIA's GPU target temperature has no
+adjustable range on this card, clock and power caps need admin and reset at reboot, and the
+persistent, supported control here is Armoury Crate's operating mode (Silent caps power; Turbo
+cools harder, which may also raise Xenon's sustained speed).
+
 **Mutation testing of the Rust core [x] (2026-11-10)** — `cargo mutants --in-place` (the crate
 finds the engine relative to the repo, so it can't be copied; run at below-normal priority with 4
 build jobs so typing stays smooth). Share of compiling deliberate breaks some test catches:
