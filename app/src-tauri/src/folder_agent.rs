@@ -648,7 +648,21 @@ fn protect(protected: &mut Vec<(String, usize, usize)>, path: &str, from: usize,
 fn covers_several_places(goal: &str) -> bool {
     let words: Vec<String> = goal.to_lowercase().split(|c: char| !c.is_alphanumeric()).map(str::to_string).collect();
     let has = |w: &str| words.iter().any(|x| x == w);
-    has("both") || has("everywhere") || has("each") || goal.to_lowercase().contains("all of")
+    has("both") || has("everywhere") || has("each") || goal.to_lowercase().contains("all of") || files_named(goal) >= 2
+}
+
+/// How many different file names (`config.py`, `src/lib.rs`) a goal mentions. A goal naming two
+/// files changes two places: run as one edit, Xenon changed client.py and never config.py.
+fn files_named(goal: &str) -> usize {
+    const EXTENSIONS: &[&str] = &["py", "rs", "ts", "tsx", "js", "mjs", "vue", "toml", "json", "md", "c", "h", "cpp"];
+    let mut names: Vec<&str> = goal
+        .split(|c: char| c.is_whitespace() || "`'\",;:()[]".contains(c))
+        .map(|w| w.trim_end_matches(['.', '!', '?']))
+        .filter(|w| w.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && EXTENSIONS.contains(&ext)))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names.len()
 }
 
 /// True when the goal says a test changes along with the code ("Update the code and its test").
@@ -746,9 +760,23 @@ fn snap_to_list(written: &str, files: &[String]) -> Option<String> {
 /// its `return` line). Blank lines are kept off both edges: Xenon dropped them when they were in.
 fn edit_range(lines: &[&str], best: usize) -> (usize, usize) {
     const DEFINERS: &[&str] = &["def ", "fn ", "function ", "class ", "async def ", "pub fn ", "pub(crate) fn ", "export function "];
-    let trimmed = lines[best].trim_start();
-    let (mut from, mut to) = if DEFINERS.iter().any(|d| trimmed.starts_with(d)) {
-        (best, (best + EDIT_LINES).min(lines.len()))
+    let defines = |i: usize| DEFINERS.iter().any(|d| lines[i].trim_start().starts_with(d));
+    // A doc comment or attribute names what it sits on, so it often ranks best; the lines to
+    // change are in the definition below it. Kept on the comment, clamp's swapped branches were
+    // never shown, only its comment and signature.
+    let mut best = best;
+    let mut below = best;
+    while below < lines.len() && is_comment_or_attribute(lines[below]) {
+        below += 1;
+    }
+    if below > best && below < lines.len() && defines(below) {
+        best = below;
+    }
+    let (mut from, mut to) = if defines(best) {
+        // A short definition is shown whole: two wrong lines in one function were otherwise
+        // split across two tries. A long one gets its first lines, as before.
+        let end = definition_end(lines, best).filter(|end| end - best <= MAX_WHOLE_DEFINITION);
+        (best, end.unwrap_or((best + EDIT_LINES).min(lines.len())))
     } else {
         (best.saturating_sub(1), (best + 2).min(lines.len()))
     };
@@ -759,6 +787,51 @@ fn edit_range(lines: &[&str], best: usize) -> (usize, usize) {
         to -= 1;
     }
     (from, to)
+}
+
+/// The longest definition shown whole to the Editor, in lines.
+const MAX_WHOLE_DEFINITION: usize = 12;
+
+fn is_comment_or_attribute(line: &str) -> bool {
+    let t = line.trim_start();
+    ["//", "#", "/*", "* ", "@"].iter().any(|p| t.starts_with(p)) || t == "*/"
+}
+
+/// The line after the definition starting at `start` ends: past its closing brace, or past the
+/// last line indented under it (Python). `None` if the end can't be found.
+fn definition_end(lines: &[&str], start: usize) -> Option<usize> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    if lines[start].trim_end().ends_with(':') {
+        let mut end = None;
+        for (i, line) in lines.iter().enumerate().skip(start + 1) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if indent(line) <= indent(lines[start]) {
+                break;
+            }
+            end = Some(i + 1);
+        }
+        return end;
+    }
+    let mut depth = 0i32;
+    let mut opened = false;
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        for c in line.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth <= 0 {
+            return Some(i + 1);
+        }
+    }
+    None
 }
 
 /// `text` with its lines `from..to` (0-based, end exclusive) replaced by `new`, keeping the file's
@@ -1802,6 +1875,19 @@ mod tests {
     }
 
     #[test]
+    fn a_doc_comment_leads_to_its_short_definition_shown_whole() {
+        let clamp = "/// Clamps `v`.\npub fn clamp(v: i32, min: i32, max: i32) -> i32 {\n    if v < min {\n        max\n    } else if v > max {\n        min\n    } else {\n        v\n    }\n}\n\nfn other() {}";
+        let lines: Vec<&str> = clamp.lines().collect();
+        assert_eq!(edit_range(&lines, 0), (1, 10), "from the signature to the closing brace");
+        let py = ["@cache", "def f(x):", "    if x:", "        return 1", "", "    return 2", "", "y = f(1)"];
+        assert_eq!(edit_range(&py, 0), (1, 6), "a decorator leads to its def; the body ends at the dedent");
+        let long: Vec<String> = std::iter::once("fn long() {".to_string()).chain((0..20).map(|i| format!("    a{i}();"))).chain(std::iter::once("}".into())).collect();
+        let long: Vec<&str> = long.iter().map(|s| s.as_str()).collect();
+        assert_eq!(edit_range(&long, 0), (0, EDIT_LINES), "a long definition keeps the short window");
+        assert_eq!(edit_range(&["# note", "X = 1", "Y = 2"], 0), (0, 2), "a comment above no definition stays put");
+    }
+
+    #[test]
     fn warnings_are_read_without_line_numbers_or_summaries() {
         let output = "warning: function `split_into_parts` is never used\n  --> src\\model_parts.rs:84:8\n   |\n\
                       warning: `app` (lib) generated 1 warning\n";
@@ -2450,7 +2536,10 @@ mod tests {
         }
         first.sort();
         // Rename goals say "everywhere" too, but the Renamer takes them before any planning.
-        assert_eq!(first, vec!["rename-across-files", "rust-two-places", "ts-rename-across-files", "ts-two-places", "two-places-one-file"]);
+        assert_eq!(first, vec!["python-two-files", "rename-across-files", "rust-two-places", "ts-rename-across-files", "ts-two-places", "two-places-one-file"]);
+        assert!(covers_several_places("Set it in `config.py` and update client.py."), "two files named");
+        assert!(!covers_several_places("Fix walker.py so walker.py stops early."), "one file, twice");
+        assert!(!covers_several_places("Bump the version to 1.2 in setup."), "a number isn't a file");
         assert!(covers_several_places("Fix the typo in each docstring"));
         assert!(!covers_several_places("Make the failing test pass"));
         assert!(!covers_several_places("Use the eachTime helper"), "a whole word, not part of a name");
