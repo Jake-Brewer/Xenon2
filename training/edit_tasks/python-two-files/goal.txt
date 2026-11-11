@@ -1,0 +1,1 @@
+The DEFAULT_TIMEOUT is defined in config.py as 5 and used in client.py. Change it to 30 in config.py and update the docstring in client.py to say 30 seconds instead of 5 seconds.

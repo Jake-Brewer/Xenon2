@@ -1,0 +1,1 @@
+Rename the function formatDate to displayDate everywhere it is used.

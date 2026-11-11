@@ -1,0 +1,1 @@
+The test fails: clamp should return min when the value is below min, max when above max, and the value itself when in range. Fix the implementation so the test passes.
