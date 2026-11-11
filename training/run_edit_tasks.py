@@ -12,10 +12,11 @@ with no file list (it finds the files itself), then copies in `check.py` and run
     python training/run_edit_tasks.py --learn       # training mode: learn: true, save lessons
     python training/run_edit_tasks.py --samples 3   # run each task 3 times; collect all passes
 
---learn passes `learn: true` to the agent so its fixed mistakes and passing edits are appended
-to `mistakes.jsonl` in the app's data folder for the next training batch.
---samples N runs each task N times and reports how many samples passed; useful for data collection
-without counting against the exam score (each sample is independent).
+--learn passes `learn: true` to the agent so the mistakes it fixes (an edit that failed, then one
+that passed at the same lines) are appended to `mistakes.jsonl` in the app's data folder for the
+next training batch. A task passed on the first try adds nothing.
+--samples N runs each task N times and reports how many passed. It overwrites the exam results
+file, so don't mix it with a scored run.
 
 Results go to training/out/edit_tasks.jsonl. Needs the Xenon2 app running.
 """

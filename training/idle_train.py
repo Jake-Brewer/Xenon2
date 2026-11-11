@@ -1,203 +1,134 @@
-"""Run a small training batch while the user is idle.
+"""Says whether a state-tuning run on the mistake batch may start now, and prints its command.
 
-Gating checks (each aborts with exit 0 if not met):
-  - GPU lease file (~/.gpu/LEASE.txt) must not name a running game.
-  - GPU temperature must be at or below COOL_C (72 C) via nvidia-smi.
-  - Training batch must have at least MIN_BATCH_ITEMS items (from build_batch.py).
+Training needs the whole 6 GB GPU (training/README.md), so it can't run inside the app or beside a
+game or another project's job. Every gate must pass:
 
-If all gates pass, runs RWKV-PEFT state tuning in WSL, then scores the result
-against the held-out set and edit tasks. Loads the tuned state if scores didn't
-get worse; discards it otherwise.
+- the Xenon2 app is closed (its code API doesn't answer);
+- no job holds a line in the GPU lease file (~/.gpu/LEASE.txt; lines starting with # are notes);
+- nvidia-smi shows the GPU cool (<= 72 C) and nearly empty (a game or another job holds memory);
+- the batch built by build_batch.py has at least --min items. build_batch.py itself needs the app
+  running, so run it before closing the app; this script only counts what it wrote.
 
-Usage:
-    python training/idle_train.py              # one shot; prints what it did
-    python training/idle_train.py --dry-run    # check gates only, don't train
+    python training/idle_train.py            # exit 0 and print the WSL command when ready, else 2
 
-The app can call this script after detecting ~10 min of user inactivity.
+The run itself, the scores before and after, and keeping or dropping the state are still done by
+hand as in training/README.md: a tuned state can't be loaded into rwkv.cpp yet.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
-import time
+import urllib.request
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-REPO = Path(__file__).resolve().parent.parent
-TRAINING = REPO / "training"
 COOL_C = 72
-HOT_C = 80
-MIN_BATCH_ITEMS = 5
-WSL_TRAIN_DIR = "~/xenon2-train"
+# The desktop alone holds a few hundred MiB; a game or a loaded model holds far more.
+BUSY_MIB = 800
+DEFAULT_MIN = 20
 LEASE_FILE = Path.home() / ".gpu" / "LEASE.txt"
-
-# Games that hold the GPU lease (lowercase substrings to match against LEASE.txt).
-GAME_SIGNALS = ["game", "steam", "proton", "codingame"]
-
-# ---------------------------------------------------------------------------
-# Gate checks
-# ---------------------------------------------------------------------------
-
-def gpu_lease_free() -> tuple[bool, str]:
-    """Returns (ok, reason). ok=False means a game or other heavy job holds the GPU."""
-    if not LEASE_FILE.exists():
-        return True, "no lease file"
-    text = LEASE_FILE.read_text(encoding="utf-8", errors="replace").lower()
-    for signal in GAME_SIGNALS:
-        if signal in text:
-            return False, f"GPU lease held by {signal!r} job"
-    return True, "lease file present but no game"
+DATA = Path(os.environ.get("APPDATA", Path.home() / ".local" / "share")) / "com.xenon2.app"
+BATCH = DATA / "training" / "batch.jsonl"
+DISCOVERY = DATA / "code-api.json"
 
 
-def gpu_temp() -> int | None:
-    """Returns GPU temperature in C, or None if nvidia-smi is unavailable."""
+def lease_holders(text: str) -> list[str]:
+    """The jobs holding the GPU: each non-empty line of the lease file that isn't a # note."""
+    return [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+
+def gpu_reading() -> tuple[int, int] | None:
+    """(temperature C, memory used MiB) from nvidia-smi, or None without an NVIDIA GPU."""
     try:
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
+            ["nvidia-smi", "--query-gpu=temperature.gpu,memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
         )
-        if out.returncode == 0:
-            return int(out.stdout.strip().split()[0])
-    except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
-        pass
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        temp, used = (int(v) for v in out.stdout.strip().splitlines()[0].split(","))
+    except (ValueError, IndexError):
+        return None
+    return temp, used
+
+
+def gpu_problem(reading: tuple[int, int] | None) -> str | None:
+    if reading is None:
+        return "no NVIDIA GPU (nvidia-smi not found); training needs one"
+    temp, used = reading
+    if temp > COOL_C:
+        return f"GPU at {temp} C; wait for {COOL_C} C"
+    if used > BUSY_MIB:
+        return f"GPU has {used} MiB in use (a game, the app, or another job)"
     return None
 
 
-def gpu_cool_enough() -> tuple[bool, str]:
-    temp = gpu_temp()
-    if temp is None:
-        return True, "nvidia-smi not found (CPU machine)"
-    if temp > COOL_C:
-        return False, f"GPU at {temp} C, need <= {COOL_C} C"
-    return True, f"GPU at {temp} C"
+def app_running() -> bool:
+    try:
+        url = json.loads(DISCOVERY.read_text(encoding="utf-8"))["url"]
+        urllib.request.urlopen(f"{url}/health", timeout=2)
+        return True
+    except Exception:
+        return False
 
 
-def batch_ready() -> tuple[bool, str]:
-    """Returns (ok, reason). Runs build_batch.py and checks item count."""
-    result = subprocess.run(
-        [sys.executable, str(TRAINING / "build_batch.py"), f"--min", str(MIN_BATCH_ITEMS)],
-        capture_output=True, text=True,
+def batch_size(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
+def command(batch: Path) -> str:
+    """The README's state-tuning command, pointed at the batch (read through /mnt/c)."""
+    drive, rest = batch.as_posix().split(":", 1)
+    data = f"/mnt/{drive.lower()}{rest}"
+    script = "/mnt/c/Users/jake/Documents/src/github/mccrea/Xenon2/training/state_tune.py"
+    return (
+        f"WANDB_MODE=disabled python {script} \\\n"
+        "  --load_model ~/xenon2-train/rwkv7-2.9b.pth \\\n"
+        f"  --proj_dir ~/xenon2-train/batch/out --data_file {data} --data_type jsonl \\\n"
+        "  --vocab_size 65536 --n_layer 32 --n_embd 2560 \\\n"
+        "  --ctx_len 384 --micro_bsz 2 --num_workers 1 \\\n"
+        "  --epoch_steps 10 --epoch_count 3 --epoch_save 1 \\\n"
+        "  --lr_init 1 --lr_final 0.01 --warmup_steps 5 \\\n"
+        "  --accelerator gpu --precision fp16 --devices 1 --strategy auto --grad_cp 1 \\\n"
+        "  --my_testing x070 --peft state --op fla --merge 0"
     )
-    if result.returncode != 0:
-        return False, f"build_batch.py: too few items (need {MIN_BATCH_ITEMS})"
-    return True, "batch ready"
 
 
-# ---------------------------------------------------------------------------
-# Training step (WSL)
-# ---------------------------------------------------------------------------
+def problems(min_items: int) -> list[str]:
+    found = []
+    if app_running():
+        found.append("the Xenon2 app is running; close it first (training needs the whole GPU)")
+    if LEASE_FILE.exists():
+        for holder in lease_holders(LEASE_FILE.read_text(encoding="utf-8", errors="replace")):
+            found.append(f"lease held: {holder}")
+    problem = gpu_problem(gpu_reading())
+    if problem:
+        found.append(problem)
+    items = batch_size(BATCH)
+    if items < min_items:
+        found.append(f"batch has {items} items; need {min_items} (run build_batch.py with the app open)")
+    return found
 
-def run_training(dry_run: bool) -> tuple[bool, str]:
-    """Runs state tuning in WSL. Returns (ok, message)."""
-    if dry_run:
-        return True, "dry-run: skipped"
-
-    wsl_cmd = (
-        f"cd {WSL_TRAIN_DIR} && "
-        "python state_tune.py "
-        "--peft state --op fla --precision fp16 "
-        "--load_model models/rwkv-7-g1l-2.9B.pth "
-        "--output_dir runs/idle "
-        "--n_layer 32 --n_embd 2560 "
-        "--micro_bsz 1 --epoch_steps 20 --epoch_count 1 "
-        "--data_file ~/xenon2-data/batch.jsonl "
-        "--quant nf4"
-    )
-    result = subprocess.run(["wsl", "bash", "-c", wsl_cmd], capture_output=True, text=True, timeout=3600)
-    if result.returncode != 0:
-        return False, f"WSL training failed:\n{result.stderr[-400:]}"
-    return True, "training complete"
-
-
-# ---------------------------------------------------------------------------
-# Scoring
-# ---------------------------------------------------------------------------
-
-def score_edit_tasks() -> int:
-    """Returns the number of tasks that passed. Returns -1 on error."""
-    result = subprocess.run(
-        [sys.executable, str(TRAINING / "run_edit_tasks.py")],
-        capture_output=True, text=True, timeout=600,
-    )
-    if result.returncode != 0:
-        return -1
-    # Last line: "N/M passed"
-    for line in reversed(result.stdout.splitlines()):
-        if "/" in line and "passed" in line:
-            try:
-                return int(line.split("/")[0].strip())
-            except ValueError:
-                pass
-    return -1
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="check gates only, don't train")
+    parser.add_argument("--min", type=int, default=DEFAULT_MIN, help="items the batch needs")
     args = parser.parse_args()
-
-    def log(msg: str) -> None:
-        print(f"idle_train: {msg}", flush=True)
-
-    # Gate 1: GPU lease
-    ok, reason = gpu_lease_free()
-    log(f"lease check: {reason}")
-    if not ok:
-        return 0
-
-    # Gate 2: GPU temperature
-    ok, reason = gpu_cool_enough()
-    log(f"temperature: {reason}")
-    if not ok:
-        return 0
-
-    # Gate 3: batch size
-    ok, reason = batch_ready()
-    log(f"batch: {reason}")
-    if not ok:
-        return 0
-
-    if args.dry_run:
-        log("dry-run: all gates passed, would train now")
-        return 0
-
-    # Baseline scores before training
-    log("scoring baseline edit tasks...")
-    baseline = score_edit_tasks()
-    log(f"baseline: {baseline} tasks passed")
-
-    # Train
-    log("starting state tuning in WSL...")
-    ok, reason = run_training(dry_run=args.dry_run)
-    log(f"training: {reason}")
-    if not ok:
-        return 1
-
-    # Score after training
-    log("scoring edit tasks after training...")
-    after = score_edit_tasks()
-    log(f"after training: {after} tasks passed")
-
-    if after < 0:
-        log("scoring failed; discarding tuned state")
-        return 1
-
-    if after >= baseline:
-        log(f"scores held or improved ({baseline} -> {after}); keeping tuned state")
-    else:
-        log(f"scores regressed ({baseline} -> {after}); discarding tuned state")
-        # TODO: revert to previous state file
-
+    found = problems(args.min)
+    if found:
+        for p in found:
+            print(f"not yet: {p}")
+        return 2
+    print("Ready. Add a lease line, then run inside the WSL env from ~/xenon2-train/RWKV-PEFT:\n")
+    print(command(BATCH))
     return 0
 
 
