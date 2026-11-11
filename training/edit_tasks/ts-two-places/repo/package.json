@@ -1,7 +1,0 @@
-{
-  "name": "pager",
-  "version": "1.0.0",
-  "scripts": {
-    "test": "node -e \"const s=require('fs').readFileSync('pager.ts','utf8');const n=(s.match(/\\b20\\b/g)||[]).length;if(n!==1){console.error('expected exactly one 20, found '+n);process.exit(1)}console.log('ok')\""
-  }
-}

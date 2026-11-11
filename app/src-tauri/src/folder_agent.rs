@@ -1572,6 +1572,20 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         round.tried.clear();
         for (i, step) in steps.iter().enumerate() {
             let label = format!("{}", i + 1);
+            // A step that explicitly covers several places is expanded here before it reaches
+            // attempt(): attempt() picks only one location, so "change both X and Y" would
+            // only change X. Breaking it now avoids wasting a turn on a partial edit.
+            if covers_several_places(step) {
+                let parts = plan(ctx, step, "")?;
+                if parts.len() >= 2 {
+                    report.narration.push(format!("Step {label}: covers several places; expanded into {} parts: {}", parts.len(), parts.join(" / ")));
+                    for (j, part) in parts.iter().enumerate() {
+                        do_step(ctx, goal, part, &format!("{label}.{}", j + 1), parts.len(), 1, &last_failure, &mut round, report)?;
+                        progress(&report.narration);
+                    }
+                    continue;
+                }
+            }
             do_step(ctx, goal, step, &label, steps.len(), 0, &last_failure, &mut round, report)?;
             progress(&report.narration);
         }
