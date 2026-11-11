@@ -707,8 +707,13 @@ Next, in order:
    then starting the run from the app when it's idle.
 5. Harder edit tasks (Rust, TypeScript, several places, several files), breaking big goals into
    smaller ones until each is small enough, and sampling several edits for the tests to choose.
-   Three tasks added, not yet run on the model: `rust-fix-test` (swapped clamp branches; the
-   check runs cargo test), `ts-rename-across-files`, `python-two-files`. `run_edit_tasks.py
+   Three tasks added: `rust-fix-test` (swapped clamp branches; the check runs cargo test),
+   `ts-rename-across-files`, `python-two-files`. First run 12/15: the Editor was shown clamp's
+   doc comment and signature but not its branches, and a goal naming two files ran as one edit.
+   With a comment leading to the definition below it, short definitions (12 lines or fewer) shown
+   whole, and goals naming two files planned first: 15/15 (G1l, 2026-11-11). `two-places-one-file`
+   failed the first run and passed the second with no change that touches it: flaky at
+   temperature 0.2, and its repo tests can't tell a half-done change from a whole one. `run_edit_tasks.py
    --learn` runs the tasks with learning on. Sampling several edits per place for the check to
    pick from is not started.
 
