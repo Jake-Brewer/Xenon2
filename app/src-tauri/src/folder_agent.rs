@@ -1602,11 +1602,15 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         let mut failure = String::new();
         let mut all_passed = true;
         let mut ran: Vec<String> = Vec::new();
+        // Build one FileChange per file: before = the original file from the first change
+        // that touched it (a snippet, but enough to detect newly introduced duplicates),
+        // after = the whole current file. The old assembly (replacing .after each time) gave
+        // mismatched before/after ranges and fired on correct multi-step edits.
         let mut whole: Vec<FileChange> = Vec::new();
         for change in &changes {
-            match whole.iter_mut().find(|c| c.path == change.path) {
-                Some(c) => c.after = change.after.clone(),
-                None => whole.push(change.clone()),
+            if !whole.iter().any(|c| c.path == change.path) {
+                let after = std::fs::read_to_string(ctx.root.join(&change.path)).unwrap_or_default();
+                whole.push(FileChange { path: change.path.clone(), before: change.before.clone(), after });
             }
         }
         if let Some(reason) = duplicate_definitions(&whole) {
