@@ -3,7 +3,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SseParser, discoveryPath, resolveConnection, runFolderAgent, sendFeedback } from "../client";
+import { SseParser, discoveryPath, resolveConnection, runFolderAgent, sendFeedback, undoFolderAgent } from "../client";
 import { firstCodeBlock, formatOverview, pickCode, withContext } from "../context";
 
 test("SSE events split across chunks are joined", () => {
@@ -135,4 +135,137 @@ test("a long file list is cut and says how much was left out", () => {
   const text = formatOverview({ name: "p", root: "/p" }, entries, undefined, 50);
   assert.match(text, /\(and \d+ more\)/);
   assert.ok(!text.includes("file99.py"));
+});
+
+test("resolveConnection throws when url is missing even if token is present", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "xenon-")), "code-api.json");
+  fs.writeFileSync(file, JSON.stringify({ token: "tok" }));  // no url
+  assert.throws(() => resolveConnection({ serverUrl: "", token: "" }, file), /isn't running/);
+});
+
+test("resolveConnection throws when token is missing even if url is present", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "xenon-")), "code-api.json");
+  fs.writeFileSync(file, JSON.stringify({ url: "http://127.0.0.1:47811" }));  // no token
+  assert.throws(() => resolveConnection({ serverUrl: "", token: "" }, file), /isn't running/);
+});
+
+test("resolveConnection strips trailing slash from url", () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "xenon-")), "code-api.json");
+  fs.writeFileSync(file, JSON.stringify({ url: "http://127.0.0.1:47811///", token: "tok" }));
+  const { url } = resolveConnection({ serverUrl: "", token: "" }, file);
+  assert.equal(url, "http://127.0.0.1:47811");
+});
+
+test("sendFeedback throws on non-ok response", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => ({ ok: false, status: 500, text: async () => "oops" }) as Response) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => sendFeedback({ url: "http://h", token: "t" }, { messageId: "1", rating: "bad", history: [], reply: "r" }),
+      /500/,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("sendFeedback sends POST with correct headers and body", async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return { ok: true, text: async () => "" } as Response;
+  }) as typeof fetch;
+  try {
+    await sendFeedback({ url: "http://h", token: "mytoken" }, { messageId: "7", rating: "good", history: [], reply: "r" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(calls[0].init.method, "POST");
+  const headers = calls[0].init.headers as Record<string, string>;
+  assert.equal(headers["Content-Type"], "application/json");
+  assert.equal(headers["Authorization"], "Bearer mytoken");
+});
+
+test("undoFolderAgent sends a POST to the undo endpoint with folder and snapshot", async () => {
+  const calls: { url: string; init: RequestInit }[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string, init: RequestInit) => {
+    calls.push({ url, init });
+    return { ok: true, text: async () => "" } as Response;
+  }) as typeof fetch;
+  try {
+    await undoFolderAgent({ url: "http://h", token: "t" }, "/my/folder", "abc123");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://h/v1/folder-agent/undo");
+  assert.equal(calls[0].init.method, "POST");
+  const body = JSON.parse(calls[0].init.body as string);
+  assert.equal(body.folder, "/my/folder");
+  assert.equal(body.snapshot_commit, "abc123");
+});
+
+test("undoFolderAgent throws on non-ok response", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => ({ ok: false, status: 503, text: async () => "gone" }) as Response) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => undoFolderAgent({ url: "http://h", token: "t" }, "/f", "sha"),
+      /503/,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("SSE filter removes non-data lines and strips leading space", () => {
+  const parser = new SseParser();
+  // A block with a comment line and a data line
+  assert.deepEqual(parser.push(': comment\ndata: {"x":1}\n\n'), ['{"x":1}']);
+});
+
+test("SSE empty data block is not emitted", () => {
+  const parser = new SseParser();
+  // A block with only a non-data line produces no events
+  assert.deepEqual(parser.push(': heartbeat\n\n'), []);
+});
+
+test("pickCode selection with whitespace-only text falls through to cursor window", () => {
+  const lines = ["line0", "line1", "line2"];
+  const result = pickCode(lines, { startLine: 0, endLine: 0, text: "   \n\t  " }, 1, 0);
+  assert.equal(result.isSelection, false);
+});
+
+test("pickCode respects the maxChars limit exactly (> not >=)", () => {
+  // If text.length === maxChars, no slice (> not >=)
+  const sel = { startLine: 0, endLine: 0, text: "abc" };
+  const exact = pickCode(["abc"], sel, 0, 3);
+  assert.equal(exact.code, "abc");  // not sliced: 3 > 3 is false
+  const over = pickCode(["abcd"], { startLine: 0, endLine: 0, text: "abcd" }, 0, 3);
+  assert.equal(over.code, "abc");   // sliced: 4 > 3 is true
+});
+
+test("formatOverview exact boundary: an entry that fits exactly is included", () => {
+  // maxListChars=10, entry "abc\n" costs 4; two entries: 4+4=8 <= 10, third would be 12 > 10
+  const entries = ["abc", "def", "ghi"];
+  const text = formatOverview({ name: "p", root: "/p" }, entries, undefined, 8);
+  assert.ok(text.includes("abc\n"));
+  assert.ok(text.includes("def\n"));
+  assert.ok(!text.includes("ghi\n"));
+  assert.match(text, /\(and 1 more\)/);
+});
+
+test("formatOverview notes trimmed: whitespace-only notes are omitted", () => {
+  const text = formatOverview({ name: "p", root: "/p" }, [], { file: "README.md", text: "   \n  " });
+  assert.ok(!text.includes("README.md"));
+});
+
+test("formatOverview notes are cut at maxNoteChars with marker", () => {
+  const longNote = "x".repeat(200);
+  const text = formatOverview({ name: "p", root: "/p" }, [], { file: "notes.md", text: longNote }, 2500, 100);
+  assert.match(text, /cut short/);
+  assert.ok(text.includes("x".repeat(100)));
+  assert.ok(!text.includes("x".repeat(101)));
 });
