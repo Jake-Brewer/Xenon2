@@ -3,7 +3,7 @@ import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { SseParser, discoveryPath, resolveConnection, runFolderAgent, sendFeedback, undoFolderAgent } from "../client";
+import { SseParser, discoveryPath, resolveConnection, runFolderAgent, sendFeedback, undoFolderAgent, streamChat } from "../client";
 import { firstCodeBlock, formatOverview, pickCode, withContext } from "../context";
 
 test("SSE events split across chunks are joined", () => {
@@ -268,4 +268,96 @@ test("formatOverview notes are cut at maxNoteChars with marker", () => {
   assert.match(text, /cut short/);
   assert.ok(text.includes("x".repeat(100)));
   assert.ok(!text.includes("x".repeat(101)));
+});
+
+// Helper: build a fake streaming fetch response from raw SSE chunks.
+function fakeSseResponse(chunks: string[]): Response {
+  async function* gen() {
+    const enc = new TextEncoder();
+    for (const c of chunks) yield enc.encode(c);
+  }
+  return {
+    ok: true,
+    status: 200,
+    body: gen() as unknown as ReadableStream,
+    text: async () => "",
+  } as Response;
+}
+
+test("streamChat collects text tokens and returns 'stop' when [DONE] arrives", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    fakeSseResponse([
+      'data: {"choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}\n\ndata: {"choices":[{"delta":{"content":" world"},"finish_reason":null}]}\n\ndata: [DONE]\n\n',
+    ])) as typeof fetch;
+  const parts: string[] = [];
+  let finish: string;
+  try {
+    finish = await streamChat({ url: "http://h", token: "t" }, [], { maxTokens: 100, temperature: 0 }, (t) => parts.push(t));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.deepEqual(parts, ["Hello", " world"]);
+  assert.equal(finish, "stop");
+});
+
+test("streamChat returns 'length' when finish_reason is length", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    fakeSseResponse([
+      'data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n',
+    ])) as typeof fetch;
+  const parts: string[] = [];
+  let finish: string;
+  try {
+    finish = await streamChat({ url: "http://h", token: "t" }, [], { maxTokens: 10, temperature: 0 }, (t) => parts.push(t));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(finish, "length");
+});
+
+test("streamChat throws when the server sends an error event", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    fakeSseResponse(['data: {"error":{"message":"out of memory"}}\n\n'])) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => streamChat({ url: "http://h", token: "t" }, [], { maxTokens: 100, temperature: 0 }, () => {}),
+      /out of memory/,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("streamChat throws 401 error when token is rejected", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => ({ ok: false, status: 401, body: null, text: async () => "" }) as Response) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => streamChat({ url: "http://h", token: "bad" }, [], { maxTokens: 100, temperature: 0 }, () => {}),
+      /token/,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("streamChat sends stream:true in request body", async () => {
+  const realFetch = globalThis.fetch;
+  let sentBody: Record<string, unknown> = {};
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    sentBody = JSON.parse(init.body as string);
+    return fakeSseResponse(["data: [DONE]\n\n"]);
+  }) as typeof fetch;
+  try {
+    await streamChat({ url: "http://h", token: "t" }, [], { maxTokens: 50, temperature: 0.5 }, () => {});
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(sentBody.stream, true);
+  assert.equal(sentBody.max_tokens, 50);
+  assert.equal(sentBody.temperature, 0.5);
+  assert.equal(sentBody.model, "xenon");
 });
