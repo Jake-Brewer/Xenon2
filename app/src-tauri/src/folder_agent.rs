@@ -384,6 +384,12 @@ fn is_python_test(path: &str) -> bool {
     name.starts_with("test_") || name.ends_with("_test.py")
 }
 
+/// Returns true for Xenon's own benchmark tests that the folder agent must never edit.
+/// These are protected regardless of the goal text: the agent fixes the code, not the oracle.
+fn is_permanently_protected(path: &str) -> bool {
+    path.starts_with("training/tests/") || path.starts_with("vscode-xenon/src/test/")
+}
+
 /// The nearest folder at or above `relative`'s folder, inside `root`, that holds `marker`.
 fn nearest_with(root: &Path, relative: &str, marker: &str) -> Option<String> {
     let mut dir = Path::new(relative).parent();
@@ -1322,6 +1328,16 @@ fn run_one(ctx: &RunContext, goal: &str, report: &mut Report, progress: &dyn Fn(
 
         let (path, from, to, written, current, code, clean_prompt) = match attempt(ctx, goal, goal, &last_failure, &mut tried, &[], report)? {
             Attempt::Edit { path, from, to, written, current, code, clean_prompt } => {
+                // A permanently protected test may never be edited: it is Xenon's own oracle.
+                if is_permanently_protected(&path) {
+                    budget.edits += 1;
+                    report.narration.push(format!("Rejected edit to protected test {path}: this file is locked"));
+                    last_failure = format!(
+                        "Your last edit was to `{path}`, which is a protected benchmark file and may \
+                         never be edited. Fix the source code instead.\n\n"
+                    );
+                    continue;
+                }
                 // A test file is protected: the model must fix the code, not loosen the test.
                 if is_python_test(&path) && !wants_test_update(goal) {
                     budget.edits += 1;
@@ -1491,6 +1507,11 @@ Only rewrite the lines shown — do not add the constant again; it is already in
     }
     let gave_up = match outcome {
         Attempt::Edit { path, from, to, written, code, .. } => {
+            // A permanently protected test may never be edited.
+            if is_permanently_protected(&path) {
+                report.narration.push(format!("Step {label}: rejected edit to protected test {path}"));
+                return Ok(());
+            }
             // A test file is protected unless the goal explicitly asks to change tests.
             if is_python_test(&path) && !wants_test_update(goal) {
                 report.narration.push(format!("Step {label}: rejected edit to test file {path}"));
@@ -2436,6 +2457,11 @@ mod tests {
         assert_eq!(failing_test_line("C:\\tmp\\repo\\tests\\test_a.py:12: in test_x"), Some(("C:/tmp/repo/tests/test_a.py".to_string(), 12)));
         assert_eq!(failing_test_line("text.py:3: SyntaxError"), None, "not a test file");
         assert!(wants_test_update("Update the code and its Test.") && !wants_test_update("Fix the bug"));
+        assert!(is_permanently_protected("training/tests/test_make_self_data.py"));
+        assert!(is_permanently_protected("vscode-xenon/src/test/client.test.ts"));
+        assert!(!is_permanently_protected("training/make_self_data.py"), "source, not test");
+        assert!(!is_permanently_protected("vscode-xenon/src/client.ts"), "source, not test");
+        assert!(!is_permanently_protected("test_text.py"), "edit-task test, not Xenon oracle");
     }
 
     #[test]
