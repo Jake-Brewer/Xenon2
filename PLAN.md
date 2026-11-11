@@ -688,17 +688,25 @@ Next, in order:
    (19%) — the remaining survivors are path constants and app-call I/O, not testable without the
    running model. Stryker for the VS Code extension done (three rounds, 46%→58%→68%; 31 tests
    in `vscode-xenon/src/test/client.test.ts`; surviving 93 are SKIP_DIRS constants, macOS path
-   unreachable on Windows, and repeated HTTP-header string literals). Still to do: a protected
-   set of tests the agent may not edit.
+   unreachable on Windows, and repeated HTTP-header string literals). Protected set done:
+   `training/tests/` and `vscode-xenon/src/test/` are locked by `is_permanently_protected()` in
+   both the single-step and round-based paths — the agent can fix source but never weaken these.
 2. Code and test changed together as one unit when a goal changes behavior, never a loosened test.
 3. The folder agent writes its fixed mistakes (failed prompt + the change that later passed) for
-   the batch.
+   the batch. Done: `run_steps` now saves a `Lesson { source: "steps" }` for each changed file
+   when a round passes after at least one failed round. The single-step path already did this
+   (source: "agent"). Both paths write to `mistakes.jsonl` via `lessons_file`; `learn: false` on
+   exam runs leaves that file `None`.
 4. Training close to the mistakes without getting in the way: small batches (about 20 items, or
    one that matters), run only while the user is idle (no input or requests for ~10 minutes, no
    game, GPU free and cool), stopped the moment they return, kept only if the held-out set and
    the edit tasks don't get worse, loaded as a tuned state.
 5. Harder edit tasks (Rust, TypeScript, several places, several files), breaking big goals into
    smaller ones until each is small enough, and sampling several edits for the tests to choose.
+   Three new tasks added: `rust-fix-test` (fix swapped clamp branches; check runs cargo test),
+   `ts-rename-across-files` (rename formatDate→displayDate in two TS files),
+   `python-two-files` (change a constant in config.py and its docstring mention in client.py).
+   Still to do: sampling several edits for the tests to pick the best.
 
 ## Future work (not yet scheduled)
 
