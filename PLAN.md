@@ -693,28 +693,24 @@ Next, in order:
    both the single-step and round-based paths — the agent can fix source but never weaken these.
 2. Code and test changed together as one unit when a goal changes behavior, never a loosened test.
 3. The folder agent writes its fixed mistakes (failed prompt + the change that later passed) for
-   the batch. Done: `run_steps` now saves a `Lesson { source: "steps" }` for each changed file
-   when a round passes after at least one failed round. The single-step path already did this
-   (source: "agent"). Both paths write to `mistakes.jsonl` via `lessons_file`; `learn: false` on
-   exam runs leaves that file `None`.
+   the batch. Done for both paths: the one-edit loop (source "agent") and, since 2026-11-11, the
+   planned steps (source "steps": a step that passes at lines a failed round also edited, paired
+   with the Editor's prompt without feedback). Written to `mistakes.jsonl` only when `learn` is on.
 4. Training close to the mistakes without getting in the way: small batches (about 20 items, or
    one that matters), run only while the user is idle (no input or requests for ~10 minutes, no
    game, GPU free and cool), stopped the moment they return, kept only if the held-out set and
-   the edit tasks don't get worse, loaded as a tuned state. Gate script done:
-   `training/idle_train.py` checks the lease file (game signals), GPU temperature via
-   nvidia-smi, and batch size; trains in WSL via RWKV-PEFT; scores edit tasks before and after;
-   keeps the state only if scores don't regress. 10 gate tests in
-   `training/tests/test_idle_train.py`. App idle detector wired: code_api.rs tracks
-   LAST_REQUEST_SECS; start_idle_trainer() fires idle_train.py after 10 min of silence.
-   Still to do: load/revert of tuned state in rwkv.cpp once WSL training produces a usable state file.
+   the edit tasks don't get worse, loaded as a tuned state. Training needs the whole GPU with the
+   app closed, so it can't start from inside the app until the app can free the GPU. For now
+   `training/idle_train.py` says whether a run may start (app closed, no lease line, GPU cool and
+   nearly empty, batch big enough) and prints the README's command for the batch. Still to do:
+   loading a tuned state into rwkv.cpp, which nothing has done yet, then the score-and-keep step,
+   then starting the run from the app when it's idle.
 5. Harder edit tasks (Rust, TypeScript, several places, several files), breaking big goals into
    smaller ones until each is small enough, and sampling several edits for the tests to choose.
-   Three new tasks added: `rust-fix-test` (fix swapped clamp branches; check runs cargo test),
-   `ts-rename-across-files` (rename formatDate→displayDate in two TS files),
-   `python-two-files` (change a constant in config.py and its docstring mention in client.py).
-   Sampling done: `run_edit_tasks.py --samples N --learn` runs each task N times with `learn:true`
-   so all passing runs generate lessons for the training batch. `--learn` alone is the training
-   mode; without it the exam never contaminates the batch.
+   Three tasks added, not yet run on the model: `rust-fix-test` (swapped clamp branches; the
+   check runs cargo test), `ts-rename-across-files`, `python-two-files`. `run_edit_tasks.py
+   --learn` runs the tasks with learning on. Sampling several edits per place for the check to
+   pick from is not started.
 
 ## Future work (not yet scheduled)
 
