@@ -704,8 +704,9 @@ Next, in order:
    `training/idle_train.py` checks the lease file (game signals), GPU temperature via
    nvidia-smi, and batch size; trains in WSL via RWKV-PEFT; scores edit tasks before and after;
    keeps the state only if scores don't regress. 10 gate tests in
-   `training/tests/test_idle_train.py`. Still to wire: app idle detector → idle_train.py call,
-   and load/revert of tuned state in rwkv.cpp once WSL training produces a usable state file.
+   `training/tests/test_idle_train.py`. App idle detector wired: code_api.rs tracks
+   LAST_REQUEST_SECS; start_idle_trainer() fires idle_train.py after 10 min of silence.
+   Still to do: load/revert of tuned state in rwkv.cpp once WSL training produces a usable state file.
 5. Harder edit tasks (Rust, TypeScript, several places, several files), breaking big goals into
    smaller ones until each is small enough, and sampling several edits for the tests to choose.
    Three new tasks added: `rust-fix-test` (fix swapped clamp branches; check runs cargo test),
