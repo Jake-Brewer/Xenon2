@@ -1457,6 +1457,8 @@ struct Round {
     tried: HashMap<String, Vec<(usize, usize)>>,
     protected: Vec<(String, usize, usize)>,
     changes: Vec<FileChange>,
+    /// Each step's edit: path, lines, the prompt without feedback, and the lines written.
+    places: Vec<(String, usize, usize, String, String)>,
     edits: u32,
 }
 
@@ -1506,7 +1508,7 @@ Only rewrite the lines shown — do not add the constant again; it is already in
         }
     }
     let gave_up = match outcome {
-        Attempt::Edit { path, from, to, written, code, .. } => {
+        Attempt::Edit { path, from, to, written, code, clean_prompt, .. } => {
             // A permanently protected test may never be edited.
             if is_permanently_protected(&path) {
                 report.narration.push(format!("Step {label}: rejected edit to protected test {path}"));
@@ -1522,6 +1524,7 @@ Only rewrite the lines shown — do not add the constant again; it is already in
             round.edits += 1;
             report.narration.push(format!("Step {label}: edited {path}, lines {}-{to}", from + 1));
             round.changes.push(change);
+            round.places.push((path, from, to, clean_prompt, written));
             return Ok(());
         }
         Attempt::Done(reason) => {
@@ -1560,9 +1563,8 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
     let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
     let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     let mut last_failure = String::new();
-    // Prompt saved from the most recent failed round; cleared when a round passes.
-    // A lesson records: (failed prompt → passing edit) for each file changed in the passing round.
-    let mut failed_round_prompt: Option<String> = None;
+    // Lines a failed round edited. A passing step at overlapping lines fixed a mistake there.
+    let mut failed_places: Vec<(String, usize, usize)> = Vec::new();
 
     // The baselines come first, before any step changes a file.
     let mut checks: Vec<Check> = Vec::new();
@@ -1592,7 +1594,7 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         // A failed round undoes every step, so each round starts from the original files and
         // every place is fresh again. Kept across rounds, the record skipped nearly every step
         // of rounds 2 and 3 as "tried every place".
-        let mut round = Round { tried: std::mem::take(&mut tried), protected: Vec::new(), changes: Vec::new(), edits: 0 };
+        let mut round = Round { tried: std::mem::take(&mut tried), protected: Vec::new(), changes: Vec::new(), places: Vec::new(), edits: 0 };
         round.tried.clear();
         for (i, step) in steps.iter().enumerate() {
             let label = format!("{}", i + 1);
@@ -1616,6 +1618,7 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         budget.edits += round.edits;
         tried = std::mem::take(&mut round.tried);
         let changes = round.changes;
+        let places = round.places;
         if changes.is_empty() {
             report.stopped_reason = "no step changed anything".to_string();
             return Ok(());
@@ -1656,11 +1659,11 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
             }
         }
         if all_passed {
-            // A round that passes after at least one failure is a fixed mistake worth learning.
-            if let Some(prompt) = failed_round_prompt.take() {
-                for change in &changes {
-                    let answer = format!("{}\n```", change.after);
-                    report.lessons.push(Lesson { prompt: prompt.clone(), answer, passed: true, source: "steps" });
+            // As in the one-edit loop: the prompt without feedback, paired with the lines that
+            // passed where an earlier round's edit failed.
+            for (path, from, to, prompt, written) in places {
+                if failed_places.iter().any(|(p, f, t)| *p == path && from < *t && *f < to) {
+                    report.lessons.push(Lesson { prompt, answer: format!("{written}\n```"), passed: true, source: "steps" });
                 }
             }
             report.edits.extend(changes);
@@ -1675,7 +1678,7 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         report.narration.push("Undid every step".to_string());
         let diffs: Vec<String> = changes.iter().map(|c| format!("`{}`:\n```diff\n{}\n```", c.path, short_diff(&c.before, &c.after))).collect();
         last_failure = format!("Your last edits were:\n{}\nThey were undone because {failure}\n", diffs.join("\n"));
-        failed_round_prompt = Some(last_failure.clone());
+        failed_places.extend(places.into_iter().map(|(path, from, to, ..)| (path, from, to)));
         steps = plan(ctx, goal, &last_failure)?;
         if steps.is_empty() {
             report.stopped_reason = "Xenon gave no steps".to_string();
@@ -2080,7 +2083,9 @@ mod tests {
         assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
         assert!(!report.lessons.is_empty(), "failed round → passing round produces a lesson");
         assert!(report.lessons.iter().all(|l| l.source == "steps"), "lessons are tagged as steps");
-        assert!(report.lessons.iter().any(|l| l.answer.contains("VALUE = 2") || l.answer.contains("X = 2")));
+        assert!(report.lessons.iter().any(|l| l.answer.starts_with("VALUE = 2") || l.answer.starts_with("X = 2")), "{:?}", report.lessons);
+        assert!(report.lessons.iter().all(|l| l.prompt.contains("they become:")), "the Editor's own prompt");
+        assert!(report.lessons.iter().all(|l| !l.prompt.contains("undone")), "the prompt has no failure feedback");
         fs::remove_dir_all(&dir).ok();
     }
 
