@@ -2444,8 +2444,8 @@ mod tests {
             }
         }
         first.sort();
-        // The rename goal says "everywhere" too, but the Renamer takes it before any planning.
-        assert_eq!(first, vec!["rename-across-files", "rust-two-places", "ts-two-places", "two-places-one-file"]);
+        // Rename goals say "everywhere" too, but the Renamer takes them before any planning.
+        assert_eq!(first, vec!["rename-across-files", "rust-two-places", "ts-rename-across-files", "ts-two-places", "two-places-one-file"]);
         assert!(covers_several_places("Fix the typo in each docstring"));
         assert!(!covers_several_places("Make the failing test pass"));
         assert!(!covers_several_places("Use the eachTime helper"), "a whole word, not part of a name");

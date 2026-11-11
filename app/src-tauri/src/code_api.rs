@@ -17,6 +17,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +39,57 @@ const MAX_MAX_TOKENS: i32 = inference::MAX_REPLY_TOKENS;
 pub const MODEL_ID: &str = "xenon";
 /// Feedback agent tag for the coding API, so its examples never mix with chat's.
 pub const AGENT: &str = "code";
+
+/// Unix epoch seconds of the most recent API request. Updated on every incoming request.
+/// The idle-training thread reads this to decide whether the user has been quiet long enough.
+static LAST_REQUEST_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// Minimum quiet time before idle training is considered (seconds).
+const IDLE_TRAIN_AFTER_SECS: u64 = 10 * 60;
+
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Spawns a background thread that launches `idle_train.py` once the API has been quiet for
+/// `IDLE_TRAIN_AFTER_SECS`. Only one training run at a time (the script gates itself on GPU
+/// availability and batch size). Called once from `start()`.
+fn start_idle_trainer(repo: PathBuf) {
+    std::thread::spawn(move || {
+        let script = repo.join("training").join("idle_train.py");
+        if !script.exists() {
+            return;
+        }
+        let check_interval = Duration::from_secs(60);
+        // Don't fire immediately on startup.
+        LAST_REQUEST_SECS.store(epoch_secs(), Ordering::Relaxed);
+        loop {
+            std::thread::sleep(check_interval);
+            let last = LAST_REQUEST_SECS.load(Ordering::Relaxed);
+            if epoch_secs().saturating_sub(last) < IDLE_TRAIN_AFTER_SECS {
+                continue;
+            }
+            // The user has been quiet. Run the script; it gates on GPU and batch size itself.
+            eprintln!("xenon2: user idle — starting idle_train.py");
+            let result = std::process::Command::new("python")
+                .arg(&script)
+                .spawn();
+            match result {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                }
+                Err(e) => {
+                    eprintln!("xenon2: idle_train.py failed to launch: {e}");
+                }
+            }
+            // Reset so it doesn't fire again immediately.
+            LAST_REQUEST_SECS.store(epoch_secs(), Ordering::Relaxed);
+        }
+    });
+}
 
 /// The coding assistant's fixed preamble. One worked example shows the expected shape: a
 /// fenced, language-tagged code block and a short explanation. Kept free of blank lines inside
@@ -137,7 +189,13 @@ pub fn start(app: AppHandle, engine: EngineState, model_name: String) {
         }
         eprintln!("xenon2: code API listening on {}", discovery.url);
 
+        // Idle training: watches for 10 min of silence, then runs idle_train.py.
+        if let Some(repo) = path.ancestors().find(|p| p.join("training").is_dir()).map(|p| p.to_path_buf()) {
+            start_idle_trainer(repo);
+        }
+
         for stream in listener.incoming().flatten() {
+            LAST_REQUEST_SECS.store(epoch_secs(), Ordering::Relaxed);
             let app = app.clone();
             let engine = engine.clone();
             let token = token.clone();
