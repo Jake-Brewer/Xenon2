@@ -1,0 +1,14 @@
+{
+  "$schema": "https://stryker-mutator.io/schemas/stryker-schema.json#SchemaVersion",
+  "mutate": ["src/client.ts", "src/context.ts"],
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "npm run compile && node --test out/test/client.test.js"
+  },
+  "checkers": ["typescript"],
+  "tsconfigFile": "tsconfig.json",
+  "reporters": ["html", "clear-text", "progress"],
+  "concurrency": 1,
+  "timeoutMS": 30000,
+  "tempDirName": "stryker-tmp"
+}

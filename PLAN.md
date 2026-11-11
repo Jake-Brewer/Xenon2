@@ -682,8 +682,12 @@ bug: a step searched for the whole goal's words and landed on another step's lin
 
 Next, in order:
 1. Stronger checks: done for Rust edits (no new warnings; a "remove the warning" goal must remove
-   one) and for the Rust core's tests (above). Still to do: mutation testing of the Python
-   (`mutmut`) and the extension (Stryker), and a protected set of tests the agent may not edit.
+   one) and for the Rust core's tests (above). Python mutation testing done: 39 unit tests in
+   `training/tests/test_make_self_data.py` cover `held_out`, DEFINITIONS regexes, `where_items`,
+   `commit_items` parsing, near-match logic, and `build` split assignment; mutmut kills 56/293
+   (19%) — the remaining survivors are path constants and app-call I/O, not testable without the
+   running model. Still to do: Stryker for the VS Code extension, and a protected set of tests
+   the agent may not edit.
 2. Code and test changed together as one unit when a goal changes behavior, never a loosened test.
 3. The folder agent writes its fixed mistakes (failed prompt + the change that later passed) for
    the batch.
