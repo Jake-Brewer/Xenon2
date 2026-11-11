@@ -700,7 +700,12 @@ Next, in order:
 4. Training close to the mistakes without getting in the way: small batches (about 20 items, or
    one that matters), run only while the user is idle (no input or requests for ~10 minutes, no
    game, GPU free and cool), stopped the moment they return, kept only if the held-out set and
-   the edit tasks don't get worse, loaded as a tuned state.
+   the edit tasks don't get worse, loaded as a tuned state. Gate script done:
+   `training/idle_train.py` checks the lease file (game signals), GPU temperature via
+   nvidia-smi, and batch size; trains in WSL via RWKV-PEFT; scores edit tasks before and after;
+   keeps the state only if scores don't regress. 10 gate tests in
+   `training/tests/test_idle_train.py`. Still to wire: app idle detector → idle_train.py call,
+   and load/revert of tuned state in rwkv.cpp once WSL training produces a usable state file.
 5. Harder edit tasks (Rust, TypeScript, several places, several files), breaking big goals into
    smaller ones until each is small enough, and sampling several edits for the tests to choose.
    Three new tasks added: `rust-fix-test` (fix swapped clamp branches; check runs cargo test),
