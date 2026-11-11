@@ -1560,6 +1560,9 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
     let mut baselines: HashMap<String, Vec<String>> = HashMap::new();
     let mut tried: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
     let mut last_failure = String::new();
+    // Prompt saved from the most recent failed round; cleared when a round passes.
+    // A lesson records: (failed prompt → passing edit) for each file changed in the passing round.
+    let mut failed_round_prompt: Option<String> = None;
 
     // The baselines come first, before any step changes a file.
     let mut checks: Vec<Check> = Vec::new();
@@ -1653,6 +1656,13 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
             }
         }
         if all_passed {
+            // A round that passes after at least one failure is a fixed mistake worth learning.
+            if let Some(prompt) = failed_round_prompt.take() {
+                for change in &changes {
+                    let answer = format!("{}\n```", change.after);
+                    report.lessons.push(Lesson { prompt: prompt.clone(), answer, passed: true, source: "steps" });
+                }
+            }
             report.edits.extend(changes);
             report.stopped_reason = if ran.is_empty() { "finished: edited, nothing to check it with" } else { "finished: the tests pass" }.to_string();
             return Ok(());
@@ -1665,6 +1675,7 @@ fn run_steps(ctx: &RunContext, goal: &str, mut steps: Vec<String>, report: &mut 
         report.narration.push("Undid every step".to_string());
         let diffs: Vec<String> = changes.iter().map(|c| format!("`{}`:\n```diff\n{}\n```", c.path, short_diff(&c.before, &c.after))).collect();
         last_failure = format!("Your last edits were:\n{}\nThey were undone because {failure}\n", diffs.join("\n"));
+        failed_round_prompt = Some(last_failure.clone());
         steps = plan(ctx, goal, &last_failure)?;
         if steps.is_empty() {
             report.stopped_reason = "Xenon gave no steps".to_string();
@@ -2029,6 +2040,47 @@ mod tests {
         assert_eq!(report.lessons.len(), 1, "a fail then a pass at the same lines is a lesson");
         assert!(report.lessons[0].answer.starts_with("VALUE = 2"), "{}", report.lessons[0].answer);
         assert!(!report.lessons[0].prompt.contains("undone"), "the lesson's prompt has no failure feedback");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_round_records_a_lesson_when_the_next_round_passes() {
+        // The goal has two files so run_one doesn't finish; planning gives 2 steps.
+        // Round 1: steps set VALUE = 3 (wrong) and X = 3 → check fails → undone.
+        // Round 2: steps set VALUE = 2 and X = 2 → check passes → lessons saved.
+        let round = Cell::new(0u32);
+        let dir = repo_with(&[
+            ("a.py", "VALUE = 1\nassert VALUE == 2, VALUE\n"),
+            ("b.py", "X = 1\nassert X == 2, X\n"),
+        ]);
+        let model = scripted(move |question: &str, start: &str| {
+            if start == "FILE:" {
+                // Locator alternates between the two files based on the step text.
+                return if question.contains("b.py") { " b.py\n" } else { " a.py\n" }.to_string();
+            }
+            if start.starts_with("Lines ") {
+                round.set(round.get() + 1);
+                let lines = quoted_lines(start);
+                // Rounds 1-2 are the wrong edits (step 1 and step 2 of the first plan).
+                // Rounds 3-4 are the correct edits.
+                let val = if round.get() <= 2 { "3" } else { "2" };
+                return format!("{}\n```",
+                    lines.replace("VALUE = 1", &format!("VALUE = {val}"))
+                         .replace("X = 1", &format!("X = {val}")));
+            }
+            if start == "1." {
+                // Plan: two steps, one per file.
+                return " Set VALUE in a.py\n2. Set X in b.py\n".to_string();
+            }
+            let _ = question;
+            String::new()
+        });
+        let report = run_scripted(&model, &dir, "Set VALUES in both a.py and b.py", &["a.py", "b.py"]);
+
+        assert_eq!(report.stopped_reason, "finished: the tests pass", "{:?}", report.narration);
+        assert!(!report.lessons.is_empty(), "failed round → passing round produces a lesson");
+        assert!(report.lessons.iter().all(|l| l.source == "steps"), "lessons are tagged as steps");
+        assert!(report.lessons.iter().any(|l| l.answer.contains("VALUE = 2") || l.answer.contains("X = 2")));
         fs::remove_dir_all(&dir).ok();
     }
 
