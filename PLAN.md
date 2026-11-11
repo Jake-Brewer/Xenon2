@@ -686,8 +686,10 @@ Next, in order:
    `training/tests/test_make_self_data.py` cover `held_out`, DEFINITIONS regexes, `where_items`,
    `commit_items` parsing, near-match logic, and `build` split assignment; mutmut kills 56/293
    (19%) — the remaining survivors are path constants and app-call I/O, not testable without the
-   running model. Still to do: Stryker for the VS Code extension, and a protected set of tests
-   the agent may not edit.
+   running model. Stryker for the VS Code extension done (three rounds, 46%→58%→68%; 31 tests
+   in `vscode-xenon/src/test/client.test.ts`; surviving 93 are SKIP_DIRS constants, macOS path
+   unreachable on Windows, and repeated HTTP-header string literals). Still to do: a protected
+   set of tests the agent may not edit.
 2. Code and test changed together as one unit when a goal changes behavior, never a loosened test.
 3. The folder agent writes its fixed mistakes (failed prompt + the change that later passed) for
    the batch.
