@@ -164,6 +164,125 @@ class TestWhereItems:
         assert names == {"plan_goal", "locate_lines"}
 
 
+class TestCommitItems:
+    """commit_items() parses git log output. Test the parsing logic by mocking subprocess."""
+
+    def _run(self, log_output, show_output="some diff\n"):
+        import subprocess
+        def fake_run(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            if "log" in cmd:
+                result.stdout = log_output
+            else:
+                result.stdout = show_output
+            return result
+
+        with patch.object(msd, "subprocess") as mock_sub:
+            mock_sub.run = fake_run
+            return list(msd.commit_items())
+
+    def test_basic_commit(self):
+        log = "abc123\x00Add feature\n\x01"
+        items = self._run(log)
+        assert len(items) == 1
+        assert items[0]["kind"] == "commit"
+        assert items[0]["answer"] == "Add feature"
+
+    def test_coauthored_by_stripped(self):
+        log = "abc123\x00Fix the bug\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n\x01"
+        items = self._run(log)
+        assert len(items) == 1
+        assert "Co-Authored-By" not in items[0]["answer"]
+        assert "Fix the bug" in items[0]["answer"]
+
+    def test_empty_diff_skipped(self):
+        log = "abc123\x00Some message\n\x01"
+        items = self._run(log, show_output="   \n")
+        assert items == []
+
+    def test_empty_message_skipped(self):
+        log = "abc123\x00\n\x01"
+        items = self._run(log, show_output="real diff\n")
+        assert items == []
+
+    def test_diff_truncated_at_max(self):
+        long_diff = "x" * (msd.MAX_DIFF_CHARS + 100)
+        log = "abc123\x00Truncation test\n\x01"
+        items = self._run(log, show_output=long_diff)
+        assert len(items) == 1
+        assert len(items[0]["question"]) < len(long_diff) + 100
+        assert "diff cut" in items[0]["question"]
+
+    def test_diff_not_truncated_when_short(self):
+        short_diff = "tiny\n"
+        log = "abc123\x00Short diff\n\x01"
+        items = self._run(log, show_output=short_diff)
+        assert "diff cut" not in items[0]["question"]
+
+    def test_multiple_commits(self):
+        log = "aaa\x00First commit\n\x01bbb\x00Second commit\n\x01"
+        items = self._run(log)
+        assert len(items) == 2
+        answers = {i["answer"] for i in items}
+        assert answers == {"First commit", "Second commit"}
+
+    def test_entry_without_null_byte_skipped(self):
+        log = "no-null-here\x01abc\x00Valid message\n\x01"
+        items = self._run(log)
+        assert len(items) == 1
+        assert items[0]["answer"] == "Valid message"
+
+
+class TestScoreNearMatch:
+    """Test the near-match logic in score(): right file name but wrong path."""
+
+    def _near(self, answer, reply):
+        """Replicate the near-match check from score()."""
+        import re
+        ok = answer in reply
+        near = not ok and re.search(
+            r"\b" + re.escape(answer.rsplit("/", 1)[-1]) + r"\b", reply
+        )
+        return bool(near)
+
+    def test_exact_match_not_near(self):
+        assert not self._near("app/src/main.rs", "app/src/main.rs")
+
+    def test_filename_only_is_near(self):
+        assert self._near("app/src-tauri/src/inference.rs", "inference.rs")
+
+    def test_wrong_file_not_near(self):
+        assert not self._near("app/src/main.rs", "app/src/lib.rs")
+
+    def test_partial_path_is_near(self):
+        assert self._near("app/src-tauri/src/inference.rs", "src/inference.rs")
+
+    def test_empty_reply_not_near(self):
+        assert not self._near("app/src/main.rs", "")
+
+
+class TestBuildSplitAssignment:
+    """build() assigns split = 'eval' if held_out else 'train'."""
+
+    def test_split_assigned_based_on_held_out(self):
+        # Build a small set of fake items and verify split is assigned correctly.
+        fake_items = [{"kind": "where", "question": f"q{i}", "answer": f"a{i}"} for i in range(20)]
+        with patch.object(msd, "where_items", return_value=iter(fake_items)), \
+             patch.object(msd, "commit_items", return_value=iter([])), \
+             patch.object(msd, "file_items", return_value=iter([])), \
+             patch.object(msd, "OUT") as mock_out:
+            # Make OUT.open() return a no-op context manager
+            mock_out.open.return_value.__enter__ = lambda s: MagicMock()
+            mock_out.open.return_value.__exit__ = MagicMock(return_value=False)
+            mock_out.parent.mkdir = MagicMock()
+            msd.build()
+
+        for item in fake_items:
+            expected = "eval" if msd.held_out(item["question"]) else "train"
+            assert item["split"] == expected, f"item {item['question']!r}: expected {expected}, got {item['split']}"
+
+
 class TestMapEntriesParsing:
     """map_entries() from eval_repo_map.py parses .xenon/repo-map.md.
 
