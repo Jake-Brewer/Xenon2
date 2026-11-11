@@ -75,6 +75,9 @@ fn source_files(root: &Path) -> Vec<(String, String)> {
                 continue;
             }
             if let Ok(text) = std::fs::read_to_string(&path) {
+                if is_exam(&text) {
+                    continue;
+                }
                 let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
                 out.push((rel, text));
             }
@@ -82,6 +85,15 @@ fn source_files(root: &Path) -> Vec<(String, String)> {
     }
     out.sort();
     out
+}
+
+/// Marks a file whose answers Xenon must never be shown, in its first lines. Searched, the exam
+/// in `training/eval_self.py` handed Xenon its own answer key: "How many layers does your model
+/// have?" found the exam line `[r"\b32\b"]`.
+const EXAM_MARKER: &str = "xenon: exam";
+
+fn is_exam(text: &str) -> bool {
+    text.lines().take(5).any(|line| line.contains(EXAM_MARKER))
 }
 
 /// The source files of `root` (as `search` sees them) that use `name` as a whole word.
@@ -471,6 +483,15 @@ mod tests {
         let dir = project();
         let found = search(dir.path(), "threads_for");
         assert!(!found.contains("node_modules") && !found.contains("vendor"), "{found}");
+    }
+
+    #[test]
+    fn an_exam_is_never_searched() {
+        let dir = project();
+        std::fs::write(dir.path().join("exam.py"), "\"\"\"Exam. xenon: exam\"\"\"\nQ = ('threads_for answer', 32)\n").unwrap();
+        std::fs::write(dir.path().join("notes.py"), "\"\"\"Notes.\"\"\"\nQ = ('threads_for note', 32)\n").unwrap();
+        let found = search(dir.path(), "threads_for");
+        assert!(!found.contains("exam.py") && found.contains("notes.py"), "{found}");
     }
 
     #[test]

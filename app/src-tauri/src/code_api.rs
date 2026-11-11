@@ -441,6 +441,9 @@ pub fn build_prompt(request: &ChatRequest, style: Style) -> Result<Prompt, Strin
 Xenon: ", &format!("
 
 {}: ", style.label));
+    if let Some(notes) = request.workspace.as_deref().and_then(self_notes) {
+        prior.push_str(&notes);
+    }
     let system: Vec<String> = earlier
         .iter()
         .filter(|m| m.role == "system" || m.role == "developer")
@@ -480,6 +483,21 @@ Xenon: ", &format!("
         repeat_penalty: request.repeat_penalty.unwrap_or(1.2).clamp(1.0, 2.0),
     };
     Ok(Prompt { prior, last: format!("User: {question}\n\n{}:{}", style.label, style.opener), params })
+}
+
+/// Where a project keeps the description of how it is built that Xenon reads (for Xenon2 itself,
+/// Xenon's own description of how it works).
+const SELF_NOTES: &str = ".xenon/self.md";
+
+/// The workspace's `.xenon/self.md`, as a block for the cached prior. Asked how it works, Xenon
+/// otherwise guessed: it called itself a transformer (15.9% on `training/eval_self.py`). Searching
+/// the notes by keyword picked the wrong section for questions like "What GPU do you run on?", so
+/// the whole file goes in. It sits right after the preamble, where it is the same on every
+/// request, so after the first request it is read from the cache, not again.
+fn self_notes(workspace: &str) -> Option<String> {
+    let text = std::fs::read_to_string(std::path::Path::new(workspace).join(SELF_NOTES)).ok()?;
+    let text = clean(&text);
+    (!text.is_empty()).then(|| format!("Xenon's notes on how this project, and Xenon itself, are built:\n{text}\n\n"))
 }
 
 /// Puts search results inside the new user turn as question, results, question again. A recurrent
@@ -686,6 +704,25 @@ mod tests {
 
     fn request(messages: Value) -> ChatRequest {
         serde_json::from_value(json!({ "messages": messages })).unwrap()
+    }
+
+    #[test]
+    fn a_workspace_with_self_notes_puts_them_in_the_cached_prior() {
+        let dir = std::env::temp_dir().join(format!("xenon-self-notes-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".xenon")).unwrap();
+        std::fs::write(dir.join(".xenon/self.md"), "# How Xenon is built\n\n## The model\n\nRWKV-7 2.9B.\n").unwrap();
+        let ask = |workspace: &std::path::Path| -> ChatRequest {
+            serde_json::from_value(json!({ "messages": [{ "role": "user", "content": "What model?" }], "workspace": workspace })).unwrap()
+        };
+        let with = build_prompt_world(&ask(&dir)).unwrap();
+        assert!(with.prior.starts_with(&build_prompt_world(&request(json!([{ "role": "user", "content": "x" }]))).unwrap().prior));
+        assert!(with.prior.contains("## The model\nRWKV-7 2.9B."), "blank lines collapsed: {}", with.prior);
+        assert!(with.prior.ends_with("\n\n") && !with.last.contains("RWKV"));
+        // The same notes on every request, so the prior (and its cached state) is the same.
+        assert_eq!(build_prompt_world(&ask(&dir)).unwrap().prior, with.prior);
+        std::fs::remove_file(dir.join(".xenon/self.md")).unwrap();
+        assert!(!build_prompt_world(&ask(&dir)).unwrap().prior.contains("notes"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

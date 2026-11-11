@@ -1,4 +1,7 @@
-"""Exam: can Xenon explain how it is built and how its model works?
+"""Exam: can Xenon explain how it is built and how its model works?  (xenon: exam)
+
+The marker above hides this file from Xenon's code search, so the answers below can't leak into
+the prompts that are being scored.
 
 Each question lists the facts a good answer must contain. A fact is a regex, matched without
 case, and `|` gives accepted phrasings. An answer scores the share of its question's facts it
