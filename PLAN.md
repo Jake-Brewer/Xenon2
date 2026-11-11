@@ -706,7 +706,9 @@ Next, in order:
    Three new tasks added: `rust-fix-test` (fix swapped clamp branches; check runs cargo test),
    `ts-rename-across-files` (rename formatDate→displayDate in two TS files),
    `python-two-files` (change a constant in config.py and its docstring mention in client.py).
-   Still to do: sampling several edits for the tests to pick the best.
+   Sampling done: `run_edit_tasks.py --samples N --learn` runs each task N times with `learn:true`
+   so all passing runs generate lessons for the training batch. `--learn` alone is the training
+   mode; without it the exam never contaminates the batch.
 
 ## Future work (not yet scheduled)
 

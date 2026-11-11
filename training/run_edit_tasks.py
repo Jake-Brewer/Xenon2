@@ -7,12 +7,20 @@ enough: one run fixed `average` and deleted the line above it, and its tests sti
 For each task this copies `repo/` into a fresh git repo, runs the agent through the running app
 with no file list (it finds the files itself), then copies in `check.py` and runs it:
 
-    python training/run_edit_tasks.py              # all tasks
-    python training/run_edit_tasks.py off-by-one   # some
+    python training/run_edit_tasks.py              # all tasks, exam mode (learn: false)
+    python training/run_edit_tasks.py off-by-one   # named tasks only
+    python training/run_edit_tasks.py --learn       # training mode: learn: true, save lessons
+    python training/run_edit_tasks.py --samples 3   # run each task 3 times; collect all passes
+
+--learn passes `learn: true` to the agent so its fixed mistakes and passing edits are appended
+to `mistakes.jsonl` in the app's data folder for the next training batch.
+--samples N runs each task N times and reports how many samples passed; useful for data collection
+without counting against the exam score (each sample is independent).
 
 Results go to training/out/edit_tasks.jsonl. Needs the Xenon2 app running.
 """
 
+import argparse
 import json
 import os
 import shutil
@@ -34,9 +42,8 @@ def git(folder, *args):
     subprocess.run(["git", *args], cwd=folder, check=True, capture_output=True)
 
 
-def run_agent(folder, goal):
-    # learn: false keeps these runs out of the training batch; this is Xenon's exam.
-    job = post("/v1/folder-agent", {"folder": str(folder), "goal": goal, "files": [], "learn": False})
+def run_agent(folder, goal, learn: bool = False):
+    job = post("/v1/folder-agent", {"folder": str(folder), "goal": goal, "files": [], "learn": learn})
     url, token = connection()
     while True:
         req = urllib.request.Request(f"{url}/v1/folder-agent/{job['id']}", headers={"Authorization": "Bearer " + token})
@@ -46,7 +53,7 @@ def run_agent(folder, goal):
         time.sleep(2)
 
 
-def run_task(task):
+def run_task(task, learn: bool = False):
     goal = (task / "goal.txt").read_text(encoding="utf-8").strip()
     with tempfile.TemporaryDirectory(prefix=f"xenon-task-{task.name}-") as tmp:
         folder = Path(tmp) / "repo"
@@ -57,7 +64,7 @@ def run_task(task):
         git(folder, "config", "user.email", "t@x.local")
         git(folder, "config", "user.name", "t")
         started = time.time()
-        status = run_agent(folder, goal)
+        status = run_agent(folder, goal, learn=learn)
         seconds = round(time.time() - started)
         report = status.get("report") or {}
         shutil.copy(task / "check.py", Path(tmp) / "check.py")
@@ -77,16 +84,35 @@ def run_task(task):
 
 
 def main():
-    names = sys.argv[1:]
-    tasks = [t for t in sorted(TASKS.iterdir()) if t.is_dir() and (not names or t.name in names)]
+    parser = argparse.ArgumentParser()
+    parser.add_argument("names", nargs="*", help="task names to run (default: all)")
+    parser.add_argument("--learn", action="store_true", help="pass learn:true to the agent (training mode)")
+    parser.add_argument("--samples", type=int, default=1, metavar="N", help="run each task N times (default 1)")
+    args = parser.parse_args()
+
+    tasks = [t for t in sorted(TASKS.iterdir()) if t.is_dir() and (not args.names or t.name in args.names)]
     OUT.parent.mkdir(parents=True, exist_ok=True)
     results = []
     with OUT.open("w", encoding="utf-8") as out:
         for task in tasks:
-            result = run_task(task)
+            if args.samples > 1:
+                passes = 0
+                for s in range(args.samples):
+                    result = run_task(task, learn=args.learn)
+                    if result["passed"]:
+                        passes += 1
+                # Report the last sample's metadata with a pass-rate summary.
+                result["passes"] = passes
+                result["samples"] = args.samples
+                result["passed"] = passes > 0
+            else:
+                result = run_task(task, learn=args.learn)
             results.append(result)
             out.write(json.dumps(result) + "\n")
-            print(f"{'PASS' if result['passed'] else 'fail'} {task.name} ({result['seconds']}s): {result['stopped']}", flush=True)
+            if args.samples > 1:
+                print(f"{'PASS' if result['passed'] else 'fail'} {task.name} {passes}/{args.samples} samples: {result['stopped']}", flush=True)
+            else:
+                print(f"{'PASS' if result['passed'] else 'fail'} {task.name} ({result['seconds']}s): {result['stopped']}", flush=True)
     print(f"{sum(r['passed'] for r in results)}/{len(results)} passed")
     return 0
 
