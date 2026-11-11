@@ -1482,7 +1482,8 @@ fn do_step(
         let change = FileChange { path: path.clone(), before: current.clone(), after: code.clone() };
         if let Some(reason) = duplicate_definitions(&[change]) {
             report.narration.push(format!("Step {label}: {reason}; asking again"));
-            feedback = format!("{feedback}Your last try at this step was rejected: {reason}.
+            feedback = format!("{feedback}Your last try at this step was rejected: {reason}. \
+Only rewrite the lines shown — do not add the constant again; it is already in the file from an earlier step.
 
 ");
             outcome = attempt(ctx, &step_goal, step, &feedback, &mut round.tried, &round.protected, report)?;
